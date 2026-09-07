@@ -2863,11 +2863,10 @@ public static class TokenRaderIndexer
 
     private static string NormalizeLongContextSource(string source, string model, long callInput, long threshold)
     {
-        if (string.Equals(source, "pricing_threshold", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(source, "no_threshold", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(source, "unknown_model", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(source, "missing_input", StringComparison.OrdinalIgnoreCase))
-            return source.ToLowerInvariant();
+        // The current pricing document is authoritative during aggregation.
+        // An older index may have stored no_threshold before support for a new
+        // model was added; retaining that stale label would contradict the
+        // threshold and long-context bucket computed above.
         if (callInput <= 0L) return "missing_input";
         if (string.IsNullOrWhiteSpace(model)) return "unknown_model";
         return threshold > 0L ? "pricing_threshold" : "no_threshold";
@@ -4704,7 +4703,7 @@ public static class TokenRaderIndexer
     private static bool IsKnownLongContextModel(string model)
     {
         string normalized = (model ?? "").Trim().ToLowerInvariant();
-        foreach (string id in new[] { "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4" })
+        foreach (string id in new[] { "gpt-6-astra", "gpt-5.6", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-cyber", "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "gpt-5.4" })
         {
             if (normalized == id || normalized.StartsWith(id + "-20", StringComparison.OrdinalIgnoreCase)) return true;
         }

@@ -196,12 +196,44 @@ Import-Module (Join-Path $projectRoot 'TokenRader.Core.psm1') -Force
 Assert-Equal 'USD' ([string]$prices.currency) 'pricing currency metadata'
 Assert-Equal 1000000 ([Int64]$prices.unitTokens) 'pricing unit metadata'
 Assert-Equal 'OpenAI API Standard processing' ([string]$prices.priceType) 'pricing type metadata'
-foreach ($pricingModelId in @('gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4-mini', 'gpt-5.4')) {
+$expectedPrices = [ordered]@{
+    'gpt-6-astra'     = @(10.00, 1.00, 50.00)
+    'gpt-5.6-sol'     = @(4.00, 0.40, 20.00)
+    'gpt-5.6-terra'   = @(2.00, 0.20, 12.00)
+    'gpt-5.6-luna'    = @(0.20, 0.02, 1.20)
+    'gpt-5.6-cyber'   = @(12.50, 1.25, 75.00)
+    'gpt-5.5'         = @(5.00, 0.50, 30.00)
+    'gpt-5.4-mini'    = @(0.75, 0.075, 4.50)
+    'gpt-5.4'         = @(2.50, 0.25, 15.00)
+    'gpt-5.3-codex'   = @(1.75, 0.175, 14.00)
+    'gpt-5.2-codex'   = @(1.75, 0.175, 14.00)
+    'gpt-5.2'         = @(1.75, 0.175, 14.00)
+    'gpt-5-codex'     = @(1.25, 0.125, 10.00)
+    'gpt-5-mini'      = @(0.25, 0.025, 2.00)
+    'gpt-5'           = @(1.25, 0.125, 10.00)
+}
+$canonicalIds = @($prices.models | ForEach-Object { ([string]$_.id).ToLowerInvariant() })
+$largeContextModelIds = @('gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4')
+$longContextModelIds = @('gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-cyber', 'gpt-5.5', 'gpt-5.4')
+Assert-Equal $canonicalIds.Count @($canonicalIds | Sort-Object -Unique).Count 'pricing canonical model IDs are unique'
+Assert-Equal $expectedPrices.Count $canonicalIds.Count 'every pricing entry has an exact official-price regression'
+foreach ($pricingModelId in @($expectedPrices.Keys)) {
     $pricingModel = @($prices.models | Where-Object { [string]$_.id -eq $pricingModelId })[0]
     if ($null -eq $pricingModel) { throw "ASSERT FAILED: pricing entry missing for $pricingModelId" }
-    if ([string]::IsNullOrWhiteSpace([string]$pricingModel.source)) { throw "ASSERT FAILED: pricing source missing for $pricingModelId" }
-    if ([double]$pricingModel.input -lt 0 -or [double]$pricingModel.cachedInput -lt 0 -or [double]$pricingModel.output -lt 0) {
-        throw "ASSERT FAILED: pricing values must be non-negative for $pricingModelId"
+    if (-not ([string]$pricingModel.source).StartsWith('https://developers.openai.com/api/docs/models/', [StringComparison]::Ordinal)) {
+        throw "ASSERT FAILED: official pricing source missing for $pricingModelId"
+    }
+    $expected = @($expectedPrices[$pricingModelId])
+    Assert-Near ([double]$expected[0]) ([double]$pricingModel.input) 0.0000001 "$pricingModelId official input price"
+    Assert-Near ([double]$expected[1]) ([double]$pricingModel.cachedInput) 0.0000001 "$pricingModelId official cached-input price"
+    Assert-Near ([double]$expected[2]) ([double]$pricingModel.output) 0.0000001 "$pricingModelId official output price"
+    $expectedContextWindow = if ($largeContextModelIds -contains $pricingModelId) { 1050000L } else { 400000L }
+    $expectedThreshold = if ($longContextModelIds -contains $pricingModelId) { 272000L } else { 0L }
+    Assert-Equal $expectedContextWindow ([Int64]$pricingModel.contextWindow) "$pricingModelId official context window"
+    Assert-Equal $expectedThreshold ([Int64]$pricingModel.longContextThreshold) "$pricingModelId official long-context threshold"
+    Assert-Equal $pricingModelId ([string](Resolve-TokenRaderPrice -Model $pricingModelId -PricingDocument $prices).id) "$pricingModelId canonical price resolution"
+    foreach ($alias in @($pricingModel.aliases)) {
+        Assert-Equal $pricingModelId ([string](Resolve-TokenRaderPrice -Model ([string]$alias) -PricingDocument $prices).id) "$pricingModelId alias price resolution"
     }
 }
 $coreModule = Get-Module TokenRader.Core
@@ -280,9 +312,18 @@ try {
 
     $snapshotPrice = Resolve-TokenRaderPrice -Model 'gpt-5.4-mini-2026-03-17' -PricingDocument $prices
     Assert-Equal 'gpt-5.4-mini' $snapshotPrice.id 'snapshot model price resolution'
+    $astraSnapshotPrice = Resolve-TokenRaderPrice -Model 'gpt-6-astra-2026-09-08' -PricingDocument $prices
+    Assert-Equal 'gpt-6-astra' $astraSnapshotPrice.id 'GPT-6 Astra snapshot price resolution'
+    Assert-Near 10.0 $astraSnapshotPrice.input 0.0000001 'GPT-6 Astra official input price'
+    Assert-Near 1.0 $astraSnapshotPrice.cachedInput 0.0000001 'GPT-6 Astra official cached-input price'
+    Assert-Near 50.0 $astraSnapshotPrice.output 0.0000001 'GPT-6 Astra official output price'
+    Assert-Equal 1050000 ([Int64]$astraSnapshotPrice.contextWindow) 'GPT-6 Astra context window'
+    Assert-Equal 272000 ([Int64]$astraSnapshotPrice.longContextThreshold) 'GPT-6 Astra long-context threshold'
     $aliasPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6' -PricingDocument $prices
     Assert-Equal 'gpt-5.6-sol' $aliasPrice.id 'model alias price resolution'
-    Assert-Equal '2026-09-01' ([string]$prices.verifiedAt) 'pricing verification date'
+    Assert-Equal 'gpt-5.6-sol' ([string](Resolve-TokenRaderPrice -Model 'gpt-daybreak-blue-latest' -PricingDocument $prices).id) 'Daybreak Blue current alias price resolution'
+    Assert-Equal 'gpt-5.6-cyber' ([string](Resolve-TokenRaderPrice -Model 'gpt-daybreak-red-latest' -PricingDocument $prices).id) 'Daybreak Red current alias price resolution'
+    Assert-Equal '2026-09-08' ([string]$prices.verifiedAt) 'pricing verification date'
     Assert-Equal 'Promotional' ([string]$aliasPrice.pricingStatus) 'Sol promotional price status'
     Assert-Equal '2026-11-21' ([string]$aliasPrice.promotionalPriceValidThroughAtLeast) 'Sol promotional price minimum validity'
     $terraPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6-terra' -PricingDocument $prices

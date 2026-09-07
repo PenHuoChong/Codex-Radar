@@ -398,21 +398,36 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 
 ## 官方价格与计价边界
 
-`pricing.json` 保存标准 API 处理价格，最近核对日期为 **2026-09-01**：
+`pricing.json` 保存标准 API 处理价格，最近核对日期为 **2026-09-08**：
 
 | 模型 | 输入 | 缓存输入 | 输出 |
 |---|---:|---:|---:|
+| GPT-6 Astra | $10.00 | $1.00 | $50.00 |
 | GPT-5.6 Sol | $4.00 | $0.40 | $20.00 |
 | GPT-5.6 Terra | $2.00 | $0.20 | $12.00 |
 | GPT-5.6 Luna | $0.20 | $0.02 | $1.20 |
+| GPT-5.6 Cyber | $12.50 | $1.25 | $75.00 |
+| GPT-5.5 | $5.00 | $0.50 | $30.00 |
+| GPT-5.4 mini | $0.75 | $0.075 | $4.50 |
+| GPT-5.4 | $2.50 | $0.25 | $15.00 |
+| GPT-5.3-Codex | $1.75 | $0.175 | $14.00 |
+| GPT-5.2-Codex | $1.75 | $0.175 | $14.00 |
+| GPT-5.2 | $1.75 | $0.175 | $14.00 |
+| GPT-5-Codex | $1.25 | $0.125 | $10.00 |
+| GPT-5 mini | $0.25 | $0.025 | $2.00 |
+| GPT-5 | $1.25 | $0.125 | $10.00 |
 
-单位均为每百万 token。GPT-5.6 Sol 当前为官方促销价，官方说明至少持续至 **2026-11-21**；到期后应重新核验，程序不会擅自恢复旧价。完整模型表及来源 URL 见 `pricing.json`。
+单位均为每百万 token；上表覆盖程序当前支持的全部标准文本 Token 价格。GPT-5.6 Sol 当前为官方促销价，官方说明至少持续至 **2026-11-21**；到期后应重新核验，程序不会擅自恢复旧价。完整模型元数据及来源 URL 见 `pricing.json`。
 
 主要官方来源：
 
+- [OpenAI API 标准价格总表](https://developers.openai.com/api/docs/pricing)
+- [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)
 - [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
 - [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
 - [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+- [GPT-5.6 Cyber](https://developers.openai.com/api/docs/models/gpt-5.6-cyber)
+- [Daybreak Blue](https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest) / [Daybreak Red](https://developers.openai.com/api/docs/models/gpt-daybreak-red-latest)
 - [GPT-5.5](https://developers.openai.com/api/docs/models/gpt-5.5)
 - [GPT-5.4](https://developers.openai.com/api/docs/models/gpt-5.4)
 - [GPT-5.4 mini](https://developers.openai.com/api/docs/models/gpt-5.4-mini)
@@ -420,6 +435,7 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 - [GPT-5.2-Codex](https://developers.openai.com/api/docs/models/gpt-5.2-codex)
 - [GPT-5.2](https://developers.openai.com/api/docs/models/gpt-5.2)
 - [GPT-5-Codex](https://developers.openai.com/api/docs/models/gpt-5-codex)
+- [GPT-5 mini](https://developers.openai.com/api/docs/models/gpt-5-mini)
 - [GPT-5](https://developers.openai.com/api/docs/models/gpt-5)
 
 金额是标准 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单，也不能用来推断一个官方固定的 Pro 周美元池。Pro 5x 的百分比不需要再乘 5。对价格表中明确配置长上下文规则的模型，单次 `input_tokens > 272,000` 时整次请求按输入 2×、输出 1.5×计价；这些模型的 `contextWindow=1,050,000` 只表示最大上下文窗口，不会让所有请求自动套用长上下文价格。当前实现将 JSONL 中可观察到的缓存写入 token 按未缓存输入价格的 1.25 倍计价（GPT-5.6 官方规则采用该倍率）；若 JSONL 提供 `cache_creation_tokens`/`cache_write_tokens`，程序会从普通未缓存输入中扣出并单独计入该项，否则将结果标记为仅可观察 Token，绝不猜测缓存写入量。估算仍不包含工具调用费、Fast mode、图片生成、其他共享客户端消耗、区域处理加价和 Priority/Batch/Flex 差异，这些不可观测消耗会使本地结果低于实际账单。

@@ -1,13 +1,26 @@
 {
   "currency": "USD",
   "unitTokens": 1000000,
-  "verifiedAt": "2026-09-01",
+  "verifiedAt": "2026-09-08",
   "priceType": "OpenAI API Standard processing",
   "models": [
     {
+      "id": "gpt-6-astra",
+      "displayName": "GPT-6 Astra",
+      "aliases": [],
+      "input": 10.00,
+      "cachedInput": 1.00,
+      "output": 50.00,
+      "contextWindow": 1050000,
+      "longContextThreshold": 272000,
+      "longContextInputMultiplier": 2.0,
+      "longContextOutputMultiplier": 1.5,
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-astra"
+    },
+    {
       "id": "gpt-5.6-sol",
       "displayName": "GPT-5.6 Sol",
-      "aliases": ["gpt-5.6"],
+      "aliases": ["gpt-5.6", "gpt-daybreak-blue-latest"],
       "input": 4.00,
       "cachedInput": 0.40,
       "output": 20.00,
@@ -46,6 +59,19 @@
       "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
     },
     {
+      "id": "gpt-5.6-cyber",
+      "displayName": "GPT-5.6 Cyber",
+      "aliases": ["gpt-daybreak-red-latest"],
+      "input": 12.50,
+      "cachedInput": 1.25,
+      "output": 75.00,
+      "contextWindow": 400000,
+      "longContextThreshold": 272000,
+      "longContextInputMultiplier": 2.0,
+      "longContextOutputMultiplier": 1.5,
+      "source": "https://developers.openai.com/api/docs/models/gpt-5.6-cyber"
+    },
+    {
       "id": "gpt-5.5",
       "displayName": "GPT-5.5",
       "aliases": [],
@@ -65,6 +91,7 @@
       "input": 0.75,
       "cachedInput": 0.075,
       "output": 4.50,
+      "contextWindow": 400000,
       "longContextThreshold": 0,
       "source": "https://developers.openai.com/api/docs/models/gpt-5.4-mini"
     },
@@ -88,6 +115,7 @@
       "input": 1.75,
       "cachedInput": 0.175,
       "output": 14.00,
+      "contextWindow": 400000,
       "longContextThreshold": 0,
       "source": "https://developers.openai.com/api/docs/models/gpt-5.3-codex"
     },
@@ -98,6 +126,7 @@
       "input": 1.75,
       "cachedInput": 0.175,
       "output": 14.00,
+      "contextWindow": 400000,
       "longContextThreshold": 0,
       "source": "https://developers.openai.com/api/docs/models/gpt-5.2-codex"
     },
@@ -108,6 +137,7 @@
       "input": 1.75,
       "cachedInput": 0.175,
       "output": 14.00,
+      "contextWindow": 400000,
       "longContextThreshold": 0,
       "source": "https://developers.openai.com/api/docs/models/gpt-5.2"
     },
@@ -118,6 +148,7 @@
       "input": 1.25,
       "cachedInput": 0.125,
       "output": 10.00,
+      "contextWindow": 400000,
       "longContextThreshold": 0,
       "source": "https://developers.openai.com/api/docs/models/gpt-5-codex"
     },
@@ -128,6 +159,7 @@
       "input": 0.25,
       "cachedInput": 0.025,
       "output": 2.00,
+      "contextWindow": 400000,
       "longContextThreshold": 0,
       "source": "https://developers.openai.com/api/docs/models/gpt-5-mini"
     },
@@ -138,6 +170,7 @@
       "input": 1.25,
       "cachedInput": 0.125,
       "output": 10.00,
+      "contextWindow": 400000,
       "longContextThreshold": 0,
       "source": "https://developers.openai.com/api/docs/models/gpt-5"
     }

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$IndexerDllPath = '')
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -173,18 +173,23 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $projectRoot 'TokenRader.Core.psm1') -Force
 $prices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.json')
 $sqliteDll = Join-Path $projectRoot 'indexer\System.Data.SQLite.dll'
-$indexerDll = Join-Path $projectRoot 'indexer\TokenRader.Indexer.dll'
+$indexerDll = if ([string]::IsNullOrWhiteSpace($IndexerDllPath)) {
+    Join-Path $projectRoot 'indexer\TokenRader.Indexer.dll'
+} else {
+    (Resolve-Path -LiteralPath $IndexerDllPath).Path
+}
 if ($null -eq ('System.Data.SQLite.SQLiteConnection' -as [type])) { Add-Type -Path $sqliteDll }
 if ($null -eq ('TokenRaderIndexer' -as [type])) { Add-Type -Path $indexerDll }
 
 # Direct cost checks exercise the same exported pricing function used by the
 # UI and by all compact aggregate buckets. Every boundary is deliberately
 # synthetic and uses call_input (never a cumulative total).
-$boundaryModels = @('gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4')
+$boundaryModels = @('gpt-6-astra', 'gpt-5.6', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-cyber', 'gpt-daybreak-blue-latest', 'gpt-daybreak-red-latest', 'gpt-5.4')
 foreach ($model in $boundaryModels) {
     $price = Resolve-TokenRaderPrice -Model $model -PricingDocument $prices
     Assert-LongContext ($null -ne $price) ('pricing entry exists for ' + $model)
-    Assert-LongContext ([Int64]$price.contextWindow -eq 1050000L) ('1M context metadata for ' + $model)
+    $expectedContextWindow = if ([string]$price.id -eq 'gpt-5.6-cyber') { 400000L } else { 1050000L }
+    Assert-LongContext ([Int64]$price.contextWindow -eq $expectedContextWindow) ('context metadata for ' + $model)
     foreach ($callInput in @(271999L, 272000L, 272001L)) {
         $usage = New-LongContextUsage -InputTokens $callInput -CachedTokens 1000 -OutputTokens 200
         $cost = Get-TokenRaderCost -Usage $usage -Model $model -PricingDocument $prices -Scope call
@@ -244,17 +249,17 @@ try {
     $sessionId = '81000000-0000-0000-0000-000000000001'
     $path = Join-Path $tempRoot ('rollout-' + $sessionId + '.jsonl')
     $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($line in @(New-LongContextJsonlLine -Timestamp '2026-08-30T00:00:01Z' -Model 'gpt-5.6-sol' `
+    foreach ($line in @(New-LongContextJsonlLine -Timestamp '2026-08-30T00:00:01Z' -Model 'gpt-6-astra' `
             -TotalInput 350000 -TotalCached 100 -TotalOutput 100 -CallInput 1000 -CallCached 100 -CallOutput 10 `
             -CacheField 'cache_read_tokens' -CacheCreationTokens 50 -IncludeContextWindow -IncludeTurnContext)) {
         [void]$lines.Add($line)
     }
-    foreach ($line in @(New-LongContextJsonlLine -Timestamp '2026-08-30T00:00:02Z' -Model 'gpt-5.6-sol' `
+    foreach ($line in @(New-LongContextJsonlLine -Timestamp '2026-08-30T00:00:02Z' -Model 'gpt-6-astra' `
             -TotalInput 350100 -TotalCached 120 -TotalOutput 120 -CallInput 100 -CallCached 20 -CallOutput 20 `
             -CacheField 'cache_read_tokens' -CacheCreationField 'cache_write_tokens' -CacheCreationTokens 10 -IncludeContextWindow)) {
         [void]$lines.Add($line)
     }
-    foreach ($line in @(New-LongContextJsonlLine -Timestamp '2026-08-30T00:00:03Z' -Model 'gpt-5.6-sol' `
+    foreach ($line in @(New-LongContextJsonlLine -Timestamp '2026-08-30T00:00:03Z' -Model 'gpt-6-astra' `
             -TotalInput 622101 -TotalCached 120 -TotalOutput 320 -CallInput 272001 -CallCached 0 -CallOutput 200 `
             -CacheField 'cache_creation_tokens' -CacheCreationTokens 30 -IncludeContextWindow)) {
         [void]$lines.Add($line)
@@ -277,7 +282,7 @@ try {
         [Int64]$rows.Rows[0]['long_context_threshold'] -eq 272000L) 'cumulative total_input does not trigger long context'
 
     $thresholds = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
-    $thresholds['gpt-5.6-sol'] = 272000L
+    $thresholds['gpt-6-astra'] = 272000L
     $aggregate = [TokenRaderIndexer]::AggregateIntervalRecords(
         $db, @{ $path = 0L }, @{ $path = $length },
         [DateTimeOffset]::Parse('2026-01-01T00:00:00Z'), $thresholds,
@@ -292,15 +297,16 @@ try {
 
     $noContextSession = '81000000-0000-0000-0000-000000000002'
     $noContextPath = Join-Path $tempRoot ('rollout-' + $noContextSession + '.jsonl')
-    $noContextLine = New-LongContextJsonlLine -Timestamp '2026-08-30T00:00:10Z' -Model 'gpt-5.6-sol' `
+    $noContextLine = New-LongContextJsonlLine -Timestamp '2026-08-30T00:00:10Z' -Model 'gpt-5.6' `
         -TotalInput 1000 -TotalCached 0 -TotalOutput 10 -CallInput 1000 -CallCached 0 -CallOutput 10
     Write-LongContextJsonl -Path $noContextPath -Lines @(
-        ([ordered]@{ timestamp = '2026-08-30T00:00:09Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.6-sol' } } | ConvertTo-Json -Depth 6 -Compress),
+        ([ordered]@{ timestamp = '2026-08-30T00:00:09Z'; type = 'turn_context'; payload = [ordered]@{ model = 'gpt-5.6' } } | ConvertTo-Json -Depth 6 -Compress),
         $noContextLine
     )
     [void](Add-LongContextIndexedFile -Connection $db -Path $noContextPath -SessionId $noContextSession)
     $noContextRows = Get-LongContextRows -Connection $db -Path $noContextPath
     Assert-LongContext ([DBNull]::Value.Equals($noContextRows.Rows[0]['model_context_window'])) 'missing context window remains empty metadata'
+    Assert-LongContext ([Int64]$noContextRows.Rows[0]['long_context_threshold'] -eq 272000L) 'GPT-5.6 alias keeps its official long-context threshold'
     Assert-LongContext (-not [bool]$noContextRows.Rows[0]['cache_write_observable']) 'missing cache-write fields are marked unobservable'
     $missingContextSnapshot = Get-TokenRaderUsageSnapshot -FilePath $noContextPath
     Assert-LongContext ($null -ne $missingContextSnapshot) 'missing context window token snapshot remains readable'
