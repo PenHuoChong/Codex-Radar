@@ -438,7 +438,7 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 - [GPT-5 mini](https://developers.openai.com/api/docs/models/gpt-5-mini)
 - [GPT-5](https://developers.openai.com/api/docs/models/gpt-5)
 
-金额是标准 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单，也不能用来推断一个官方固定的 Pro 周美元池。Pro 5x 的百分比不需要再乘 5。对价格表中明确配置长上下文规则的模型，单次 `input_tokens > 272,000` 时整次请求按输入 2×、输出 1.5×计价；这些模型的 `contextWindow=1,050,000` 只表示最大上下文窗口，不会让所有请求自动套用长上下文价格。当前实现将 JSONL 中可观察到的缓存写入 token 按未缓存输入价格的 1.25 倍计价（GPT-5.6 官方规则采用该倍率）；若 JSONL 提供 `cache_creation_tokens`/`cache_write_tokens`，程序会从普通未缓存输入中扣出并单独计入该项，否则将结果标记为仅可观察 Token，绝不猜测缓存写入量。估算仍不包含工具调用费、Fast mode、图片生成、其他共享客户端消耗、区域处理加价和 Priority/Batch/Flex 差异，这些不可观测消耗会使本地结果低于实际账单。
+金额是标准 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单，也不能用来推断一个官方固定的 Pro 周美元池。Pro 5x 的百分比不需要再乘 5。对价格表中明确配置长上下文规则的模型，单次 `input_tokens > 272,000` 时整次请求按输入 2×、输出 1.5×计价；`contextWindow` 保存各模型官方最大上下文窗口（当前为 400,000 或 1,050,000），不会让所有请求自动套用长上下文价格。当前实现将 JSONL 中可观察到的缓存写入 token 按未缓存输入价格的 1.25 倍计价（GPT-5.6 官方规则采用该倍率）；若 JSONL 提供 `cache_creation_tokens`/`cache_write_tokens`，程序会从普通未缓存输入中扣出并单独计入该项，否则将结果标记为仅可观察 Token，绝不猜测缓存写入量。估算仍不包含工具调用费、Fast mode、图片生成、其他共享客户端消耗、区域处理加价和 Priority/Batch/Flex 差异，这些不可观测消耗会使本地结果低于实际账单。
 
 ## 项目目录结构
 
