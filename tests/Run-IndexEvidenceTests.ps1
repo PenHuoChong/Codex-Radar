@@ -110,7 +110,8 @@ function Add-IndexEvidenceAggregateRow {
         [string]$PlanType = 'pro',
         [string]$RateLimitId = 'synthetic',
         [string]$ServiceTier = '',
-        [string]$ServiceTierSource = ''
+        [string]$ServiceTierSource = '',
+        [string]$Model = 'gpt-5.6-sol'
     )
     $command = $Connection.CreateCommand()
     try {
@@ -121,12 +122,13 @@ INSERT INTO token_records
  source_offset_end,root_session_id,index_revision,request_id,identity_source,
  service_tier,service_tier_source,
  five_hour_used,five_hour_window,five_hour_resets,plan_type,rate_limit_id)
-VALUES (@session,@timestamp,'gpt-5.6-sol',@total,0,10,0,@call,0,10,0,
+VALUES (@session,@timestamp,@model,@total,0,10,0,@call,0,10,0,
  @fingerprint,@path,@offset,@session,1,@request,'request_id',@tier,@tier_source,
  @used,300,@reset,@plan,@limit)
 '@
         [void]$command.Parameters.AddWithValue('@session', $SessionId)
         [void]$command.Parameters.AddWithValue('@timestamp', $Timestamp)
+        [void]$command.Parameters.AddWithValue('@model', $Model)
         [void]$command.Parameters.AddWithValue('@total', $TotalInput)
         [void]$command.Parameters.AddWithValue('@call', $CallInput)
         [void]$command.Parameters.AddWithValue('@fingerprint', ($TotalInput.ToString() + ':0:10:0:' + $CallInput.ToString() + ':0:10:0'))
@@ -289,7 +291,7 @@ try {
             Get-TokenRaderQuotaWindowEvidence -StartWindow $start -EndWindow $end -WindowKind FiveHour -Connection $connection -EndOffsets $ends -Thresholds @{} -PricingDocument $prices -CancellationToken ([Threading.CancellationToken]::None) -Cache @{}
         }
         $evidence = & $coreModule $getEvidence $db $quotaEnds $startWindow $endWindow $quotaPrices
-        Assert-IndexEvidence ($null -ne $evidence -and $evidence.QuotaEvidenceComplete -and $evidence.CountedEvents -eq 2) 'production evidence rejected complete manually confirmed endpoints'
+        Assert-IndexEvidence ($null -ne $evidence -and $evidence.QuotaEvidenceComplete -and -not $evidence.ReferencePricingApplied -and $evidence.CountedEvents -eq 2) 'production evidence rejected complete manually confirmed endpoints'
         Add-IndexEvidenceAggregateRow $db $quotaSession '2026-09-08T04:00:30Z' $quotaPath 35 'quota-plateau' 100 100 2 $reset
         $endWindow.ObservedAt=[DateTimeOffset]::Parse('2026-09-08T04:00:30Z')
         $plateauEvidence = & $coreModule $getEvidence $db $quotaEnds $startWindow $endWindow $quotaPrices
@@ -299,6 +301,45 @@ try {
         Assert-IndexEvidence (-not $invalidQuota) 'quota validator accepted a higher pre-end snapshot'
         $staleEvidence = & $coreModule $getEvidence $db $quotaEnds $startWindow $endWindow $quotaPrices
         Assert-IndexEvidence ($null -eq $staleEvidence) 'production evidence accepted a late lower endpoint'
+
+        # Missing mode evidence may still produce a nonzero, explicitly labelled
+        # Standard-price reference when the endpoints and every model price are
+        # valid. The strict quota flag must remain false.
+        $referencePath = 'synthetic://index-evidence-reference'
+        $referenceSession = '20000000-0000-0000-0000-000000000022'
+        $referenceReset = 1890000001L
+        Add-IndexEvidenceAggregateRow -Connection $db -SessionId $referenceSession -Timestamp '2026-09-08T05:00:00Z' -SourcePath $referencePath -Offset 10 -RequestId 'reference-start' -FiveHourUsed 10 -FiveHourReset $referenceReset
+        Add-IndexEvidenceAggregateRow -Connection $db -SessionId $referenceSession -Timestamp '2026-09-08T05:00:20Z' -SourcePath $referencePath -Offset 20 -RequestId 'reference-end' -FiveHourUsed 12 -FiveHourReset $referenceReset
+        $referenceEnds = @{ $referencePath = 1000L }
+        $referenceStartWindow = [pscustomobject]@{ObservedAt=[DateTimeOffset]::Parse('2026-09-08T05:00:00Z');UsedPercent=10.0;WindowMinutes=300;ResetsAt=[DateTimeOffset]::FromUnixTimeSeconds($referenceReset);PlanType='pro';LimitId='synthetic'}
+        $referenceEndWindow = [pscustomobject]@{ObservedAt=[DateTimeOffset]::Parse('2026-09-08T05:00:20Z');UsedPercent=12.0;WindowMinutes=300;ResetsAt=[DateTimeOffset]::FromUnixTimeSeconds($referenceReset);PlanType='pro';LimitId='synthetic'}
+        $referencePrices = [pscustomobject]@{
+            verifiedAt = 'synthetic-index-evidence'
+            unitTokens = 1000000
+            models = @([pscustomobject]@{ id='gpt-5.6-sol'; aliases=@(); input=1.0; cachedInput=0.5; output=2.0 })
+        }
+        $referenceEvidence = & $coreModule $getEvidence $db $referenceEnds $referenceStartWindow $referenceEndWindow $referencePrices
+        Assert-IndexEvidence ($null -ne $referenceEvidence -and [double]$referenceEvidence.EstimatedTotalUsd -gt 0 -and $referenceEvidence.ReferencePricingApplied -and -not $referenceEvidence.QuotaEvidenceComplete -and $referenceEvidence.PricingComplete) 'unknown mode did not produce a labelled nonzero reference estimate'
+        $referenceLimitsStart = [pscustomobject]@{PlanType='pro';FiveHour=$referenceStartWindow;Weekly=$null}
+        $referenceLimitsEnd = [pscustomobject]@{PlanType='pro';FiveHour=$referenceEndWindow;Weekly=$null}
+        $referenceEstimate = & $coreModule { param($start,$end,$evidence) Get-TokenRaderQuotaEstimate -StartRateLimits $start -EndRateLimits $end -IntervalCost 0 -CostComplete $false -QuotaEvidence ([pscustomobject]@{FiveHour=$evidence;Weekly=$null}) } $referenceLimitsStart $referenceLimitsEnd $referenceEvidence
+        Assert-IndexEvidence ($null -ne $referenceEstimate.FiveHour -and $referenceEstimate.FiveHour.ReferencePricingApplied -and -not $referenceEstimate.FiveHour.QuotaEvidenceComplete -and [double]$referenceEstimate.FiveHour.TotalUsd -gt 0) 'reference label or nonzero estimate was lost at quota-card propagation'
+
+        # A model absent from the synthetic pricing catalog is never eligible
+        # for reference pricing, even with otherwise aligned endpoints.
+        $unknownModelPath = 'synthetic://index-evidence-unknown-model'
+        $unknownModelSession = '20000000-0000-0000-0000-000000000023'
+        Add-IndexEvidenceAggregateRow -Connection $db -SessionId $unknownModelSession -Timestamp '2026-09-08T06:00:00Z' -SourcePath $unknownModelPath -Offset 10 -RequestId 'unknown-model-start' -FiveHourUsed 20 -FiveHourReset $referenceReset -Model 'synthetic-unknown-model'
+        Add-IndexEvidenceAggregateRow -Connection $db -SessionId $unknownModelSession -Timestamp '2026-09-08T06:00:20Z' -SourcePath $unknownModelPath -Offset 20 -RequestId 'unknown-model-end' -FiveHourUsed 22 -FiveHourReset $referenceReset -Model 'synthetic-unknown-model'
+        $unknownModelEnds = @{ $unknownModelPath = 1000L }
+        $unknownModelStartWindow = [pscustomobject]@{ObservedAt=[DateTimeOffset]::Parse('2026-09-08T06:00:00Z');UsedPercent=20.0;WindowMinutes=300;ResetsAt=[DateTimeOffset]::FromUnixTimeSeconds($referenceReset);PlanType='pro';LimitId='synthetic'}
+        $unknownModelEndWindow = [pscustomobject]@{ObservedAt=[DateTimeOffset]::Parse('2026-09-08T06:00:20Z');UsedPercent=22.0;WindowMinutes=300;ResetsAt=[DateTimeOffset]::FromUnixTimeSeconds($referenceReset);PlanType='pro';LimitId='synthetic'}
+        $unknownModelEvidence = & $coreModule $getEvidence $db $unknownModelEnds $unknownModelStartWindow $unknownModelEndWindow $referencePrices
+        Assert-IndexEvidence ($null -ne $unknownModelEvidence -and -not $unknownModelEvidence.PricingComplete -and -not $unknownModelEvidence.ReferencePricingApplied -and @($unknownModelEvidence.UnknownModels) -contains 'synthetic-unknown-model') 'unknown model was silently reference-priced'
+        $unknownModelLimitsStart = [pscustomobject]@{PlanType='pro';FiveHour=$unknownModelStartWindow;Weekly=$null}
+        $unknownModelLimitsEnd = [pscustomobject]@{PlanType='pro';FiveHour=$unknownModelEndWindow;Weekly=$null}
+        $unknownModelEstimate = & $coreModule { param($start,$end,$evidence) Get-TokenRaderQuotaEstimate -StartRateLimits $start -EndRateLimits $end -IntervalCost 0 -CostComplete $false -QuotaEvidence ([pscustomobject]@{FiveHour=$evidence;Weekly=$null}) } $unknownModelLimitsStart $unknownModelLimitsEnd $unknownModelEvidence
+        Assert-IndexEvidence ($null -eq $unknownModelEstimate.FiveHour) 'unknown model produced a quota estimate despite incomplete pricing'
 
         Write-Output 'INDEX_EVIDENCE_TESTS_PASSED'
     } finally {

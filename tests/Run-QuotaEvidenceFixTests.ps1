@@ -129,6 +129,7 @@ function New-QuotaFixEvidence {
     param(
         [bool]$QuotaEvidenceComplete = $true,
         [bool]$ModeAssumptionApplied = $false,
+        [bool]$ReferencePricingApplied = $false,
         [double]$TotalCost = 1.0,
         [double]$EffectiveDeltaPercent = 0.2,
         [DateTimeOffset]$ObservedAt = ([DateTimeOffset]::Parse('2026-09-08T01:00:00Z'))
@@ -138,10 +139,11 @@ function New-QuotaFixEvidence {
         EstimateSource = 'snapshot_delta_usd_estimate'
         PricingComplete = $true
         ServiceTierComplete = $QuotaEvidenceComplete
-        ModeEvidenceComplete = -not $ModeAssumptionApplied
+        ModeEvidenceComplete = $QuotaEvidenceComplete -and -not $ModeAssumptionApplied
         ModeAssumptionApplied = $ModeAssumptionApplied
         ManualServiceTierApplied = $ModeAssumptionApplied
         QuotaEvidenceComplete = $QuotaEvidenceComplete
+        ReferencePricingApplied = $ReferencePricingApplied
         TotalCost = $TotalCost
         EstimatedTotalUsd = $TotalCost / ($EffectiveDeltaPercent / 100.0)
         EstimatedUsedUsd = 10.0
@@ -249,6 +251,27 @@ $manualEvidence = [pscustomobject]@{ FiveHour = New-QuotaFixEvidence -QuotaEvide
 $manualEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $startLimits -EndRateLimits $endLimits -IntervalCost 1.0 -CostComplete $true -QuotaEvidence $manualEvidence
 Assert-QuotaFixNear 500.0 $manualEstimate.FiveHour.TotalUsd 0.0000001 'manual quota estimate uses actual fractional delta'
 Assert-QuotaFixEqual $true $manualEstimate.FiveHour.ManualServiceTierApplied 'manual quota assumption flag reaches estimate card'
+Assert-QuotaFixEqual $false $manualEstimate.FiveHour.ReferencePricingApplied 'manual quota estimate is not labelled as reference pricing'
+
+# An aligned, fully-priced interval may display a Standard-price reference even
+# when the log did not disclose its processing mode. The strict evidence flag
+# remains false and the label must survive quota-estimate propagation.
+$referenceEvidence = New-QuotaFixEvidence -QuotaEvidenceComplete $false -ReferencePricingApplied $true -TotalCost 1.0 -EffectiveDeltaPercent 0.2
+$referenceEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $startLimits -EndRateLimits $endLimits -IntervalCost 0 -CostComplete $false -QuotaEvidence ([pscustomobject]@{ FiveHour = $referenceEvidence; Weekly = $null })
+Assert-QuotaFixEqual $false $referenceEvidence.QuotaEvidenceComplete 'reference pricing keeps strict evidence incomplete'
+Assert-QuotaFixEqual $true $referenceEvidence.ReferencePricingApplied 'unknown mode reference evidence is labelled'
+Assert-QuotaFixEqual $false $referenceEvidence.ModeEvidenceComplete 'reference pricing does not invent mode evidence'
+Assert-QuotaFixEqual $true ([bool]($null -ne $referenceEstimate.FiveHour)) 'reference pricing is allowed through the quota estimate gate'
+Assert-QuotaFixEqual $true $referenceEstimate.FiveHour.ReferencePricingApplied 'reference pricing label reaches estimate card'
+Assert-QuotaFixEqual $false $referenceEstimate.FiveHour.QuotaEvidenceComplete 'estimate card preserves strict evidence false'
+Assert-QuotaFixNear 500.0 $referenceEstimate.FiveHour.TotalUsd 0.0000001 'reference quota estimate uses aligned fractional delta'
+
+# Manual and explicit mode estimates retain their previous semantics and are
+# never marked as Standard-reference pricing.
+$explicitEvidence = New-QuotaFixEvidence -QuotaEvidenceComplete $true -ModeAssumptionApplied $false -ReferencePricingApplied $false -TotalCost 1.0 -EffectiveDeltaPercent 0.2
+$explicitEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $startLimits -EndRateLimits $endLimits -IntervalCost 0 -CostComplete $false -QuotaEvidence ([pscustomobject]@{ FiveHour = $explicitEvidence; Weekly = $null })
+Assert-QuotaFixEqual $true $explicitEstimate.FiveHour.QuotaEvidenceComplete 'explicit mode remains strict-complete'
+Assert-QuotaFixEqual $false $explicitEstimate.FiveHour.ReferencePricingApplied 'explicit mode is not labelled as reference pricing'
 
 # Legacy callers without QuotaEvidence (and old evidence objects without the
 # new fields) retain the previous estimate behavior.
@@ -278,5 +301,19 @@ Assert-QuotaFixNear 500.0 $lateEstimate.FiveHour.TotalUsd 0.0000001 'repeated-la
 $resetEndLimits = [pscustomobject]@{ PlanType = 'synthetic'; FiveHour = New-QuotaFixWindow -UsedPercent 10.2 -ObservedAt $endAt -ResetsAt $endAt.AddHours(5); Weekly = $null }
 $resetEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $startLimits -EndRateLimits $resetEndLimits -IntervalCost 1.0 -CostComplete $true
 Assert-QuotaFixEqual $null $resetEstimate.FiveHour 'reset identity change rejects the affected quota window'
+
+# Reference pricing never bypasses the independent boundary and complete-price
+# guards. A caller cannot opt an invalid boundary or unknown model into a
+# dollar estimate merely by setting the display label.
+$invalidReferenceEvidence = New-QuotaFixEvidence -QuotaEvidenceComplete $false -ReferencePricingApplied $true -TotalCost 1.0 -EffectiveDeltaPercent 0.2
+$invalidReferenceEvidence.BoundaryValid = $false
+$invalidReferenceEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $startLimits -EndRateLimits $endLimits -IntervalCost 0 -CostComplete $false -QuotaEvidence ([pscustomobject]@{ FiveHour = $invalidReferenceEvidence; Weekly = $null })
+Assert-QuotaFixEqual $null $invalidReferenceEstimate.FiveHour 'invalid boundary rejects reference-priced estimate'
+
+$unknownModelEvidence = New-QuotaFixEvidence -QuotaEvidenceComplete $false -ReferencePricingApplied $true -TotalCost 1.0 -EffectiveDeltaPercent 0.2
+$unknownModelEvidence.PricingComplete = $false
+$unknownModelEvidence | Add-Member -NotePropertyName UnknownModels -NotePropertyValue @('synthetic-unknown-model')
+$unknownModelEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits $startLimits -EndRateLimits $endLimits -IntervalCost 0 -CostComplete $false -QuotaEvidence ([pscustomobject]@{ FiveHour = $unknownModelEvidence; Weekly = $null })
+Assert-QuotaFixEqual $null $unknownModelEstimate.FiveHour 'unknown model rejects reference-priced estimate'
 
 Write-Output 'QUOTA_EVIDENCE_FIX_TESTS_PASSED'

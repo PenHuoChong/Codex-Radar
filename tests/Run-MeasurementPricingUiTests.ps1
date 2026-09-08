@@ -48,6 +48,10 @@ $usage=[pscustomobject]@{Text=''};$progress=[pscustomobject]@{Value=0};$dollar=[
 Set-QuotaWindowCard -Window $window -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
 Assert-UiPricing ($dollar.Text.Contains((Format-TokenRaderUsd 30.0)) -and $dollar.Text.Contains((Format-TokenRaderUsd 70.0))) 'retained calibration displays stale used/remaining dollars'
 Assert-UiPricing ($dollar.Text.Contains('人工确认')) 'manual evidence not labeled on quota'
+$estimate | Add-Member -NotePropertyName ReferencePricingApplied -NotePropertyValue $true
+$estimate.ManualServiceTierApplied=$false
+Set-QuotaWindowCard -Window $window -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($dollar.Text.Contains('未知模式按普通价参考') -and $dollar.Text.Contains((Format-TokenRaderUsd 100.0))) 'unknown mode reference must display dollars with its pricing basis'
 $script:State.RateLimits=[pscustomobject]@{FiveHour=$null;Weekly=$window;ObservedAt=$now;PlanType='synthetic'}
 $late=[pscustomobject]@{UsedPercent=29.0;WindowMinutes=10080;PlanType='synthetic';ResetsAt=$reset;ObservedAt=$now.AddSeconds(1)}
 Merge-LatestRateLimits -Candidate ([pscustomobject]@{FiveHour=$null;Weekly=$late;ObservedAt=$late.ObservedAt;PlanType='synthetic'})

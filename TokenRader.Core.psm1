@@ -2055,7 +2055,7 @@ function Get-TokenRaderQuotaEstimate {
                 -not [bool]$Evidence.BoundaryValid -or $null -eq $Evidence.PSObject.Properties['EstimateSource'] -or
                 [string]::IsNullOrWhiteSpace([string]$Evidence.EstimateSource) -or
                 $null -eq $Evidence.PSObject.Properties['PricingComplete'] -or -not [bool]$Evidence.PricingComplete -or
-                -not $evidenceQuotaComplete -or
+                (-not $evidenceQuotaComplete -and -not ($null -ne $Evidence.PSObject.Properties['ReferencePricingApplied'] -and [bool]$Evidence.ReferencePricingApplied)) -or
                 $null -eq $Evidence.PSObject.Properties['EstimatedTotalUsd'] -or [double]$Evidence.EstimatedTotalUsd -le 0 -or
                 $null -eq $Evidence.PSObject.Properties['TotalCost'] -or [double]$Evidence.TotalCost -le 0 -or
                 $null -eq $Evidence.PSObject.Properties['EndObservedAt'] -or
@@ -2105,6 +2105,7 @@ function Get-TokenRaderQuotaEstimate {
                 ModeAssumptionApplied = if ($null -ne $Evidence.PSObject.Properties['ModeAssumptionApplied']) { [bool]$Evidence.ModeAssumptionApplied } else { $false }
                 ManualServiceTierApplied = if ($null -ne $Evidence.PSObject.Properties['ManualServiceTierApplied']) { [bool]$Evidence.ManualServiceTierApplied } else { $false }
                 QuotaEvidenceComplete = if ($null -ne $Evidence.PSObject.Properties['QuotaEvidenceComplete']) { [bool]$Evidence.QuotaEvidenceComplete } else { $true }
+                ReferencePricingApplied = $null -ne $Evidence.PSObject.Properties['ReferencePricingApplied'] -and [bool]$Evidence.ReferencePricingApplied
                 IdentityComplete = if ($null -ne $Evidence.PSObject.Properties['IdentityComplete']) { [bool]$Evidence.IdentityComplete } else { $false }
                 IdentitySources = if ($null -ne $Evidence.PSObject.Properties['IdentitySources']) { @($Evidence.IdentitySources) } else { @() }
                 UnidentifiedEvents = if ($null -ne $Evidence.PSObject.Properties['UnidentifiedEvents']) { [Int64]$Evidence.UnidentifiedEvents } else { 0L }
@@ -3738,9 +3739,8 @@ function Get-TokenRaderQuotaWindowEvidence {
     $priced = ConvertFrom-TokenRaderPricedAggregate -Aggregate $aggregate -PricingDocument $PricingDocument
     # PricingComplete intentionally retains its historical meaning: an
     # unobserved tier can still be shown at the Standard reference rate.  A
-    # quota calibration is stricter and may proceed only when every bucket has
-    # a known tier, either from the log or from an explicit transient manual
-    # confirmation.  The latter is marked as an assumption below.
+    # confirmed quota calibration requires known tiers. Unknown modes may
+    # produce a separately labelled reference without upgrading this flag.
     $quotaEvidenceComplete = $null -ne $priced.PSObject.Properties['QuotaEvidenceComplete'] -and
         [bool]$priced.QuotaEvidenceComplete
     [Int64]$observedTokens = [Int64]$priced.Usage.Total
@@ -3771,7 +3771,10 @@ function Get-TokenRaderQuotaWindowEvidence {
     [double]$estimatedRemainingUsd = 0
     $usdEstimateSource = ''
     [double]$estimatedUsedUsd = 0
-    if ($quotaEvidenceComplete -and [double]$priced.TotalCost -gt 0 -and $deltaPercent -gt 0) {
+    # Missing mode evidence must not hide a usable dollar reference. Keep the
+    # strict evidence flag false and disclose Standard-reference pricing.
+    $referencePricingApplied = [bool]$priced.PricingComplete -and -not $quotaEvidenceComplete
+    if ([bool]$priced.PricingComplete -and [double]$priced.TotalCost -gt 0 -and $deltaPercent -gt 0) {
         if ($observedTokens -gt 0) { $averageUsdPerToken = [double]$priced.TotalCost / [double]$observedTokens }
         $estimatedTotalUsd = [double]$priced.TotalCost / ($deltaPercent / 100.0)
         $estimatedUsedUsd = $estimatedTotalUsd * ($currentUsedPercent / 100.0)
@@ -3812,6 +3815,7 @@ function Get-TokenRaderQuotaWindowEvidence {
         ModeAssumptionApplied = if ($null -ne $priced.PSObject.Properties['ModeAssumptionApplied']) { [bool]$priced.ModeAssumptionApplied } else { $false }
         ManualServiceTierApplied = if ($null -ne $priced.PSObject.Properties['ManualServiceTierApplied']) { [bool]$priced.ManualServiceTierApplied } else { $false }
         QuotaEvidenceComplete = $quotaEvidenceComplete
+        ReferencePricingApplied = $referencePricingApplied
         UnknownModels = @($priced.UnknownModels)
         CountedEvents = [Int64]$aggregate.CountedEvents
         FirstCountedAt = $aggregate.FirstCountedAt

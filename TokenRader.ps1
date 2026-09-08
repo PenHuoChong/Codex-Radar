@@ -1374,6 +1374,9 @@ function Set-QuotaWindowCard {
         if ($null -ne $Estimate.PSObject.Properties['ManualServiceTierApplied'] -and [bool]$Estimate.ManualServiceTierApplied) {
             $historyLabel += ' · 模式经人工确认'
         }
+        if ($null -ne $Estimate.PSObject.Properties['ReferencePricingApplied'] -and [bool]$Estimate.ReferencePricingApplied) {
+            $historyLabel += ' · 未知模式按普通价参考'
+        }
         $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 已用≈{2} · 剩余≈{3}{4}{5} · 来源：{6}{7}' -f
             $currentPercent,
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
@@ -1554,7 +1557,7 @@ function Update-QuotaEstimatesFromInterval {
     } elseif (-not $pricingComplete) {
         ''
     } elseif ($quotaModesIncomplete) {
-        '日志未明确提供计价模式；可在“本次计价模式…”中按模型确认普通或 Fast 后重新计算额度。'
+        '日志未明确提供计价模式；边界有效时直接显示普通价参考额度，也可按模型确认 Fast 后重算。'
     } elseif ([double]$Result.TotalCost -le 0) {
         '当前时间段尚无可计价消耗，点击“查看结果”会再次检查。'
     } else {
