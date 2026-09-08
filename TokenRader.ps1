@@ -2187,7 +2187,10 @@ function Reset-MeasurementPricingConfirmation {
         $script:State.QuotaEstimateAccountIdentity = ''
     }
     $script:State.ManualServiceTiers = @{}
-    if ($null -ne $script:MeasurementPricingButton) { $script:MeasurementPricingButton.Content = '本次计价模式…' }
+    foreach ($price in @($script:Prices.models)) {
+        $script:State.ManualServiceTiers[[string]$price.id] = 'default'
+    }
+    if ($null -ne $script:MeasurementPricingButton) { $script:MeasurementPricingButton.Content = '本次计价模式（人工确认）…' }
 }
 
 function Set-MeasurementPricingConfirmation {
@@ -2232,7 +2235,7 @@ function Show-MeasurementPricingDialog {
     $panel.Margin = '16'
     $dialog.Content = $panel
     $note = New-Object Windows.Controls.TextBlock
-    $note.Text = '仅填写你能确认的模式。设置应用于本次测量及其额度校准快照区间中，该模型的模式缺失记录；明确的日志模式优先。不会把子代理自动设成父任务的模式，也不会修改日志或周期历史。开始新测量后清空。'
+    $note.Text = '按你的设置，各模型默认确认为普通模式，需要时可分别改为 Fast。设置仅补足本次测量及额度校准区间中的缺失模式；明确的日志模式优先。不修改日志或周期历史。开始新测量后恢复全部普通模式。'
     $note.TextWrapping = 'Wrap'
     $note.Margin = '0,0,0,14'
     [Windows.Controls.DockPanel]::SetDock($note, 'Top')

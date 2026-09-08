@@ -37,7 +37,15 @@ $script:State.IntervalComputing=$true
 Assert-UiPricing (-not (Set-MeasurementPricingConfirmation -Selections @{})) 'an active query allowed policy mutation'
 $script:State.IntervalComputing=$false
 Reset-MeasurementPricingConfirmation
-Assert-UiPricing ($script:State.ManualServiceTiers.Count -eq 0) 'new measurement inherited manual assumptions'
+Assert-UiPricing ($script:State.ManualServiceTiers.Count -eq @($script:Prices.models).Count) 'new measurement did not initialize all priced models'
+Assert-UiPricing (@($script:State.ManualServiceTiers.Values | Where-Object { $_ -ne 'default' }).Count -eq 0) 'new measurement retained Fast instead of confirmed Standard'
+$defaultPrices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.json')
+$defaultPrices | Add-Member -NotePropertyName ManualServiceTiers -NotePropertyValue $script:State.ManualServiceTiers
+$usage = [pscustomobject]@{Input=100;Cached=0;Output=10;Total=110;Uncached=100;ReasoningOutput=0}
+$defaultCost = Get-TokenRaderCost -Model 'gpt-6-astra' -Usage $usage -PricingDocument $defaultPrices
+Assert-UiPricing ($defaultCost.ManualServiceTierApplied -and $defaultCost.ServiceTier -eq 'default') 'default selection was not applied as confirmation'
+$explicitCost = Get-TokenRaderCost -Model 'gpt-6-astra' -Usage $usage -PricingDocument $defaultPrices -ServiceTier 'priority'
+Assert-UiPricing ($explicitCost.ServiceTier -eq 'priority' -and -not $explicitCost.ManualServiceTierApplied) 'default Standard overwrote explicit Fast'
 
 $now=[DateTimeOffset]::Now
 $reset=$now.AddDays(5)
