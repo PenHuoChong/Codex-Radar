@@ -280,7 +280,7 @@ try {
         $validQuota = [TokenRaderIndexer]::ValidateQuotaSnapshotPairByOffsets($db, $quotaEnds, 'FiveHour', 300, $reset, 'pro', 'synthetic', 0, [DateTimeOffset]::Parse('2026-09-08T04:00:00Z'), 2, [DateTimeOffset]::Parse('2026-09-08T04:00:20Z'), [Threading.CancellationToken]::None)
         Assert-IndexEvidence $validQuota 'valid zero-percent quota endpoint pair was rejected'
         # Exercise the actual Core evidence path, not just its validator. A
-        # newer observation on the same plateau must keep exact endpoints.
+        # newer observation on the same plateau must keep the completed step.
         $coreModule = Import-Module (Join-Path $projectRoot 'TokenRader.Core.psm1') -PassThru
         $quotaPrices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.json')
         $quotaPrices | Add-Member -NotePropertyName ManualServiceTiers -NotePropertyValue @{'gpt-5.6-sol'='default'} -Force
@@ -291,11 +291,11 @@ try {
             Get-TokenRaderQuotaWindowEvidence -StartWindow $start -EndWindow $end -WindowKind FiveHour -Connection $connection -EndOffsets $ends -Thresholds @{} -PricingDocument $prices -CancellationToken ([Threading.CancellationToken]::None) -Cache @{}
         }
         $evidence = & $coreModule $getEvidence $db $quotaEnds $startWindow $endWindow $quotaPrices
-        Assert-IndexEvidence ($null -ne $evidence -and $evidence.QuotaEvidenceComplete -and -not $evidence.ReferencePricingApplied -and $evidence.CountedEvents -eq 2) 'production evidence rejected complete manually confirmed endpoints'
+        Assert-IndexEvidence ($null -ne $evidence -and $evidence.QuotaEvidenceComplete -and -not $evidence.ReferencePricingApplied -and $evidence.CountedEvents -eq 1 -and $evidence.StartUsedPercent -eq 1) 'production evidence did not select latest completed 1-to-2 step'
         Add-IndexEvidenceAggregateRow $db $quotaSession '2026-09-08T04:00:30Z' $quotaPath 35 'quota-plateau' 100 100 2 $reset
         $endWindow.ObservedAt=[DateTimeOffset]::Parse('2026-09-08T04:00:30Z')
         $plateauEvidence = & $coreModule $getEvidence $db $quotaEnds $startWindow $endWindow $quotaPrices
-        Assert-IndexEvidence ($null -ne $plateauEvidence -and $plateauEvidence.CountedEvents -eq 3 -and $plateauEvidence.EndObservedAt -eq $endWindow.ObservedAt) 'production evidence replaced a later plateau endpoint with the first step'
+        Assert-IndexEvidence ($null -ne $plateauEvidence -and $plateauEvidence.CountedEvents -eq 1 -and $plateauEvidence.EndObservedAt -eq [DateTimeOffset]::Parse('2026-09-08T04:00:20Z')) 'unfinished plateau calls contaminated the completed step'
         Add-IndexEvidenceAggregateRow $db $quotaSession '2026-09-08T04:00:05Z' $quotaPath 40 'quota-high' 100 100 3 $reset
         $invalidQuota = [TokenRaderIndexer]::ValidateQuotaSnapshotPairByOffsets($db, $quotaEnds, 'FiveHour', 300, $reset, 'pro', 'synthetic', 0, [DateTimeOffset]::Parse('2026-09-08T04:00:00Z'), 2, [DateTimeOffset]::Parse('2026-09-08T04:00:20Z'), [Threading.CancellationToken]::None)
         Assert-IndexEvidence (-not $invalidQuota) 'quota validator accepted a higher pre-end snapshot'

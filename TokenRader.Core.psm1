@@ -3606,7 +3606,6 @@ function Get-TokenRaderQuotaWindowEvidence {
     $calibrationStart = $null
     $calibrationEnd = $null
     $historyLookbackApplied = $false
-    [bool]$directPositivePair = $false
     if ($null -ne $StartWindow) {
         if ($null -eq $StartWindow.PSObject.Properties['ObservedAt'] -or $null -eq $StartWindow.ResetsAt -or
             [int]$StartWindow.WindowMinutes -ne [int]$EndWindow.WindowMinutes -or
@@ -3619,97 +3618,36 @@ function Get-TokenRaderQuotaWindowEvidence {
             -not [string]::Equals([string]$StartWindow.LimitId, [string]$EndWindow.LimitId, [StringComparison]::OrdinalIgnoreCase)) { return $null }
         [double]$directDelta = [double]$EndWindow.UsedPercent - [double]$StartWindow.UsedPercent
         if ($directDelta -lt -0.000000001) { return $null }
-        if ($directDelta -gt 0.000000001 -and [DateTimeOffset]$EndWindow.ObservedAt -gt [DateTimeOffset]$StartWindow.ObservedAt) {
-            $directPositivePair = $true
-            # The two snapshots are frozen at different offsets, but another
-            # process may have appended an older observation after a newer
-            # one.  A raw positive endpoint delta would then look valid while
-            # spanning a non-monotonic sequence.  Ask the compiled streaming
-            # validator to check the same reset/plan/window envelope before
-            # accepting the direct pair.  It compares both exact endpoints
-            # and the maxima seen before each endpoint, so a later stale
-            # regression cannot make a positive delta look valid.
-            $effectiveLimitId = if ($null -ne $EndWindow.PSObject.Properties['LimitId']) { [string]$EndWindow.LimitId } else { $RateLimitId }
-            $directPairValid = $false
-            $validatorAvailable = $false
-            try {
-                $directPairValid = [TokenRaderIndexer]::ValidateQuotaSnapshotPairByOffsets(
-                    $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
-                    ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
-                    [string]$EndWindow.PlanType, [string]$effectiveLimitId,
-                    [double]$StartWindow.UsedPercent, ([DateTimeOffset]$StartWindow.ObservedAt),
-                    [double]$EndWindow.UsedPercent, ([DateTimeOffset]$EndWindow.ObservedAt),
-                    $CancellationToken)
-                $validatorAvailable = $true
-            } catch {
-                # Keep Core loadable with an older companion DLL.  The
-                # fallback below still requires a complete same-cycle pair;
-                # it is never used when the streaming validator is present.
-                $validatorAvailable = $false
-            }
-            if (-not $validatorAvailable) {
-                $directPair = $null
-                try {
-                    $directPair = [TokenRaderIndexer]::QueryQuotaCalibrationPairByOffsets(
-                        $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
-                        ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
-                        [string]$EndWindow.PlanType, [string]$effectiveLimitId, [double]$EndWindow.UsedPercent,
-                        ([DateTimeOffset]$EndWindow.ObservedAt), $CancellationToken)
-                } catch { $directPair = $null }
-                if ($null -ne $directPair -and $directPair.Rows.Count -eq 2) {
-                    $directPairStartRecord = ConvertFrom-TokenRaderIndexRecord -Row $directPair.Rows[0]
-                    $directPairEndRecord = ConvertFrom-TokenRaderIndexRecord -Row $directPair.Rows[1]
-                    $directPairStart = if ($WindowKind -eq 'FiveHour') { $directPairStartRecord.RateLimits.FiveHour } else { $directPairStartRecord.RateLimits.Weekly }
-                    $directPairEnd = if ($WindowKind -eq 'FiveHour') { $directPairEndRecord.RateLimits.FiveHour } else { $directPairEndRecord.RateLimits.Weekly }
-                    if ($null -ne $directPairStart -and $null -ne $directPairEnd) {
-                        $pairEndWithinFrozenEnd = [DateTimeOffset]$directPairEnd.ObservedAt -le [DateTimeOffset]$EndWindow.ObservedAt -and
-                            [double]$directPairEnd.UsedPercent -le ([double]$EndWindow.UsedPercent + 0.000000001)
-                        $pairIsMonotonic = [DateTimeOffset]$directPairEnd.ObservedAt -gt [DateTimeOffset]$directPairStart.ObservedAt -and
-                            [double]$directPairEnd.UsedPercent -gt ([double]$directPairStart.UsedPercent + 0.000000001)
-                        $directPairValid = $pairEndWithinFrozenEnd -and $pairIsMonotonic
-                    }
-                }
-            }
-            if ($directPairValid) {
-                $calibrationStart = $StartWindow
-                $calibrationEnd = $EndWindow
-            }
-        }
     }
 
-    # When a short measurement remains inside the same displayed percentage,
-    # recover the latest completed percentage step from this exact account /
-    # plan / reset cycle. If the log exposes tenths or hundredths, the greatest
-    # previous value naturally makes the calibration use that finer real step.
-    if ($null -eq $calibrationStart) {
-        # A positive direct endpoint pair was present but failed the frozen
-        # monotonic-envelope validation above.  Do not silently replace its
-        # boundaries with a different historical pair: the cost interval must
-        # remain exactly (startObserved,endObserved].
-        if ($directPositivePair) { return $null }
-        # A split 5h/weekly record can carry different metadata timestamps. Use
-        # the id attached to this exact window row when available, including an
-        # explicitly empty id; only legacy window objects fall back to the
-        # top-level value supplied by the caller.
-        $effectiveLimitId = if ($null -ne $EndWindow.PSObject.Properties['LimitId']) { [string]$EndWindow.LimitId } else { $RateLimitId }
-        $historyRows = [TokenRaderIndexer]::QueryQuotaCalibrationPairByOffsets(
-            $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
-            ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
-            [string]$EndWindow.PlanType, [string]$effectiveLimitId, $currentUsedPercent,
-            $currentObservedAt, $CancellationToken)
-        if ($null -eq $historyRows -or $historyRows.Rows.Count -ne 2) { return $null }
-        $historyStartRecord = ConvertFrom-TokenRaderIndexRecord -Row $historyRows.Rows[0]
-        $historyEndRecord = ConvertFrom-TokenRaderIndexRecord -Row $historyRows.Rows[1]
-        if ($WindowKind -eq 'FiveHour') {
-            $calibrationStart = $historyStartRecord.RateLimits.FiveHour
-            $calibrationEnd = $historyEndRecord.RateLimits.FiveHour
-        } else {
-            $calibrationStart = $historyStartRecord.RateLimits.Weekly
-            $calibrationEnd = $historyEndRecord.RateLimits.Weekly
-        }
-        $historyLookbackApplied = $true
+    # Always recover the latest completed percentage step from this exact
+    # account / plan / reset cycle.  The compiled selector chooses the
+    # earliest observation of the greatest prior percentage and the first
+    # later observation that reaches the current percentage, using its
+    # monotonic envelope; endpoint measurements are never substituted.
+    # A split 5h/weekly record can carry different metadata timestamps. Use
+    # the id attached to this exact window row when available, including an
+    # explicitly empty id; only legacy window objects fall back to the
+    # top-level value supplied by the caller.
+    $effectiveLimitId = if ($null -ne $EndWindow.PSObject.Properties['LimitId']) { [string]$EndWindow.LimitId } else { $RateLimitId }
+    $historyRows = [TokenRaderIndexer]::QueryQuotaCalibrationPairByOffsets(
+        $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
+        ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
+        [string]$EndWindow.PlanType, [string]$effectiveLimitId, $currentUsedPercent,
+        $currentObservedAt, $CancellationToken)
+    if ($null -eq $historyRows -or $historyRows.Rows.Count -ne 2) { return $null }
+    $historyStartRecord = ConvertFrom-TokenRaderIndexRecord -Row $historyRows.Rows[0]
+    $historyEndRecord = ConvertFrom-TokenRaderIndexRecord -Row $historyRows.Rows[1]
+    if ($WindowKind -eq 'FiveHour') {
+        $calibrationStart = $historyStartRecord.RateLimits.FiveHour
+        $calibrationEnd = $historyEndRecord.RateLimits.FiveHour
+    } else {
+        $calibrationStart = $historyStartRecord.RateLimits.Weekly
+        $calibrationEnd = $historyEndRecord.RateLimits.Weekly
     }
     if ($null -eq $calibrationStart -or $null -eq $calibrationEnd) { return $null }
+    $historyLookbackApplied = $null -eq $StartWindow -or
+        [DateTimeOffset]$calibrationStart.ObservedAt -lt [DateTimeOffset]$StartWindow.ObservedAt
 
     [DateTimeOffset]$startObservedAt = [DateTimeOffset]$calibrationStart.ObservedAt
     [DateTimeOffset]$endObservedAt = [DateTimeOffset]$calibrationEnd.ObservedAt

@@ -610,6 +610,36 @@ try {
     Assert-Equal $true ([bool]$historyQuotaEstimate.FiveHour.HistoryLookbackApplied) 'production quota estimate discarded historical calibration evidence'
     Assert-Near ([double]$historyQuotaResult.QuotaEvidence.FiveHour.EstimatedTotalUsd) ([double]$historyQuotaEstimate.FiveHour.TotalUsd) 0.0000001 'production five-hour card did not use historical calibration dollars'
 
+    # Advance two completed steps after the same baseline: calibration must
+    # roll forward rather than average everything since measurement start.
+    foreach ($step in @(
+        @{At='2026-07-14T02:04:00Z';Input=1500;Cached=150;Output=150;Call=500;Five=52.0;Week=71.1;ExpectedInput=900;ExpectedStart=51.0},
+        @{At='2026-07-14T02:05:00Z';Input=2200;Cached=220;Output=220;Call=700;Five=53.0;Week=71.2;ExpectedInput=700;ExpectedStart=52.0}
+    )) {
+        $stepRecord=New-TestTokenRecord -Timestamp $step.At -TotalInput $step.Input -TotalCached $step.Cached -TotalOutput $step.Output -CallInput $step.Call -CallCached ($step.Call/10) -CallOutput ($step.Call/10) -RateLimits (New-TestRawRateLimits -FiveHourUsed $step.Five -WeeklyUsed $step.Week -FiveHourReset $historyFiveReset -WeeklyReset $historyWeeklyReset)
+        ($stepRecord | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $historyQuotaPath -Encoding UTF8
+        Update-TokenRaderIndex -SessionsRoot $historyQuotaRoot -CandidateFiles @($historyQuotaPath) | Out-Null
+        $stepEnd=CaptureMeasurementEnd -Baseline $historyQuotaBaseline
+        $stepResult=Get-TokenRaderIndexedIntervalResult -Baseline $historyQuotaBaseline -PricingDocument $prices -EndOffsets $stepEnd.EndOffsets -EndRevision $stepEnd.EndRevision
+        Assert-Near $step.ExpectedStart $stepResult.QuotaEvidence.FiveHour.StartUsedPercent 0.0000001 'latest completed step did not advance start'
+        Assert-Near 1.0 $stepResult.QuotaEvidence.FiveHour.EffectiveDeltaPercent 0.0000001 'measurement-wide delta replaced latest step'
+        Assert-Equal $step.ExpectedInput $stepResult.QuotaEvidence.FiveHour.Usage.Input 'latest step included previous completed step costs'
+        Assert-Near 0.1 $stepResult.QuotaEvidence.Weekly.EffectiveDeltaPercent 0.0000001 'weekly latest decimal step not selected independently'
+        Assert-Near ($stepResult.QuotaEvidence.FiveHour.TotalCost*100) $stepResult.QuotaEvidence.FiveHour.EstimatedTotalUsd 0.0000001 'latest step dollar denominator'
+    }
+    Assert-Equal 1600 $stepResult.Usage.Input 'latest-step calibration changed full measurement token scope'
+    Assert-Equal $false ([bool]$stepResult.QuotaEvidence.FiveHour.HistoryLookbackApplied) 'in-measurement completed step mislabeled historical lookback'
+    $samePercentRecord=New-TestTokenRecord -Timestamp '2026-07-14T02:06:00Z' -TotalInput 2500 -TotalCached 250 -TotalOutput 250 -CallInput 300 -CallCached 30 -CallOutput 30 -RateLimits (New-TestRawRateLimits -FiveHourUsed 53 -WeeklyUsed 71.2 -FiveHourReset $historyFiveReset -WeeklyReset $historyWeeklyReset)
+    ($samePercentRecord | ConvertTo-Json -Depth 8 -Compress) | Add-Content -LiteralPath $historyQuotaPath -Encoding UTF8
+    Update-TokenRaderIndex -SessionsRoot $historyQuotaRoot -CandidateFiles @($historyQuotaPath) | Out-Null
+    $samePercentEnd=CaptureMeasurementEnd -Baseline $historyQuotaBaseline
+    $samePercentResult=Get-TokenRaderIndexedIntervalResult -Baseline $historyQuotaBaseline -PricingDocument $prices -EndOffsets $samePercentEnd.EndOffsets -EndRevision $samePercentEnd.EndRevision
+    Assert-Equal 1900 $samePercentResult.Usage.Input 'same-percent new calls missing from measurement'
+    Assert-Near $stepResult.QuotaEvidence.FiveHour.TotalCost $samePercentResult.QuotaEvidence.FiveHour.TotalCost 0.0000001 'unfinished next step contaminated latest completed calibration'
+    $frozenStepResult=Get-TokenRaderIndexedIntervalResult -Baseline $historyQuotaBaseline -PricingDocument $prices -EndOffsets $stepEnd.EndOffsets -EndRevision $stepEnd.EndRevision
+    Assert-Equal 1600 $frozenStepResult.Usage.Input 'frozen step incorporated later appended calls'
+    Assert-Near $stepResult.QuotaEvidence.FiveHour.TotalCost $frozenStepResult.QuotaEvidence.FiveHour.TotalCost 0.0000001 'frozen calibration changed after append'
+
     # The compiled aggregator must remain numerically identical to the legacy
     # byte parser across multiple models, long-context pricing and an unknown
     # model. A timestamp-only repeat of the same cumulative snapshot is dropped,
