@@ -1889,6 +1889,9 @@ try {
     & (Join-Path $PSScriptRoot 'Run-IndexEvidenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaEvidenceFixTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-MeasurementPricingUiTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-ExplorerTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-ExplorerBackfillTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-ExplorerUiTests.ps1')
 
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')

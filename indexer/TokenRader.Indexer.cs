@@ -2937,6 +2937,19 @@ public static class TokenRaderIndexer
         CancellationToken cancellationToken,
         IDictionary progressState = null)
     {
+        return AggregateScopedTimeRangeRecordsAtOffsets(db, endOffsets,
+            startedExclusive, endedInclusive, longContextThresholds,
+            cancellationToken, progressState, null);
+    }
+
+    // Explorer filters ownership only AFTER lineage canonicalization. Ancestor
+    // records may be provided as evidence without charging them to a child.
+    public static TokenRaderIntervalAggregateResult AggregateScopedTimeRangeRecordsAtOffsets(
+        SQLiteConnection db, IDictionary endOffsets,
+        DateTimeOffset startedExclusive, DateTimeOffset endedInclusive,
+        IDictionary longContextThresholds, CancellationToken cancellationToken,
+        IDictionary progressState, string[] countedSessionIds)
+    {
         if (db == null) throw new ArgumentNullException("db");
         if (endedInclusive <= startedExclusive)
             throw new ArgumentException("endedInclusive must be later than startedExclusive");
@@ -3065,7 +3078,8 @@ public static class TokenRaderIndexer
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        FinalizeAggregateLineageCandidates(lineageGroups, thresholds, result);
+        FinalizeAggregateLineageCandidates(lineageGroups, thresholds, result,
+            countedSessionIds == null ? null : new HashSet<string>(countedSessionIds, StringComparer.OrdinalIgnoreCase));
         result.ProcessingMilliseconds = stopwatch.ElapsedMilliseconds;
         SetAggregateProgress(progressState, result.ProcessedRows, "区间聚合完成");
         return result;
@@ -3344,7 +3358,8 @@ public static class TokenRaderIndexer
     private static void FinalizeAggregateLineageCandidates(
         Dictionary<string, List<AggregateEventCandidate>> groups,
         Dictionary<string, long> thresholds,
-        TokenRaderIntervalAggregateResult result)
+        TokenRaderIntervalAggregateResult result,
+        HashSet<string> countedSessionIds = null)
     {
         var activeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -3366,7 +3381,8 @@ public static class TokenRaderIndexer
             for (int i = 0; i < representatives.Count; i++)
             {
                 AggregateEventCandidate candidate = representatives[i];
-                if (!candidate.IncludeInResult) continue;
+                if (!candidate.IncludeInResult ||
+                    (countedSessionIds != null && !countedSessionIds.Contains(candidate.SessionId))) continue;
                 string stableId = !string.IsNullOrWhiteSpace(candidate.RequestId)
                     ? "request:" + candidate.RequestId
                     : (!string.IsNullOrWhiteSpace(candidate.ResponseId) ? "response:" + candidate.ResponseId : "");
@@ -3384,7 +3400,8 @@ public static class TokenRaderIndexer
             for (int i = 0; i < representatives.Count; i++)
             {
                 AggregateEventCandidate candidate = representatives[i];
-                if (!candidate.IncludeInResult) continue;
+                if (!candidate.IncludeInResult ||
+                    (countedSessionIds != null && !countedSessionIds.Contains(candidate.SessionId))) continue;
                 string stableId = !string.IsNullOrWhiteSpace(candidate.RequestId)
                     ? "request:" + candidate.RequestId
                     : (!string.IsNullOrWhiteSpace(candidate.ResponseId) ? "response:" + candidate.ResponseId : "");

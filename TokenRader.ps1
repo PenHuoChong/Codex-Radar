@@ -13,6 +13,7 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.Apartme
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 Import-Module (Join-Path $PSScriptRoot 'TokenRader.Core.psm1') -Force
+. (Join-Path $PSScriptRoot 'TokenRader.Explorer.UI.ps1')
 
 $script:Paths = Get-TokenRaderPaths -ProjectRoot $PSScriptRoot
 $script:Prices = Get-TokenRaderPrices -PricingPath $script:Paths.PricingPath
@@ -263,7 +264,7 @@ $controlNames = @(
     'TotalMetricText', 'HitRateMetricText', 'HitRateProgress', 'UsdCostText', 'CostBreakdownText',
     'LongContextText', 'PricingVerifiedText', 'OpenPricingButton', 'InputPriceText', 'CachedPriceText',
     'OutputPriceText', 'FormulaText', 'PricingDataGrid', 'CaveatText', 'StatusText'
-    'IntervalStatusText', 'IntervalTimeText', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'MeasurementPricingButton'
+    'IntervalStatusText', 'IntervalTimeText', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'MeasurementPricingButton', 'ExplorerButton'
     'FiveHourUsageText', 'FiveHourProgress', 'FiveHourDollarText', 'FiveHourResetText',
     'WeeklyUsageText', 'WeeklyProgress', 'WeeklyDollarText', 'WeeklyResetText', 'QuotaEstimateHintText',
     'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText',
@@ -2696,6 +2697,7 @@ $script:ScopeComboBox.Add_SelectionChanged({
 })
 $script:StartMeasureButton.Add_Click({ Start-IntervalMeasurement })
 $script:MeasurementPricingButton.Add_Click({ Show-MeasurementPricingDialog })
+$script:ExplorerButton.Add_Click({ Show-TokenRaderExplorer })
 $script:StopMeasureButton.Add_Click({ Stop-IntervalMeasurement })
 $script:ViewIntervalButton.Add_Click({
     if ($null -ne $script:State.IntervalBaseline) {
@@ -2732,6 +2734,13 @@ $script:Timer.Add_Tick({
     }
 })
 $script:Window.Add_Closing({
+    param($sender, $eventArgs)
+    if ($null -ne $script:Explorer -and $null -ne $script:Explorer.Job) {
+        $eventArgs.Cancel = $true
+        $script:Explorer.CloseOwner = $true
+        Stop-ExplorerWork
+        return
+    }
     $script:WindowClosing = $true
     $script:Timer.Stop()
     Reset-TokenRaderComputeHost
