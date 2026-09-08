@@ -39,6 +39,12 @@ $script:State.IntervalComputing=$false
 Reset-MeasurementPricingConfirmation
 Assert-UiPricing ($script:State.ManualServiceTiers.Count -eq @($script:Prices.models).Count) 'new measurement did not initialize all priced models'
 Assert-UiPricing (@($script:State.ManualServiceTiers.Values | Where-Object { $_ -ne 'default' }).Count -eq 0) 'new measurement retained Fast instead of confirmed Standard'
+$script:State.QuotaEstimates=[pscustomobject]@{Weekly='retained-standard'}
+Reset-MeasurementPricingConfirmation
+Assert-UiPricing ($script:State.QuotaEstimates.Weekly -eq 'retained-standard') 'unchanged Standard policy erased immediately available dollars'
+$script:State.ManualServiceTiers['gpt-6-astra']='priority'
+Reset-MeasurementPricingConfirmation
+Assert-UiPricing ($null -eq $script:State.QuotaEstimates) 'changed pricing policy retained incompatible dollars'
 $defaultPrices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.json')
 $defaultPrices | Add-Member -NotePropertyName ManualServiceTiers -NotePropertyValue $script:State.ManualServiceTiers
 $usage = [pscustomobject]@{Input=100;Cached=0;Output=10;Total=110;Uncached=100;ReasoningOutput=0}
@@ -60,6 +66,13 @@ $estimate | Add-Member -NotePropertyName ReferencePricingApplied -NotePropertyVa
 $estimate.ManualServiceTierApplied=$false
 Set-QuotaWindowCard -Window $window -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
 Assert-UiPricing ($dollar.Text.Contains('未知模式按普通价参考') -and $dollar.Text.Contains((Format-TokenRaderUsd 100.0))) 'unknown mode reference must display dollars with its pricing basis'
+$estimate | Add-Member -NotePropertyName EndUsedPercent -NotePropertyValue 30.0
+Set-QuotaWindowCard -Window $null -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($dollar.Text.Contains((Format-TokenRaderUsd 100.0)) -and $dollar.Text.Contains('沿用最近有效快照')) 'transient missing snapshot hid available dollars'
+$estimate.ResetsAt=$now.AddSeconds(-1)
+Set-QuotaWindowCard -Window $null -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($dollar.Text -eq '美金额度：暂无当前窗口') 'expired estimate was presented as current dollars'
+$estimate.ResetsAt=$reset
 $script:State.RateLimits=[pscustomobject]@{FiveHour=$null;Weekly=$window;ObservedAt=$now;PlanType='synthetic'}
 $late=[pscustomobject]@{UsedPercent=29.0;WindowMinutes=10080;PlanType='synthetic';ResetsAt=$reset;ObservedAt=$now.AddSeconds(1)}
 Merge-LatestRateLimits -Candidate ([pscustomobject]@{FiveHour=$null;Weekly=$late;ObservedAt=$late.ObservedAt;PlanType='synthetic'})

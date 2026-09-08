@@ -1352,6 +1352,15 @@ function Set-QuotaWindowCard {
         [Parameter(Mandatory = $true)]$ResetText
     )
 
+    $usingPreviousSnapshot = $false
+    if ($null -eq $Window -and $null -ne $Estimate -and
+        $null -ne $Estimate.PSObject.Properties['EndUsedPercent'] -and
+        $null -ne $Estimate.PSObject.Properties['ResetsAt'] -and $null -ne $Estimate.ResetsAt -and
+        [DateTimeOffset]$Estimate.ResetsAt -gt [DateTimeOffset]::Now) {
+        # A missing refresh snapshot must not hide a retained, unexpired estimate.
+        $Window = [pscustomobject]@{UsedPercent=$Estimate.EndUsedPercent;ResetsAt=$Estimate.ResetsAt;WindowMinutes=$Estimate.WindowMinutes}
+        $usingPreviousSnapshot = $true
+    }
     $windowExpired = $null -ne $Window -and $null -ne $Window.ResetsAt -and
         [DateTimeOffset]$Window.ResetsAt -le [DateTimeOffset]::Now
     if ($null -eq $Window -or $windowExpired) {
@@ -1387,6 +1396,7 @@ function Set-QuotaWindowCard {
             $historyLabel,
             $sourceLabel,
             $identityLabel)
+        if ($usingPreviousSnapshot) { $DollarText.Text += ' · 沿用最近有效快照，正在更新' }
     } else {
         $DollarText.Text = '美金额度：尚无有效估算结果'
     }
@@ -2183,14 +2193,19 @@ function Stop-IntervalMeasurement {
 }
 
 function Reset-MeasurementPricingConfirmation {
-    if ($script:State.ContainsKey('ManualServiceTiers') -and $script:State.ManualServiceTiers.Count -gt 0) {
+    $defaults = @{}
+    foreach ($price in @($script:Prices.models)) { $defaults[[string]$price.id] = 'default' }
+    $samePolicy = $script:State.ContainsKey('ManualServiceTiers') -and $script:State.ManualServiceTiers.Count -eq $defaults.Count
+    if ($samePolicy) {
+        foreach ($id in $defaults.Keys) {
+            if (-not $script:State.ManualServiceTiers.ContainsKey($id) -or [string]$script:State.ManualServiceTiers[$id] -ne 'default') { $samePolicy=$false; break }
+        }
+    }
+    if (-not $samePolicy) {
         $script:State.QuotaEstimates = $null
         $script:State.QuotaEstimateAccountIdentity = ''
     }
-    $script:State.ManualServiceTiers = @{}
-    foreach ($price in @($script:Prices.models)) {
-        $script:State.ManualServiceTiers[[string]$price.id] = 'default'
-    }
+    $script:State.ManualServiceTiers = $defaults
     if ($null -ne $script:MeasurementPricingButton) { $script:MeasurementPricingButton.Content = '本次计价模式（人工确认）…' }
 }
 
