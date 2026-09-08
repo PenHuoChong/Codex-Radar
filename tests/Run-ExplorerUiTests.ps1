@@ -21,7 +21,7 @@ Assert-ExplorerUi $rejected 'reversed range was accepted'
 [xml]$xml=Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $root 'ExplorerWindow.xaml')
 $window=[Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($xml))
 $controls=@{}
-foreach ($name in @('Reload','Backfill','Titles','Cancel','Query','Tree','Range','From','To','Selection','Summary','Coverage','Models','Status')) {
+foreach ($name in @('Reload','Backfill','Titles','Cancel','Query','Tree','Range','From','To','Selection','Summary','Coverage','Models','Status','Search','SearchButton')) {
     $controls[$name]=$window.FindName($name)
     Assert-ExplorerUi ($null -ne $controls[$name]) ('Missing explorer control '+$name)
 }
@@ -33,6 +33,29 @@ $project=$controls.Tree.Items[0]
 Assert-ExplorerUi (-not $project.Tag.Loaded) 'conversation controls eagerly loaded'
 $project.IsExpanded=$true
 Assert-ExplorerUi ($project.Tag.Loaded -and $project.Items[0].Header -eq 'Synthetic title') 'lazy expansion or title metadata failed'
+$script:Explorer.TitleMap=@{'synthetic-session'='审阅项目进展与GitHub对接（干净继承）';'another-session'='审阅项目进展与GitHub对接（干净继承）'}
+$catalog.Projects[0].Sessions += [pscustomobject]@{SessionId='another-session';DisplayName='another'}
+$controls.Search.Text='GitHub对接'
+Set-ExplorerCatalog $catalog
+$project=$controls.Tree.Items[0]
+Assert-ExplorerUi ($project.IsExpanded -and $project.Items.Count -eq 2) 'name filter did not retain both same-title conversations'
+Assert-ExplorerUi ($project.Items[0].Tag.SessionId -ne $project.Items[1].Tag.SessionId) 'same titles merged distinct session identities'
+Assert-ExplorerUi ($project.Items[0].Tag.Name -eq '审阅项目进展与GitHub对接（干净继承）') 'query selection did not use conversation title'
+$controls.Search.Text='synthetic-session'
+Set-ExplorerCatalog $catalog
+Assert-ExplorerUi ($controls.Tree.Items.Count -eq 0) 'name search unexpectedly matched an internal ID'
+$controls.Search.Text='example'
+Set-ExplorerCatalog $catalog
+Assert-ExplorerUi ($controls.Tree.Items[0].Items.Count -eq 2) 'case-insensitive project name search failed'
+$controls.Search.Text=''
+$script:Explorer.TitleMap=@{}
+Set-ExplorerCatalog $catalog
+$controls.Tree.Items[0].IsExpanded=$true
+Assert-ExplorerUi ($controls.Tree.Items[0].Items[0].Header -eq '未命名对话（标题未读取或不可用）') 'missing titles displayed opaque IDs as names'
+Assert-ExplorerUi ($controls.Tree.Items[0].Items[0].ToolTip -eq 'synthetic-session') 'internal ID unavailable for disambiguation'
+Complete-ExplorerWork ([pscustomobject]@{Catalog=$catalog;TitleMap=@{'synthetic-session'='Updated title'}}) 'Catalog'
+$controls.Tree.Items[0].IsExpanded=$true
+Assert-ExplorerUi ($controls.Tree.Items[0].Items[0].Header -eq 'Updated title') 'refresh did not update names'
 $usage=[pscustomobject]@{Input=300;Cached=200;Uncached=100;Output=20;Total=320}
 $result=[pscustomobject]@{Usage=$usage;TotalCost=0.125;PricingComplete=$true;CoverageMessage='Synthetic coverage';Items=@([pscustomobject]@{Model='synthetic-model';ServiceTier='default';Usage=$usage;Cost=[pscustomobject]@{TotalCost=0.125}})}
 Complete-ExplorerWork $result 'Query'

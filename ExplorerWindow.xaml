@@ -12,6 +12,11 @@
     </StackPanel>
     <StackPanel Grid.Row="1" Margin="0,0,0,12">
       <TextBlock Text="独立查询，不改变主界面的测量范围。点击项目汇总项目，点击对话包含其子代理；仅手动操作触发。" TextWrapping="Wrap"/>
+      <WrapPanel Margin="0,8,0,0">
+        <TextBlock Text="项目 / 对话名称：" VerticalAlignment="Center"/>
+        <TextBox x:Name="Search" Width="340" ToolTip="输入名称关键词，点击检索或按回车；留空显示全部。"/>
+        <Button x:Name="SearchButton" Content="按名称检索" Margin="8,0,0,0" Padding="10,4"/>
+      </WrapPanel>
       <WrapPanel Margin="0,10,0,0">
         <ComboBox x:Name="Range" Width="130" SelectedIndex="0">
           <ComboBoxItem Content="最近24小时" Tag="1"/><ComboBoxItem Content="最近7天" Tag="7"/>

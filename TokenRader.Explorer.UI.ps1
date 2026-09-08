@@ -14,7 +14,7 @@ function Get-ExplorerTimeRange {
 
 function Set-ExplorerBusy {
     param([bool]$Busy)
-    foreach ($name in @('Reload','Backfill','Titles','Query','Tree','Range','From','To')) {
+    foreach ($name in @('Reload','Backfill','Titles','Query','Tree','Range','From','To','Search','SearchButton')) {
         $script:Explorer.Controls[$name].IsEnabled = -not $Busy
     }
     $script:Explorer.Controls.Cancel.IsEnabled = $Busy
@@ -30,11 +30,17 @@ function Set-ExplorerCatalog {
     $script:Explorer.Catalog = $Catalog
     $tree = $script:Explorer.Controls.Tree
     $tree.Items.Clear()
+    $filter = $script:Explorer.Controls.Search.Text.Trim()
     foreach ($project in @($Catalog.Projects)) {
+        $sessions = @(foreach ($session in @($project.Sessions)) {
+            $title = Get-ExplorerConversationName $session
+            if ($filter.Length -eq 0 -or ([string]$project.ProjectName).IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $title.IndexOf($filter, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $session }
+        })
+        if ($filter.Length -gt 0 -and $sessions.Count -eq 0) { continue }
         $node = New-Object Windows.Controls.TreeViewItem
         $node.Header = [string]$project.ProjectName
         $node.ToolTip = [string]$project.ProjectPath
-        $node.Tag = [pscustomobject]@{ProjectPath=[string]$project.ProjectPath;SessionId='';Name=[string]$project.ProjectName;Sessions=@($project.Sessions);Loaded=$false}
+        $node.Tag = [pscustomobject]@{ProjectPath=[string]$project.ProjectPath;SessionId='';Name=[string]$project.ProjectName;Sessions=$sessions;Loaded=$false}
         [void]$node.Items.Add('展开查看对话')
         $node.Add_Expanded({
             param($sender,$eventArgs)
@@ -42,8 +48,7 @@ function Set-ExplorerCatalog {
             $sender.Items.Clear()
             foreach ($session in @($sender.Tag.Sessions)) {
                 $child = New-Object Windows.Controls.TreeViewItem
-                $title = [string]$session.DisplayName
-                if ($script:Explorer.TitleMap.ContainsKey([string]$session.SessionId)) { $title=$script:Explorer.TitleMap[[string]$session.SessionId] }
+                $title = Get-ExplorerConversationName $session
                 $child.Header=$title
                 $child.ToolTip=[string]$session.SessionId
                 $child.Tag=[pscustomobject]@{ProjectPath=[string]$sender.Tag.ProjectPath;SessionId=[string]$session.SessionId;Name=$title}
@@ -52,7 +57,21 @@ function Set-ExplorerCatalog {
             $sender.Tag.Loaded=$true
         })
         [void]$tree.Items.Add($node)
+        if ($filter.Length -gt 0) { $node.IsExpanded = $true }
     }
+}
+
+function Get-ExplorerConversationName {
+    param($Session)
+    $id = [string]$Session.SessionId
+    if ($script:Explorer.TitleMap.ContainsKey($id) -and -not [string]::IsNullOrWhiteSpace([string]$script:Explorer.TitleMap[$id])) { return [string]$script:Explorer.TitleMap[$id] }
+    return '未命名对话（标题未读取或不可用）'
+}
+
+function Confirm-ExplorerTitleAccess {
+    $answer=[Windows.MessageBox]::Show($script:Explorer.Window,'是否只读本机 .codex/session_index.jsonl 的对话 ID 和标题，用于按名称显示和检索？标题可能包含私人信息，仅保留在此窗口内存中；不读取正文、auth.json 或密钥，不写入缓存。','读取标题授权',[Windows.MessageBoxButton]::YesNo)
+    $script:Explorer.TitlesAuthorized = $answer -eq [Windows.MessageBoxResult]::Yes
+    return $script:Explorer.TitlesAuthorized
 }
 
 function Complete-ExplorerWork {
@@ -63,7 +82,8 @@ function Complete-ExplorerWork {
         if ($null -ne $script:Explorer.Catalog) { Set-ExplorerCatalog $script:Explorer.Catalog }
         $c.Status.Text='已读取本机标题元数据；未读取正文，标题只保留在此窗口内存中。'
     } elseif ($Operation -in @('Catalog','Backfill')) {
-        Set-ExplorerCatalog $Result
+        if ($null -ne $Result.PSObject.Properties['TitleMap']) { $script:Explorer.TitleMap=$Result.TitleMap; Set-ExplorerCatalog $Result.Catalog }
+        else { Set-ExplorerCatalog $Result }
         $c.Status.Text='项目列表已更新。选择项目或展开后选择对话；全部时间仅覆盖本机保留的日志。'
     } else {
         $partial=if ($Result.PricingComplete) {''} else {'（部分）'}
@@ -96,7 +116,7 @@ function Start-ExplorerWork {
     param([string]$Operation)
     $e=$script:Explorer
     if ($null -ne $e.Job) { return }
-    $args=@{ProjectRoot=$PSScriptRoot;Operation=$Operation;CodexRoot=$script:Paths.CodexRoot}
+    $args=@{ProjectRoot=$PSScriptRoot;Operation=$Operation;CodexRoot=$script:Paths.CodexRoot;ReadTitles=[bool]$e.TitlesAuthorized}
     try {
         if ($Operation -eq 'Query') {
             $node=$e.Controls.Tree.SelectedItem
@@ -114,10 +134,10 @@ function Start-ExplorerWork {
         $args.CancellationToken=$cts.Token; $args.ProgressState=$progress
         $worker=[PowerShell]::Create()
         [void]$worker.AddScript({
-            param($ProjectRoot,$Operation,$CodexRoot,$ProjectPath='',$SessionId='',$StartAt=$null,$EndAt=$null,$CancellationToken,$ProgressState)
+            param($ProjectRoot,$Operation,$CodexRoot,$ProjectPath='',$SessionId='',$StartAt=$null,$EndAt=$null,$CancellationToken,$ProgressState,[bool]$ReadTitles=$false)
             $ErrorActionPreference='Stop'
             Import-Module (Join-Path $ProjectRoot 'TokenRader.Explorer.psm1') -Force
-            if ($Operation -eq 'Titles') {
+            if ($ReadTitles -and $Operation -in @('Titles','Catalog','Backfill')) {
                 # Explicit UI consent precedes this one-file metadata read.
                 $map=@{}; $path=Join-Path $CodexRoot 'session_index.jsonl'
                 if (Test-Path -LiteralPath $path) {
@@ -126,13 +146,17 @@ function Start-ExplorerWork {
                     try { while (-not $reader.EndOfStream) {
                         $CancellationToken.ThrowIfCancellationRequested()
                         try { $entry=$reader.ReadLine() | ConvertFrom-Json } catch { continue }
-                        if ($null -ne $entry.id -and $null -ne $entry.thread_name) { $map[[string]$entry.id]=[string]$entry.thread_name }
+                        if (-not [string]::IsNullOrWhiteSpace([string]$entry.id) -and -not [string]::IsNullOrWhiteSpace([string]$entry.thread_name)) { $map[[string]$entry.id]=[string]$entry.thread_name }
                     } } finally { $reader.Dispose() }
                 }
-                return ,$map
+                if ($Operation -eq 'Titles') { return ,$map }
             }
             if ($Operation -eq 'Backfill') { Update-TokenRaderExplorerIndex -ProjectRoot $ProjectRoot -CancellationToken $CancellationToken -ProgressState $ProgressState | Out-Null }
-            if ($Operation -in @('Catalog','Backfill')) { return Get-TokenRaderExplorerCatalog -ProjectRoot $ProjectRoot }
+            if ($Operation -in @('Catalog','Backfill')) {
+                $catalog=Get-TokenRaderExplorerCatalog -ProjectRoot $ProjectRoot
+                if ($ReadTitles) { return [pscustomobject]@{Catalog=$catalog;TitleMap=$map} }
+                return $catalog
+            }
             Get-TokenRaderExplorerResult -ProjectRoot $ProjectRoot -ProjectPath $ProjectPath -SessionId $SessionId -StartAt $StartAt -EndAt $EndAt -CancellationToken $CancellationToken
         }.ToString())
         foreach ($key in $args.Keys) { [void]$worker.AddParameter($key,$args[$key]) }
@@ -158,8 +182,8 @@ function Show-TokenRaderExplorer {
     $window=[Windows.Markup.XamlReader]::Load([Xml.XmlNodeReader]::new($xaml))
     $window.Owner=$script:Window
     $controls=@{}
-    foreach ($name in @('Reload','Backfill','Titles','Cancel','Query','Tree','Range','From','To','Selection','Summary','Coverage','Models','Status')) { $controls[$name]=$window.FindName($name) }
-    $script:Explorer=@{Window=$window;Controls=$controls;Job=$null;Closed=$false;CloseOwner=$false;Catalog=$null;TitleMap=@{};Timer=(New-Object Windows.Threading.DispatcherTimer)}
+    foreach ($name in @('Reload','Backfill','Titles','Cancel','Query','Tree','Range','From','To','Selection','Summary','Coverage','Models','Status','Search','SearchButton')) { $controls[$name]=$window.FindName($name) }
+    $script:Explorer=@{Window=$window;Controls=$controls;Job=$null;Closed=$false;CloseOwner=$false;Catalog=$null;TitleMap=@{};TitlesAuthorized=$false;Timer=(New-Object Windows.Threading.DispatcherTimer)}
     $controls.From.Text=[DateTime]::Now.AddDays(-1).ToString('yyyy-MM-dd HH:mm:ss')
     $controls.To.Text=[DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
     $controls.From.IsEnabled=$false; $controls.To.IsEnabled=$false
@@ -168,13 +192,14 @@ function Show-TokenRaderExplorer {
     $controls.Query.Add_Click({Start-ExplorerWork 'Query'})
     $controls.Tree.Add_SelectedItemChanged({Start-ExplorerWork 'Query'})
     $controls.Cancel.Add_Click({Stop-ExplorerWork})
+    $controls.SearchButton.Add_Click({ if ($null -ne $script:Explorer.Catalog) { Set-ExplorerCatalog $script:Explorer.Catalog } })
+    $controls.Search.Add_KeyDown({ param($sender,$eventArgs) if ($eventArgs.Key -eq [Windows.Input.Key]::Return -and $null -eq $script:Explorer.Job -and $null -ne $script:Explorer.Catalog) { Set-ExplorerCatalog $script:Explorer.Catalog; $eventArgs.Handled=$true } })
     $controls.Backfill.Add_Click({
         $answer=[Windows.MessageBox]::Show($script:Explorer.Window,'将只读扫描本机 sessions 中保留的日志，提取项目、任务关系和 Token 元数据，写入本项目独立查询缓存。不读取密钥，不保存对话正文，不修改原始日志。历史较多时可能耗时较长，可取消。是否继续？','手动补齐历史',[Windows.MessageBoxButton]::YesNo)
         if ($answer -eq [Windows.MessageBoxResult]::Yes) { Start-ExplorerWork 'Backfill' }
     })
     $controls.Titles.Add_Click({
-        $answer=[Windows.MessageBox]::Show($script:Explorer.Window,'是否只读本机 .codex/session_index.jsonl 的对话 ID 和标题？标题可能包含私人信息，仅在此窗口显示，不读取正文、auth.json 或密钥，不写入缓存。','读取标题授权',[Windows.MessageBoxButton]::YesNo)
-        if ($answer -eq [Windows.MessageBoxResult]::Yes) { Start-ExplorerWork 'Titles' }
+        if (Confirm-ExplorerTitleAccess) { Start-ExplorerWork 'Titles' }
     })
     $script:Explorer.Timer.Interval=[TimeSpan]::FromMilliseconds(100)
     $script:Explorer.Timer.Add_Tick({
@@ -201,5 +226,6 @@ function Show-TokenRaderExplorer {
         if ($null -ne $script:Explorer.Job) { Stop-ExplorerWork } else { $script:Explorer.Timer.Stop(); $script:Explorer=$null }
     })
     $window.Show()
+    [void](Confirm-ExplorerTitleAccess)
     Start-ExplorerWork 'Catalog'
 }
