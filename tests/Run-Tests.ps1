@@ -243,7 +243,7 @@ $aliasPricingEntry = @($aliasPricingDocument.models | Where-Object { [string]$_.
 $aliasPricingEntry.aliases = @('synthetic-gpt-5.5-alias')
 $aliasPricingCacheKey = & $coreModule { param($document) Get-TokenRaderPricingCacheKey -PricingDocument $document } $aliasPricingDocument
 Assert-Equal $false ($basePricingCacheKey -eq $aliasPricingCacheKey) 'usage-history pricing cache invalidates when model aliases change'
-if (-not $basePricingCacheKey.StartsWith('usage-history-v5|', [StringComparison]::Ordinal)) {
+if (-not $basePricingCacheKey.StartsWith('usage-history-v6|', [StringComparison]::Ordinal)) {
     throw 'ASSERT FAILED: usage-history pricing cache key is missing its algorithm version'
 }
 
@@ -1881,6 +1881,7 @@ try {
     if ($Performance) { & $aggregateTestScript -IncludeLegacyInterference }
     else { & $aggregateTestScript }
     & (Join-Path $PSScriptRoot 'Run-ModelBackfillTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-ServiceTierTests.ps1')
 
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')
@@ -1931,6 +1932,37 @@ try {
     # compute path must not fall back to invoking the parser on the UI thread.
     $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
     $coreSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.Core.psm1'))
+    # Exercise production pricing helpers against synthetic results without
+    # starting the application or opening the user's index/session catalog.
+    foreach ($helperName in @('Get-ServiceTierLabel', 'Get-ResultServiceTierSummary', 'Set-ResultPricing', 'Set-PricingTable')) {
+        $helperMatch = [regex]::Match($uiSource, '(?s)function ' + [regex]::Escape($helperName) + '\b.*?(?=\r?\nfunction |\z)')
+        if (-not $helperMatch.Success) { throw ('UI CONTRACT FAILED: missing helper ' + $helperName) }
+        Invoke-Expression $helperMatch.Value
+    }
+    $script:State = @{ CurrentPriceUrl = '' }
+    foreach ($controlName in @('InputPriceText', 'CachedPriceText', 'OutputPriceText', 'OpenPricingButton', 'PricingDataGrid', 'PricingVerifiedText')) {
+        Set-Variable -Name $controlName -Value ($window.FindName($controlName)) -Scope Script
+    }
+    $fastUiItem = [pscustomobject]@{ ServiceTier = 'priority'; Events = 2L; LongContext = $true; Cost = [pscustomobject]@{ Known = $true } }
+    $standardUiItem = [pscustomobject]@{ ServiceTier = 'default'; Events = 1L; LongContext = $false; Cost = [pscustomobject]@{ Known = $true } }
+    $fastUiResult = [pscustomobject]@{ Models = @('gpt-6-astra'); Items = @($fastUiItem) }
+    Set-ResultPricing -Result $fastUiResult
+    Assert-Equal '$20' $script:InputPriceText.Text 'UI uses Fast input price'
+    Assert-Equal '$2' $script:CachedPriceText.Text 'UI uses Fast cached price'
+    Assert-Equal '$100' $script:OutputPriceText.Text 'UI uses Fast output price'
+    Assert-Equal $true $script:OpenPricingButton.IsEnabled 'UI Fast price source remains available'
+    $mixedUiResult = [pscustomobject]@{ Models = @('gpt-6-astra'); Items = @($fastUiItem, $standardUiItem) }
+    Set-ResultPricing -Result $mixedUiResult
+    Assert-Equal '混合模式' $script:InputPriceText.Text 'UI does not show one price for mixed modes'
+    $tierSummary = Get-ResultServiceTierSummary -Result $mixedUiResult
+    if ($tierSummary -notmatch '快速 Fast 2 次' -or $tierSummary -notmatch '普通 1 次' -or $tierSummary -notmatch '长上下文 2 次') {
+        throw 'UI CONTRACT FAILED: mode totals must retain the long-context summary'
+    }
+    $fastUiItem.Cost.Known = $false
+    Set-ResultPricing -Result $fastUiResult
+    Assert-Equal '未公布' $script:InputPriceText.Text 'UI must not show short Fast prices for an unsupported bucket'
+    Set-PricingTable
+    Assert-Equal 1 @($script:PricingDataGrid.ItemsSource | Where-Object { $_.Model -eq 'GPT-6 Astra · 快速 Fast' }).Count 'UI price table contains an Astra Fast row'
     $quotaMatcherMatch = [regex]::Match($uiSource, '(?s)function Test-TokenRaderQuotaEstimateMatchesWindow\b.*?(?=\r?\nfunction |\z)')
     if (-not $quotaMatcherMatch.Success) { throw 'UI CONTRACT FAILED: quota-window matcher was not found' }
     Invoke-Expression $quotaMatcherMatch.Value

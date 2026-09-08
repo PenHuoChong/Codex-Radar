@@ -257,6 +257,7 @@ ALL_TESTS_PASSED
 
 测试覆盖：
 
+- 快速/普通模式逐调用计价、模式切换、长上下文组合、父子去重及周期缓存中的模式明细；专项脚本为 `tests/Run-ServiceTierTests.ps1`。
 - token、模型、账号计划和额度窗口解析；
 - Unix 秒、Unix 毫秒、ISO 时间和 `resets_in_seconds` 重置时间解析；
 - 缓存与未缓存输入计算；
@@ -398,7 +399,7 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 
 ## 官方价格与计价边界
 
-`pricing.json` 保存标准 API 处理价格，最近核对日期为 **2026-09-08**：
+`pricing.json` 保存标准 API 价格及已核验的 Fast 价格，最近核对日期为 **2026-09-08**。下表为标准价格，Fast 费率保存在各模型的 `serviceTiers.priority` 中并显示于程序价格表：
 
 | 模型 | 输入 | 缓存输入 | 输出 |
 |---|---:|---:|---:|
@@ -438,7 +439,21 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 - [GPT-5 mini](https://developers.openai.com/api/docs/models/gpt-5-mini)
 - [GPT-5](https://developers.openai.com/api/docs/models/gpt-5)
 
-金额是标准 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单，也不能用来推断一个官方固定的 Pro 周美元池。Pro 5x 的百分比不需要再乘 5。对价格表中明确配置长上下文规则的模型，单次 `input_tokens > 272,000` 时整次请求按输入 2×、输出 1.5×计价；`contextWindow` 保存各模型官方最大上下文窗口（当前为 400,000 或 1,050,000），不会让所有请求自动套用长上下文价格。当前实现将 JSONL 中可观察到的缓存写入 token 按未缓存输入价格的 1.25 倍计价（GPT-5.6 官方规则采用该倍率）；若 JSONL 提供 `cache_creation_tokens`/`cache_write_tokens`，程序会从普通未缓存输入中扣出并单独计入该项，否则将结果标记为仅可观察 Token，绝不猜测缓存写入量。估算仍不包含工具调用费、Fast mode、图片生成、其他共享客户端消耗、区域处理加价和 Priority/Batch/Flex 差异，这些不可观测消耗会使本地结果低于实际账单。
+金额是按日志服务模式折算的 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单，也不能用来推断一个官方固定的 Pro 周美元池。Pro 5x 的百分比不需要再乘 5。对价格表中明确配置长上下文规则的模型，单次 `input_tokens > 272,000` 时整次请求按输入 2×、输出 1.5×计价；`contextWindow` 保存各模型官方最大上下文窗口（当前为 400,000 或 1,050,000），不会让所有请求自动套用长上下文价格。当前实现将 JSONL 中可观察到的缓存写入 token 按未缓存输入价格的 1.25 倍计价（GPT-5.6 官方规则采用该倍率）；若 JSONL 提供 `cache_creation_tokens`/`cache_write_tokens`，程序会从普通未缓存输入中扣出并单独计入该项，否则将结果标记为仅可观察 Token，绝不猜测缓存写入量。估算仍不包含工具调用费、图片生成、其他共享客户端消耗、区域处理加价和 Batch/Flex 等未收录服务价格，这些不可观测消耗会使本地结果低于实际账单。
+
+### 快速模式与普通模式
+
+日志中的 `service_tier=fast` / `priority` 统一识别为快速模式，`default` / `standard` 识别为普通模式。调用记录提供的实际 response 模式优先于请求设置，其次使用该调用所属 `turn_context` 的模式。新 turn 未提供模式或显式写入 `null` 时清空旧模式；单次调用的覆盖值不会改变后续调用的 turn 设置。
+
+仅有 `turn_context` 时，模式证据代表请求设置，不能保证服务端未降级；如果同一调用稍后补充了实际 response 模式，汇总会更正费率而不新增 Token 或改变调用时间。没有实际返回模式时，按请求模式折算仍可能与实际处理价格不同。
+
+每个模型按“服务模式 × 标准/长上下文”分别分桶，适用于最后一次调用、整次任务、时间段、项目、周期用量及额度校准。父子复制调用仍先去重，再采用规范祖先的模型及服务模式。周期磁盘缓存保存模式明细；升级后价格缓存自动失效，使用已保存的元数据重新折算。界面的原有明细位置显示普通/Fast调用数，价格表列出对应模式费率。
+
+缺失、`auto` 或 `unknown` 的记录不能证明实际服务模式：界面显示“模式未知（普通价参考）”，保留标准 API 参考金额，内部 `ServiceTierKnown=false`。明确指定了其他模式但价格表未收录相应费率时，该桶标为价格不完整，不按普通价冒充 Fast 价格。旧索引没有保存的模式信息不会靠模型名称、推理强度、当前配置或运行速度猜测；本次升级不触发全量日志回填，无法恢复旧版未单独保存的 turn 模式边界。
+
+截至 2026-09-08，GPT-6 Astra、GPT-5.6 Sol/Terra/Luna 的 Fast **API Token 费率为标准价的 2 倍**；不同模型仍使用 `pricing.json` 中逐项核验的费率。已公布长上下文Fast费率的调用在相应模式价格上应用倍率一次，Token数不乘倍率。GPT-5.5/GPT-5.4仅收录官方公布的短上下文Fast价格；超过272K的Fast调用保留Token，但该桶标为价格不完整。ChatGPT订阅的 Fast额度消耗则为GPT-6 Astra/GPT-5.6/GPT-5.5标准模式的2.5倍、GPT-5.4的2倍；这些订阅倍率不乘进API美元或日志百分比。混合模式下反推的API等价总额度也可能变化。
+
+官方依据：[API Fast mode](https://developers.openai.com/api/docs/guides/fast-mode)、[API价格表](https://developers.openai.com/api/docs/pricing)、[Codex速度与订阅消耗](https://learn.chatgpt.com/docs/agent-configuration/speed)。
 
 ## 项目目录结构
 
@@ -459,6 +474,7 @@ Codex-Limit-USD-Radar/
 ├─ tests/
 │  ├─ Run-Tests.ps1                 # 回归测试与可选 Live 检查
 │  ├─ Run-AggregatePerformanceTests.ps1 # 编译态聚合语义与大批量性能测试
+│  ├─ Run-ServiceTierTests.ps1       # Fast/普通模式计价与模式边界回归
 │  ├─ Run-UiCallbackTests.ps1        # 后台回调、超时与取消测试
 │  └─ Render-Preview.ps1             # 合成预览图生成
 ├─ Build.ps1                         # 构建 TokenRader.exe
@@ -481,7 +497,7 @@ Codex-Limit-USD-Radar/
 - 跨项目派生任务缺少父日志时，继承历史的项目归属可能不完整。
 - 派生/子任务累计量包含父历史，因此不直接显示累计美元。
 - 价格表为人工核对的静态快照；官方调价后需要更新 `pricing.json`。
-- API 等价美元不等于套餐账单或官方固定美元池。Fast/Priority、日志未提供的缓存写入、图片/工具、失败请求和其他客户端仍可能使快照区间的可观察 API 成本及额度估算偏少。
+- API 等价美元不等于套餐账单或官方固定美元池。未记录服务模式的调用、日志未提供的缓存写入、图片/工具、失败请求和其他客户端仍可能使快照区间的可观察 API 成本及额度估算偏少。
 - 当前真实JSONL通常没有服务端`limit_tokens`；这不影响美元公式，因为美元额度使用快照间可观察API成本/百分比增量反推。其他客户端或不可观察消耗仍会影响该估算。
 - 当前真实`token_count`可能没有request/response ID，只能按事件顺序继承`turn_id`。程序会标记请求级去重不完整；该标记说明请求身份的证据等级，不会把已完成的累计Token与父子血缘去重结果改成重复计费。
 - 开始/结束测量状态和冻结快照只保存在内存中；程序关闭后不能恢复未完成测量。

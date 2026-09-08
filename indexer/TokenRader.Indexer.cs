@@ -96,6 +96,15 @@ internal sealed class TokenRaderJsonRecord
 public sealed class TokenRaderIntervalAggregateBucket
 {
     public string Model { get; set; }
+    /// <summary>
+    /// Normalized processing tier for this bucket.  "priority" represents
+    /// both Fast and Priority wire values; "default" represents Standard,
+    /// Normal, and Default.  An empty value means that the log did not expose
+    /// a resolvable tier (including Auto/Unknown), so callers must not guess.
+    /// </summary>
+    public string ServiceTier { get; set; }
+    public bool ServiceTierObservable { get; set; }
+    public string ServiceTierSource { get; set; }
     public bool LongContext { get; set; }
     public long Input { get; set; }
     public long Cached { get; set; }
@@ -111,6 +120,8 @@ public sealed class TokenRaderIntervalAggregateBucket
     public TokenRaderIntervalAggregateBucket()
     {
         Model = "";
+        ServiceTier = "";
+        ServiceTierSource = "";
         LongContextSource = "";
     }
 }
@@ -163,6 +174,8 @@ public sealed class TokenRaderIntervalAggregateResult
 public sealed class TokenRaderUsageHistoryModelSnapshot
 {
     public string Model { get; set; }
+    /// <summary>Normalized processing tier for this model history row.</summary>
+    public string ServiceTier { get; set; }
     public long TotalInput { get; set; }
     public long TotalCached { get; set; }
     public long TotalOutput { get; set; }
@@ -186,6 +199,7 @@ public sealed class TokenRaderUsageHistoryModelSnapshot
     public TokenRaderUsageHistoryModelSnapshot()
     {
         Model = "";
+        ServiceTier = "";
     }
 }
 
@@ -311,6 +325,9 @@ public static class TokenRaderIndexer
         public string RootSessionId = "";
         public string SourcePath = "";
         public string Model = "";
+        public string ServiceTier = "";
+        public bool ServiceTierObservable;
+        public string ServiceTierSource = "";
         public DateTimeOffset EventAt;
         public bool HasTimestamp;
         public string TurnId = "";
@@ -328,6 +345,44 @@ public static class TokenRaderIndexer
         public long CallOutput;
         public long CallReasoning;
         public bool IncludeInResult = true;
+    }
+
+    // Cumulative snapshots are deduplicated for billing, but a later status
+    // refresh can contain a stronger, actual response-tier observation. Keep
+    // the first candidate reference so that observation can enrich its tier
+    // without changing any usage totals, timestamps or lineage identity.
+    private sealed class AggregateCumulativeSnapshotIndex
+    {
+        private readonly HashSet<string> _seen =
+            new HashSet<string>(StringComparer.Ordinal);
+        private readonly Dictionary<string, AggregateEventCandidate> _candidates =
+            new Dictionary<string, AggregateEventCandidate>(StringComparer.Ordinal);
+
+        public bool Observe(string key, string sessionId, string serviceTier, string serviceTierSource)
+        {
+            if (_seen.Add(key ?? "")) return true;
+
+            AggregateEventCandidate existing;
+            if (_candidates.TryGetValue(key ?? "", out existing) && existing != null &&
+                string.Equals(existing.SessionId ?? "", sessionId ?? "", StringComparison.OrdinalIgnoreCase) &&
+                IsStrongerServiceTierEvidence(existing.ServiceTierSource, serviceTierSource))
+            {
+                existing.ServiceTier = NormalizeServiceTier(serviceTier);
+                existing.ServiceTierObservable = !string.IsNullOrWhiteSpace(existing.ServiceTier);
+                existing.ServiceTierSource = NormalizeServiceTierSource(
+                    serviceTierSource, existing.ServiceTier);
+            }
+            return false;
+        }
+
+        public void Register(string key, AggregateEventCandidate candidate)
+        {
+            if (candidate == null || !_seen.Contains(key ?? "")) return;
+            string normalizedKey = key ?? "";
+            AggregateEventCandidate existing;
+            if (!_candidates.TryGetValue(normalizedKey, out existing) || existing == null)
+                _candidates[normalizedKey] = candidate;
+        }
     }
 
     private sealed class QuotaSnapshotCandidate
@@ -563,7 +618,7 @@ public static class TokenRaderIndexer
     {
         using (var cmd = db.CreateCommand())
         {
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS file_metadata (path TEXT PRIMARY KEY, length INTEGER NOT NULL, last_write_ticks INTEGER NOT NULL, parsed_offset INTEGER NOT NULL DEFAULT 0, session_id TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '', parent_thread_id TEXT NOT NULL DEFAULT '', forked_from_id TEXT NOT NULL DEFAULT '', content_retained INTEGER NOT NULL DEFAULT 1, root_session_id TEXT NOT NULL DEFAULT '')";
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS file_metadata (path TEXT PRIMARY KEY, length INTEGER NOT NULL, last_write_ticks INTEGER NOT NULL, parsed_offset INTEGER NOT NULL DEFAULT 0, session_id TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '', parent_thread_id TEXT NOT NULL DEFAULT '', forked_from_id TEXT NOT NULL DEFAULT '', content_retained INTEGER NOT NULL DEFAULT 1, root_session_id TEXT NOT NULL DEFAULT '', turn_context_service_tier TEXT NOT NULL DEFAULT '', turn_context_service_tier_source TEXT NOT NULL DEFAULT '')";
             cmd.ExecuteNonQuery();
 
             // Existing installations may have a four-column file_metadata table.
@@ -575,8 +630,10 @@ public static class TokenRaderIndexer
             EnsureFileMetadataColumn(db, "forked_from_id", "TEXT NOT NULL DEFAULT ''");
             EnsureFileMetadataColumn(db, "content_retained", "INTEGER NOT NULL DEFAULT 1");
             EnsureFileMetadataColumn(db, "root_session_id", "TEXT NOT NULL DEFAULT ''");
+            EnsureFileMetadataColumn(db, "turn_context_service_tier", "TEXT NOT NULL DEFAULT ''");
+            EnsureFileMetadataColumn(db, "turn_context_service_tier_source", "TEXT NOT NULL DEFAULT ''");
 
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', response_id TEXT NOT NULL DEFAULT '', identity_source TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', rate_limit_id TEXT NOT NULL DEFAULT '', rate_limit_name TEXT NOT NULL DEFAULT '', credits_balance REAL, credits_has INTEGER, credits_unlimited INTEGER, five_hour_used_tokens INTEGER, five_hour_remaining_tokens INTEGER, five_hour_limit_tokens INTEGER, weekly_used_tokens INTEGER, weekly_remaining_tokens INTEGER, weekly_limit_tokens INTEGER, rate_limit_individual INTEGER, rate_limit_reached_type TEXT NOT NULL DEFAULT '', spend_control_reached INTEGER, model_context_window INTEGER, long_context_threshold INTEGER, long_context_applied INTEGER NOT NULL DEFAULT 0, long_context_source TEXT NOT NULL DEFAULT '', cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_write_observable INTEGER NOT NULL DEFAULT 0)";
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', response_id TEXT NOT NULL DEFAULT '', identity_source TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', service_tier_source TEXT NOT NULL DEFAULT '', turn_context_service_tier TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', rate_limit_id TEXT NOT NULL DEFAULT '', rate_limit_name TEXT NOT NULL DEFAULT '', credits_balance REAL, credits_has INTEGER, credits_unlimited INTEGER, five_hour_used_tokens INTEGER, five_hour_remaining_tokens INTEGER, five_hour_limit_tokens INTEGER, weekly_used_tokens INTEGER, weekly_remaining_tokens INTEGER, weekly_limit_tokens INTEGER, rate_limit_individual INTEGER, rate_limit_reached_type TEXT NOT NULL DEFAULT '', spend_control_reached INTEGER, model_context_window INTEGER, long_context_threshold INTEGER, long_context_applied INTEGER NOT NULL DEFAULT 0, long_context_source TEXT NOT NULL DEFAULT '', cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_write_observable INTEGER NOT NULL DEFAULT 0)";
             cmd.ExecuteNonQuery();
 
             // New columns are additive so databases created by older builds
@@ -592,6 +649,8 @@ public static class TokenRaderIndexer
             EnsureTokenRecordColumn(db, "response_id", "TEXT NOT NULL DEFAULT ''");
             EnsureTokenRecordColumn(db, "identity_source", "TEXT NOT NULL DEFAULT ''");
             EnsureTokenRecordColumn(db, "service_tier", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "service_tier_source", "TEXT NOT NULL DEFAULT ''");
+            EnsureTokenRecordColumn(db, "turn_context_service_tier", "TEXT NOT NULL DEFAULT ''");
             EnsureTokenRecordColumn(db, "reasoning_effort", "TEXT NOT NULL DEFAULT ''");
             EnsureTokenRecordColumn(db, "rate_limit_id", "TEXT NOT NULL DEFAULT ''");
             EnsureTokenRecordColumn(db, "rate_limit_name", "TEXT NOT NULL DEFAULT ''");
@@ -658,8 +717,12 @@ public static class TokenRaderIndexer
             EnsureUsageHistoryColumn(db, "long_context_extra_cost", "REAL NOT NULL DEFAULT 0");
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_usage_history_end ON usage_history(window_end_ticks)";
             cmd.ExecuteNonQuery();
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS usage_history_models (window_start_ticks INTEGER NOT NULL, window_end_ticks INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL DEFAULT 0, total_cached INTEGER NOT NULL DEFAULT 0, total_output INTEGER NOT NULL DEFAULT 0, total_reasoning INTEGER NOT NULL DEFAULT 0, input_cost REAL NOT NULL DEFAULT 0, cached_cost REAL NOT NULL DEFAULT 0, output_cost REAL NOT NULL DEFAULT 0, pricing_complete INTEGER NOT NULL DEFAULT 1, events INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(window_start_ticks,window_end_ticks,model))";
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS usage_history_models (window_start_ticks INTEGER NOT NULL, window_end_ticks INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL DEFAULT 0, total_cached INTEGER NOT NULL DEFAULT 0, total_output INTEGER NOT NULL DEFAULT 0, total_reasoning INTEGER NOT NULL DEFAULT 0, input_cost REAL NOT NULL DEFAULT 0, cached_cost REAL NOT NULL DEFAULT 0, output_cost REAL NOT NULL DEFAULT 0, pricing_complete INTEGER NOT NULL DEFAULT 1, events INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(window_start_ticks,window_end_ticks,model,service_tier))";
             cmd.ExecuteNonQuery();
+            // Existing indexes used (window_start_ticks,window_end_ticks,model)
+            // as the key.  Rebuild that small history table once so two tiers
+            // for one model can coexist; token rows themselves remain fully
+            // additive/migratable through EnsureTokenRecordColumn above.
             EnsureUsageHistoryModelColumn(db, "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0");
             EnsureUsageHistoryModelColumn(db, "cache_write_observable", "INTEGER NOT NULL DEFAULT 0");
             EnsureUsageHistoryModelColumn(db, "standard_context_events", "INTEGER NOT NULL DEFAULT 0");
@@ -667,6 +730,8 @@ public static class TokenRaderIndexer
             EnsureUsageHistoryModelColumn(db, "standard_context_input", "INTEGER NOT NULL DEFAULT 0");
             EnsureUsageHistoryModelColumn(db, "long_context_input", "INTEGER NOT NULL DEFAULT 0");
             EnsureUsageHistoryModelColumn(db, "long_context_output", "INTEGER NOT NULL DEFAULT 0");
+            EnsureUsageHistoryModelColumn(db, "service_tier", "TEXT NOT NULL DEFAULT ''");
+            EnsureUsageHistoryModelServiceTierKey(db);
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_usage_history_models_end ON usage_history_models(window_end_ticks)";
             cmd.ExecuteNonQuery();
         }
@@ -768,13 +833,14 @@ public static class TokenRaderIndexer
                 {
                     modelCmd.Transaction = tx;
                     modelCmd.CommandText =
-                        "INSERT INTO usage_history_models (window_start_ticks,window_end_ticks,model,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events," +
+                        "INSERT INTO usage_history_models (window_start_ticks,window_end_ticks,model,service_tier,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events," +
                         "cache_creation_tokens,cache_write_observable,standard_context_events,long_context_events,standard_context_input,long_context_input,long_context_output) " +
-                        "VALUES (@start,@end,@model,@input,@cached,@output,@reasoning,@input_cost,@cached_cost,@output_cost,@complete,@events,@cache_creation,@cache_write," +
+                        "VALUES (@start,@end,@model,@service_tier,@input,@cached,@output,@reasoning,@input_cost,@cached_cost,@output_cost,@complete,@events,@cache_creation,@cache_write," +
                         "@standard_events,@long_events,@standard_input,@long_input,@long_output)";
                     modelCmd.Parameters.AddWithValue("@start", snapshot.WindowStartTicks);
                     modelCmd.Parameters.AddWithValue("@end", snapshot.WindowEndTicks);
                     modelCmd.Parameters.AddWithValue("@model", model.Model ?? "");
+                    modelCmd.Parameters.AddWithValue("@service_tier", NormalizeServiceTier(model.ServiceTier));
                     modelCmd.Parameters.AddWithValue("@input", model.TotalInput);
                     modelCmd.Parameters.AddWithValue("@cached", model.TotalCached);
                     modelCmd.Parameters.AddWithValue("@output", model.TotalOutput);
@@ -881,9 +947,9 @@ public static class TokenRaderIndexer
         using (var cmd = db.CreateCommand())
         {
             cmd.CommandText =
-                "SELECT model,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events," +
+                "SELECT model,service_tier,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events," +
                 "cache_creation_tokens,cache_write_observable,standard_context_events,long_context_events,standard_context_input,long_context_input,long_context_output " +
-                "FROM usage_history_models WHERE window_start_ticks=@start AND window_end_ticks=@end ORDER BY model ASC";
+                "FROM usage_history_models WHERE window_start_ticks=@start AND window_end_ticks=@end ORDER BY model ASC,service_tier ASC";
             cmd.Parameters.AddWithValue("@start", windowStartTicks);
             cmd.Parameters.AddWithValue("@end", windowEndTicks);
             using (var reader = cmd.ExecuteReader())
@@ -892,22 +958,23 @@ public static class TokenRaderIndexer
                 {
                     result.Add(new TokenRaderUsageHistoryModelSnapshot {
                         Model = ReadReaderString(reader, 0),
-                        TotalInput = ReadReaderInt64(reader, 1),
-                        TotalCached = ReadReaderInt64(reader, 2),
-                        TotalOutput = ReadReaderInt64(reader, 3),
-                        TotalReasoning = ReadReaderInt64(reader, 4),
-                        InputCost = reader.IsDBNull(5) ? 0.0 : Convert.ToDouble(reader.GetValue(5), CultureInfo.InvariantCulture),
-                        CachedCost = reader.IsDBNull(6) ? 0.0 : Convert.ToDouble(reader.GetValue(6), CultureInfo.InvariantCulture),
-                        OutputCost = reader.IsDBNull(7) ? 0.0 : Convert.ToDouble(reader.GetValue(7), CultureInfo.InvariantCulture),
-                        PricingComplete = !reader.IsDBNull(8) && Convert.ToInt32(reader.GetValue(8), CultureInfo.InvariantCulture) != 0,
-                        Events = ReadReaderInt64(reader, 9),
-                        CacheCreationTokens = ReadReaderInt64(reader, 10),
-                        CacheWriteObservable = !reader.IsDBNull(11) && Convert.ToInt32(reader.GetValue(11), CultureInfo.InvariantCulture) != 0,
-                        StandardContextEvents = ReadReaderInt64(reader, 12),
-                        LongContextEvents = ReadReaderInt64(reader, 13),
-                        StandardContextInput = ReadReaderInt64(reader, 14),
-                        LongContextInput = ReadReaderInt64(reader, 15),
-                        LongContextOutput = ReadReaderInt64(reader, 16)
+                        ServiceTier = NormalizeServiceTier(ReadReaderString(reader, 1)),
+                        TotalInput = ReadReaderInt64(reader, 2),
+                        TotalCached = ReadReaderInt64(reader, 3),
+                        TotalOutput = ReadReaderInt64(reader, 4),
+                        TotalReasoning = ReadReaderInt64(reader, 5),
+                        InputCost = reader.IsDBNull(6) ? 0.0 : Convert.ToDouble(reader.GetValue(6), CultureInfo.InvariantCulture),
+                        CachedCost = reader.IsDBNull(7) ? 0.0 : Convert.ToDouble(reader.GetValue(7), CultureInfo.InvariantCulture),
+                        OutputCost = reader.IsDBNull(8) ? 0.0 : Convert.ToDouble(reader.GetValue(8), CultureInfo.InvariantCulture),
+                        PricingComplete = !reader.IsDBNull(9) && Convert.ToInt32(reader.GetValue(9), CultureInfo.InvariantCulture) != 0,
+                        Events = ReadReaderInt64(reader, 10),
+                        CacheCreationTokens = ReadReaderInt64(reader, 11),
+                        CacheWriteObservable = !reader.IsDBNull(12) && Convert.ToInt32(reader.GetValue(12), CultureInfo.InvariantCulture) != 0,
+                        StandardContextEvents = ReadReaderInt64(reader, 13),
+                        LongContextEvents = ReadReaderInt64(reader, 14),
+                        StandardContextInput = ReadReaderInt64(reader, 15),
+                        LongContextInput = ReadReaderInt64(reader, 16),
+                        LongContextOutput = ReadReaderInt64(reader, 17)
                     });
                 }
             }
@@ -926,8 +993,6 @@ public static class TokenRaderIndexer
         @"""request_id""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
     private static readonly Regex _responseIdValue = new Regex(
         @"""response_id""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
-    private static readonly Regex _serviceTierValue = new Regex(
-        @"""service_tier""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
     private static readonly Regex _reasoningEffortValue = new Regex(
         @"""reasoning_effort""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
 
@@ -942,6 +1007,322 @@ public static class TokenRaderIndexer
     private static readonly Regex _computerScreenshotType = new Regex(
         @"""type""\s*:\s*""computer_screenshot""",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static readonly string[][] _responseServiceTierPaths = new[] {
+        new[] { "payload", "info", "response", "service_tier" },
+        new[] { "payload", "response", "service_tier" },
+        new[] { "response", "service_tier" }
+    };
+
+    private static readonly string[][] _serviceTierPaths = new[] {
+        new[] { "payload", "info", "service_tier" },
+        new[] { "payload", "service_tier" },
+        new[] { "service_tier" }
+    };
+
+    /// <summary>
+    /// Normalizes the small set of documented wire aliases without inferring
+    /// an unobserved mode.  Auto/Unknown are deliberately unresolved; other
+    /// non-empty labels are retained so the caller can report unsupported
+    /// pricing instead of silently charging them as Standard.
+    /// </summary>
+    private static string NormalizeServiceTier(string raw)
+    {
+        string value = (raw ?? "").Trim().ToLowerInvariant();
+        if (value.Length == 0 || value == "auto" || value == "unknown") return "";
+        if (value == "fast" || value == "priority") return "priority";
+        if (value == "default" || value == "standard" || value == "normal") return "default";
+        return value;
+    }
+
+    private static string NormalizeServiceTierSource(string source, string tier)
+    {
+        string normalized = (source ?? "").Trim().ToLowerInvariant();
+        if (normalized.Length == 0)
+            return string.IsNullOrWhiteSpace(tier) ? "missing" : "indexed";
+        return normalized;
+    }
+
+    /// <summary>
+    /// Selects a token row's actual response tier before falling back to the
+    /// turn context.  Response fields win over service_tier fields, matching
+    /// the precedence used by the API payloads across rollout versions.
+    /// </summary>
+    private static bool TryExtractTokenServiceTier(
+        string line,
+        string fallbackTier,
+        string fallbackSource,
+        out string tier,
+        out bool observable,
+        out string source)
+    {
+        tier = NormalizeServiceTier(fallbackTier);
+        observable = !string.IsNullOrWhiteSpace(tier);
+        source = NormalizeServiceTierSource(fallbackSource, tier);
+        if (string.IsNullOrWhiteSpace(line) || line.IndexOf("service_tier", StringComparison.OrdinalIgnoreCase) < 0)
+            return false;
+
+        string raw;
+        bool isNull;
+        for (int i = 0; i < _responseServiceTierPaths.Length; i++)
+        {
+            if (!TryGetJsonStringOrNullAtPath(line, _responseServiceTierPaths[i], out raw, out isNull)) continue;
+            tier = isNull ? "" : NormalizeServiceTier(raw);
+            observable = !isNull && !string.IsNullOrWhiteSpace(tier);
+            source = isNull ? "response_null" : "response";
+            return true;
+        }
+        for (int i = 0; i < _serviceTierPaths.Length; i++)
+        {
+            if (!TryGetJsonStringOrNullAtPath(line, _serviceTierPaths[i], out raw, out isNull)) continue;
+            tier = isNull ? "" : NormalizeServiceTier(raw);
+            observable = !isNull && !string.IsNullOrWhiteSpace(tier);
+            source = isNull ? "service_tier_null" : "service_tier";
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryExtractTurnContextServiceTier(
+        string line,
+        out string tier,
+        out bool observable,
+        out string source)
+    {
+        tier = "";
+        observable = false;
+        source = "turn_context_missing";
+        string raw;
+        bool isNull;
+        // A new turn is a fresh tier boundary.  Missing and explicit null
+        // both clear the preceding context value so Fast cannot stick to a
+        // later request merely because that request omitted the field.
+        for (int i = 0; i < _serviceTierPaths.Length; i++)
+        {
+            if (!TryGetJsonStringOrNullAtPath(line, _serviceTierPaths[i], out raw, out isNull)) continue;
+            tier = isNull ? "" : NormalizeServiceTier(raw);
+            observable = !isNull && !string.IsNullOrWhiteSpace(tier);
+            source = isNull ? "turn_context_null" : "turn_context";
+            return true;
+        }
+        // Preserve the missing marker (rather than an inherited value) for a
+        // turn_context line that has no service_tier member at all.
+        return false;
+    }
+
+    private static bool TryGetJsonStringOrNullAtPath(
+        string json,
+        string[] path,
+        out string value,
+        out bool isNull)
+    {
+        value = "";
+        isNull = false;
+        if (string.IsNullOrWhiteSpace(json) || path == null || path.Length == 0) return false;
+        int index = 0;
+        SkipJsonWhitespace(json, ref index);
+        return TryFindJsonStringOrNullAtPath(json, ref index, path, 0, out value, out isNull);
+    }
+
+    /// <summary>
+    /// Tiny tolerant JSON walker used only for service-tier field paths.  The
+    /// regular token deserializer remains the source of usage data; this
+    /// walker exists to distinguish missing from null and to handle response
+    /// fields that are intentionally not part of the stable DataContract.
+    /// </summary>
+    private static bool TryFindJsonStringOrNullAtPath(
+        string json,
+        ref int index,
+        string[] path,
+        int depth,
+        out string value,
+        out bool isNull)
+    {
+        value = "";
+        isNull = false;
+        SkipJsonWhitespace(json, ref index);
+        if (index >= json.Length || json[index] != '{') return false;
+        index++;
+        while (index < json.Length)
+        {
+            SkipJsonWhitespace(json, ref index);
+            if (index < json.Length && json[index] == '}') { index++; return false; }
+            string key;
+            if (!TryReadJsonString(json, ref index, out key)) return false;
+            SkipJsonWhitespace(json, ref index);
+            if (index >= json.Length || json[index] != ':') return false;
+            index++;
+            SkipJsonWhitespace(json, ref index);
+            int valueStart = index;
+            bool keyMatches = depth < path.Length &&
+                string.Equals(key, path[depth], StringComparison.OrdinalIgnoreCase);
+            if (keyMatches && depth == path.Length - 1)
+            {
+                if (index < json.Length && json[index] == 'n' &&
+                    StartsWithJsonLiteral(json, index, "null"))
+                {
+                    index += 4;
+                    isNull = true;
+                    return true;
+                }
+                if (TryReadJsonString(json, ref index, out value))
+                {
+                    isNull = false;
+                    return true;
+                }
+                // Non-string service tier values are retained as a scalar
+                // diagnostic rather than being mistaken for an absent field.
+                if (TryReadJsonScalar(json, ref index, out value))
+                {
+                    isNull = false;
+                    return true;
+                }
+                return false;
+            }
+            if (keyMatches && index < json.Length && json[index] == '{')
+            {
+                if (TryFindJsonStringOrNullAtPath(json, ref index, path, depth + 1,
+                    out value, out isNull)) return true;
+                index = valueStart;
+            }
+            if (!SkipJsonValue(json, ref index)) return false;
+            SkipJsonWhitespace(json, ref index);
+            if (index < json.Length && json[index] == ',') { index++; continue; }
+            if (index < json.Length && json[index] == '}') { index++; return false; }
+            return false;
+        }
+        return false;
+    }
+
+    private static bool StartsWithJsonLiteral(string json, int index, string literal)
+    {
+        if (json == null || literal == null || index < 0 || index + literal.Length > json.Length) return false;
+        if (!string.Equals(json.Substring(index, literal.Length), literal, StringComparison.Ordinal)) return false;
+        int end = index + literal.Length;
+        return end >= json.Length || json[end] == ',' || json[end] == '}' ||
+            json[end] == ']' || char.IsWhiteSpace(json[end]);
+    }
+
+    private static void SkipJsonWhitespace(string json, ref int index)
+    {
+        while (index < json.Length && char.IsWhiteSpace(json[index])) index++;
+    }
+
+    private static bool TryReadJsonString(string json, ref int index, out string value)
+    {
+        value = "";
+        if (json == null || index < 0 || index >= json.Length || json[index] != '"') return false;
+        index++;
+        var builder = new StringBuilder();
+        while (index < json.Length)
+        {
+            char current = json[index++];
+            if (current == '"')
+            {
+                value = builder.ToString();
+                return true;
+            }
+            if (current != '\\')
+            {
+                builder.Append(current);
+                continue;
+            }
+            if (index >= json.Length) return false;
+            char escaped = json[index++];
+            switch (escaped)
+            {
+                case '"': builder.Append('"'); break;
+                case '\\': builder.Append('\\'); break;
+                case '/': builder.Append('/'); break;
+                case 'b': builder.Append('\b'); break;
+                case 'f': builder.Append('\f'); break;
+                case 'n': builder.Append('\n'); break;
+                case 'r': builder.Append('\r'); break;
+                case 't': builder.Append('\t'); break;
+                case 'u':
+                    if (index + 4 > json.Length) return false;
+                    int codePoint = 0;
+                    for (int i = 0; i < 4; i++)
+                    {
+                        int digit = HexDigit(json[index++]);
+                        if (digit < 0) return false;
+                        codePoint = (codePoint * 16) + digit;
+                    }
+                    builder.Append((char)codePoint);
+                    break;
+                default: builder.Append(escaped); break;
+            }
+        }
+        return false;
+    }
+
+    private static int HexDigit(char value)
+    {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    }
+
+    private static bool TryReadJsonScalar(string json, ref int index, out string value)
+    {
+        value = "";
+        int start = index;
+        while (index < json.Length && json[index] != ',' && json[index] != '}' &&
+            json[index] != ']' && !char.IsWhiteSpace(json[index])) index++;
+        if (index <= start) return false;
+        value = json.Substring(start, index - start);
+        return true;
+    }
+
+    private static bool SkipJsonValue(string json, ref int index)
+    {
+        SkipJsonWhitespace(json, ref index);
+        if (index >= json.Length) return false;
+        if (json[index] == '"')
+        {
+            string ignored;
+            return TryReadJsonString(json, ref index, out ignored);
+        }
+        if (json[index] == '{')
+        {
+            index++;
+            while (index < json.Length)
+            {
+                SkipJsonWhitespace(json, ref index);
+                if (index < json.Length && json[index] == '}') { index++; return true; }
+                string ignoredKey;
+                if (!TryReadJsonString(json, ref index, out ignoredKey)) return false;
+                SkipJsonWhitespace(json, ref index);
+                if (index >= json.Length || json[index] != ':') return false;
+                index++;
+                if (!SkipJsonValue(json, ref index)) return false;
+                SkipJsonWhitespace(json, ref index);
+                if (index < json.Length && json[index] == ',') { index++; continue; }
+                if (index < json.Length && json[index] == '}') { index++; return true; }
+                return false;
+            }
+            return false;
+        }
+        if (json[index] == '[')
+        {
+            index++;
+            while (index < json.Length)
+            {
+                SkipJsonWhitespace(json, ref index);
+                if (index < json.Length && json[index] == ']') { index++; return true; }
+                if (!SkipJsonValue(json, ref index)) return false;
+                SkipJsonWhitespace(json, ref index);
+                if (index < json.Length && json[index] == ',') { index++; continue; }
+                if (index < json.Length && json[index] == ']') { index++; return true; }
+                return false;
+            }
+            return false;
+        }
+        string ignoredScalar;
+        return TryReadJsonScalar(json, ref index, out ignoredScalar);
+    }
 
     private static readonly HashSet<string> _canonicalToolCallTypes =
         new HashSet<string>(new[] {
@@ -1011,7 +1392,41 @@ public static class TokenRaderIndexer
         string inheritedModel = ResolveInheritedModel(db, sessionId, parentSessionId,
             effectiveRootSessionId, out inheritedModelSource);
         string inheritedTurnId = GetLatestSessionTextColumn(db, sessionId, "turn_id");
-        string inheritedServiceTier = GetLatestSessionTextColumn(db, sessionId, "service_tier");
+        string persistedFileContextTier = GetLatestFileTextColumnIncludingEmpty(
+            db, sourcePath, "turn_context_service_tier");
+        string persistedFileContextSource = GetLatestFileTextColumnIncludingEmpty(
+            db, sourcePath, "turn_context_service_tier_source");
+        string persistedContextTier;
+        if (persistedFileContextTier != null && !string.IsNullOrWhiteSpace(persistedFileContextSource))
+        {
+            // File metadata is the authoritative trailing-context snapshot;
+            // unlike service_tier on the last token row it cannot be polluted
+            // by a one-off response-tier override.
+            persistedContextTier = persistedFileContextTier;
+        }
+        else
+        {
+            persistedContextTier = GetLatestSessionTextColumnIncludingEmpty(
+                db, sessionId, "turn_context_service_tier");
+        }
+        // The context column is populated by tier-aware imports.  A null
+        // result means an older index has no such rows, so retain the legacy
+        // fallback for compatibility (those rows may require a bounded
+        // source re-read/backfill to correct old token overrides).
+        string inheritedServiceTier = NormalizeServiceTier(
+            persistedContextTier == null
+                ? GetLatestSessionTextColumn(db, sessionId, "service_tier")
+                : persistedContextTier);
+        string inheritedServiceTierSource = string.IsNullOrWhiteSpace(inheritedServiceTier)
+            ? "" : "inherited_index";
+        if (startOffset <= 0L)
+        {
+            // A replacement/full import starts a new source history.  Do not
+            // carry a tier snapshot from the deleted/truncated incarnation
+            // of the same session into a file whose context is absent.
+            inheritedServiceTier = "";
+            inheritedServiceTierSource = "";
+        }
         string inheritedReasoningEffort = GetLatestSessionTextColumn(db, sessionId, "reasoning_effort");
         bool insertedUnresolvedModel = false;
 
@@ -1019,8 +1434,8 @@ public static class TokenRaderIndexer
         using (var cmd = db.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision, model_source, turn_id, request_id, response_id, identity_source, service_tier, reasoning_effort, rate_limit_id, rate_limit_name, credits_balance, credits_has, credits_unlimited, five_hour_used_tokens, five_hour_remaining_tokens, five_hour_limit_tokens, weekly_used_tokens, weekly_remaining_tokens, weekly_limit_tokens, rate_limit_individual, rate_limit_reached_type, spend_control_reached, model_context_window, long_context_threshold, long_context_applied, long_context_source, cache_creation_tokens, cache_write_observable) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23,@p24,@p25,@p26,@p27,@p28,@p29,@p30,@p31,@p32,@p33,@p34,@p35,@p36,@p37,@p38,@p39,@p40,@p41,@p42,@p43,@p44,@p45,@p46,@p47,@p48,@p49,@p50)";
-            var p = new SQLiteParameter[50];
+            cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision, model_source, turn_id, request_id, response_id, identity_source, service_tier, service_tier_source, turn_context_service_tier, reasoning_effort, rate_limit_id, rate_limit_name, credits_balance, credits_has, credits_unlimited, five_hour_used_tokens, five_hour_remaining_tokens, five_hour_limit_tokens, weekly_used_tokens, weekly_remaining_tokens, weekly_limit_tokens, rate_limit_individual, rate_limit_reached_type, spend_control_reached, model_context_window, long_context_threshold, long_context_applied, long_context_source, cache_creation_tokens, cache_write_observable) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23,@p24,@p25,@p26,@p27,@p28,@p29,@p30,@p31,@p32,@p33,@p34,@p35,@p36,@p37,@p38,@p39,@p40,@p41,@p42,@p43,@p44,@p45,@p46,@p47,@p48,@p49,@p50,@p51,@p52)";
+            var p = new SQLiteParameter[52];
             for (int i = 0; i < p.Length; i++)
             {
                 var prm = new SQLiteParameter("@p" + (i + 1));
@@ -1035,6 +1450,13 @@ public static class TokenRaderIndexer
                 long requestedEnd = endOffset < 0L ? 0L : endOffset;
                 long effectiveEnd = Math.Min(fs.Length, requestedEnd);
                 if (safeStart >= effectiveEnd) { tx.Commit(); return 0; }
+
+                string currentModel = inheritedModel;
+                string currentModelSource = inheritedModelSource;
+                string currentTurnId = inheritedTurnId;
+                string currentServiceTier = inheritedServiceTier;
+                string currentServiceTierSource = inheritedServiceTierSource;
+                string currentReasoningEffort = inheritedReasoningEffort;
 
                 bool skipPartialLine = false;
                 if (safeStart > 0L)
@@ -1060,11 +1482,6 @@ public static class TokenRaderIndexer
                     // where the preceding turn_context is not available. Inherit
                     // the latest non-empty model already indexed for this session;
                     // a later turn_context in the appended segment still wins.
-                    string currentModel = inheritedModel;
-                    string currentModelSource = inheritedModelSource;
-                    string currentTurnId = inheritedTurnId;
-                    string currentServiceTier = inheritedServiceTier;
-                    string currentReasoningEffort = inheritedReasoningEffort;
                     string line; long lineEndOffset; bool lineTerminated;
                     while (lineReader.ReadLine(out line, out lineEndOffset, out lineTerminated))
                     {
@@ -1082,10 +1499,27 @@ public static class TokenRaderIndexer
                             Match turnMatch = _turnIdValue.Match(line);
                             if (turnMatch.Success) currentTurnId = turnMatch.Groups[1].Value;
                         }
-                        if (line.Contains("service_tier"))
+                        bool isTurnContextLine = line.IndexOf("turn_context", StringComparison.OrdinalIgnoreCase) >= 0;
+                        if (isTurnContextLine)
                         {
-                            Match tierMatch = _serviceTierValue.Match(line);
-                            if (tierMatch.Success) currentServiceTier = tierMatch.Groups[1].Value;
+                            string contextTier;
+                            bool contextObservable;
+                            string contextSource;
+                            // Every new turn starts a fresh tier boundary.
+                            // Missing and explicit null both clear inherited
+                            // Fast/priority state; only a value in this line
+                            // can establish the new context tier.
+                            if (TryExtractTurnContextServiceTier(line, out contextTier,
+                                out contextObservable, out contextSource))
+                            {
+                                currentServiceTier = contextTier;
+                                currentServiceTierSource = contextSource;
+                            }
+                            else
+                            {
+                                currentServiceTier = "";
+                                currentServiceTierSource = "turn_context_missing";
+                            }
                         }
                         if (line.Contains("reasoning_effort"))
                         {
@@ -1150,6 +1584,13 @@ public static class TokenRaderIndexer
                             bool cacheWriteObservable = last.CacheCreationTokens != null || last.CacheWriteTokens != null;
                             if (totalCached > totalInput) totalCached = totalInput;
                             if (callCached > callInput) callCached = callInput;
+
+                            string recordServiceTier;
+                            bool recordServiceTierObservable;
+                            string recordServiceTierSource;
+                            TryExtractTokenServiceTier(line, currentServiceTier,
+                                currentServiceTierSource, out recordServiceTier,
+                                out recordServiceTierObservable, out recordServiceTierSource);
 
                             string fingerprint = string.Format("{0}:{1}:{2}:{3}:{4}:{5}:{6}:{7}",
                                 totalInput, totalCached, totalOutput, totalReasoning,
@@ -1259,28 +1700,30 @@ public static class TokenRaderIndexer
                             p[25].Value = requestId;
                             p[26].Value = responseId;
                             p[27].Value = identitySource;
-                            p[28].Value = currentServiceTier ?? "";
-                            p[29].Value = currentReasoningEffort ?? "";
-                            p[30].Value = rateLimitId;
-                            p[31].Value = rateLimitName;
-                            p[32].Value = (object)creditsBalance ?? DBNull.Value;
-                            p[33].Value = (object)creditsHas ?? DBNull.Value;
-                            p[34].Value = (object)creditsUnlimited ?? DBNull.Value;
-                            p[35].Value = (object)fiveHourUsedTokens ?? DBNull.Value;
-                            p[36].Value = (object)fiveHourRemainingTokens ?? DBNull.Value;
-                            p[37].Value = (object)fiveHourLimitTokens ?? DBNull.Value;
-                            p[38].Value = (object)weeklyUsedTokens ?? DBNull.Value;
-                            p[39].Value = (object)weeklyRemainingTokens ?? DBNull.Value;
-                            p[40].Value = (object)weeklyLimitTokens ?? DBNull.Value;
-                            p[41].Value = (object)rateLimitIndividual ?? DBNull.Value;
-                            p[42].Value = rateLimitReachedType;
-                            p[43].Value = (object)spendControlReached ?? DBNull.Value;
-                            p[44].Value = (object)(modelContextWindow > 0L ? (long?)modelContextWindow : null) ?? DBNull.Value;
-                            p[45].Value = (object)(longContextThreshold > 0L ? (long?)longContextThreshold : null) ?? DBNull.Value;
-                            p[46].Value = longContextApplied ? 1 : 0;
-                            p[47].Value = longContextSource;
-                            p[48].Value = cacheCreationTokens;
-                            p[49].Value = cacheWriteObservable ? 1 : 0;
+                            p[28].Value = recordServiceTier ?? "";
+                            p[29].Value = recordServiceTierSource ?? "";
+                            p[30].Value = currentServiceTier ?? "";
+                            p[31].Value = currentReasoningEffort ?? "";
+                            p[32].Value = rateLimitId;
+                            p[33].Value = rateLimitName;
+                            p[34].Value = (object)creditsBalance ?? DBNull.Value;
+                            p[35].Value = (object)creditsHas ?? DBNull.Value;
+                            p[36].Value = (object)creditsUnlimited ?? DBNull.Value;
+                            p[37].Value = (object)fiveHourUsedTokens ?? DBNull.Value;
+                            p[38].Value = (object)fiveHourRemainingTokens ?? DBNull.Value;
+                            p[39].Value = (object)fiveHourLimitTokens ?? DBNull.Value;
+                            p[40].Value = (object)weeklyUsedTokens ?? DBNull.Value;
+                            p[41].Value = (object)weeklyRemainingTokens ?? DBNull.Value;
+                            p[42].Value = (object)weeklyLimitTokens ?? DBNull.Value;
+                            p[43].Value = (object)rateLimitIndividual ?? DBNull.Value;
+                            p[44].Value = rateLimitReachedType;
+                            p[45].Value = (object)spendControlReached ?? DBNull.Value;
+                            p[46].Value = (object)(modelContextWindow > 0L ? (long?)modelContextWindow : null) ?? DBNull.Value;
+                            p[47].Value = (object)(longContextThreshold > 0L ? (long?)longContextThreshold : null) ?? DBNull.Value;
+                            p[48].Value = longContextApplied ? 1 : 0;
+                            p[49].Value = longContextSource;
+                            p[50].Value = cacheCreationTokens;
+                            p[51].Value = cacheWriteObservable ? 1 : 0;
                             cmd.ExecuteNonQuery();
                             if (string.IsNullOrWhiteSpace(currentModel)) insertedUnresolvedModel = true;
                             count++;
@@ -1288,6 +1731,9 @@ public static class TokenRaderIndexer
                         catch { continue; }
                     }
                 }
+                UpsertFileContextTier(db, tx, sourcePath, sessionId,
+                    effectiveRootSessionId, effectiveEnd, currentServiceTier,
+                    currentServiceTierSource);
             }
             tx.Commit();
         }
@@ -2039,7 +2485,7 @@ public static class TokenRaderIndexer
         // last_token_usage at a later timestamp; they are snapshots of one
         // call, not additional calls. Keep a per-session cumulative identity
         // so timestamp-only refreshes cannot be billed repeatedly.
-        var seenCumulativeSnapshots = new HashSet<string>(StringComparer.Ordinal);
+        var seenCumulativeSnapshots = new AggregateCumulativeSnapshotIndex();
         var stopwatch = Stopwatch.StartNew();
 
         SetAggregateProgress(progressState, 0L, "聚合区间记录");
@@ -2059,7 +2505,7 @@ public static class TokenRaderIndexer
                 cmd.CommandText =
                     "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                     "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
+                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source " +
                     "FROM token_records WHERE source_path=@path AND source_offset_end>@start AND source_offset_end<=@end " +
                     "ORDER BY source_offset_end ASC";
                 cmd.Parameters.AddWithValue("@path", range.Path);
@@ -2102,12 +2548,15 @@ public static class TokenRaderIndexer
                         string longContextSource = ReadReaderString(reader, 22);
                         long cacheCreationTokens = ReadReaderInt64(reader, 23);
                         bool cacheWriteObservable = ReadReaderInt64(reader, 24) != 0L;
+                        string serviceTier = NormalizeServiceTier(ReadReaderString(reader, 25));
+                        string serviceTierSource = NormalizeServiceTierSource(ReadReaderString(reader, 26), serviceTier);
 
                         if (callInput <= 0L && callOutput <= 0L) continue;
 
                         string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
                             totalInput, totalCached, totalOutput, totalReasoning);
-                        if (!seenCumulativeSnapshots.Add(cumulativeKey))
+                        if (!seenCumulativeSnapshots.Observe(cumulativeKey, sessionId,
+                            serviceTier, serviceTierSource))
                         {
                             result.DuplicateEventsDropped++;
                             continue;
@@ -2130,12 +2579,14 @@ public static class TokenRaderIndexer
                         string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
-                        AddAggregateLineageCandidate(lineageGroups, eventKey,
-                            new AggregateEventCandidate {
+                        var candidate = new AggregateEventCandidate {
                                 SessionId = sessionId,
                                 RootSessionId = rootSessionId,
                                 SourcePath = sourcePath,
                                 Model = model,
+                                ServiceTier = serviceTier,
+                                ServiceTierObservable = !string.IsNullOrWhiteSpace(serviceTier),
+                                ServiceTierSource = serviceTierSource,
                                 EventAt = eventAt,
                                 HasTimestamp = hasTimestamp,
                                 TurnId = turnId,
@@ -2152,7 +2603,10 @@ public static class TokenRaderIndexer
                                 CallCached = callCached,
                                 CallOutput = callOutput,
                                 CallReasoning = callReasoning
-                            }, parentBySession, result);
+                            };
+                        AddAggregateLineageCandidate(lineageGroups, eventKey,
+                            candidate, parentBySession, result);
+                        seenCumulativeSnapshots.Register(cumulativeKey, candidate);
                     }
                 }
             }
@@ -2188,7 +2642,7 @@ public static class TokenRaderIndexer
         var result = new TokenRaderIntervalAggregateResult();
         var parentBySession = ReadAggregateParentMap(db);
         var lineageGroups = new Dictionary<string, List<AggregateEventCandidate>>(StringComparer.Ordinal);
-        var seenCumulativeSnapshots = new HashSet<string>(StringComparer.Ordinal);
+        var seenCumulativeSnapshots = new AggregateCumulativeSnapshotIndex();
         var stopwatch = Stopwatch.StartNew();
 
         // ISO timestamps emitted by Codex are normally UTC. Widen the indexed
@@ -2211,7 +2665,7 @@ public static class TokenRaderIndexer
             cmd.CommandText =
                 "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                 "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
+                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source " +
                 "FROM token_records WHERE source_offset_end>0 AND timestamp>=@broad_start AND timestamp<@broad_end " +
                 "ORDER BY timestamp ASC,source_path ASC,source_offset_end ASC";
             cmd.Parameters.AddWithValue("@broad_start", broadStart);
@@ -2251,6 +2705,8 @@ public static class TokenRaderIndexer
                     string longContextSource = ReadReaderString(reader, 22);
                     long cacheCreationTokens = ReadReaderInt64(reader, 23);
                     bool cacheWriteObservable = ReadReaderInt64(reader, 24) != 0L;
+                    string serviceTier = NormalizeServiceTier(ReadReaderString(reader, 25));
+                    string serviceTierSource = NormalizeServiceTierSource(ReadReaderString(reader, 26), serviceTier);
 
                     DateTimeOffset eventAt;
                     if (!TryParseTimestamp(timestampText, out eventAt) || eventAt < startedAt || eventAt >= endedAt) continue;
@@ -2259,7 +2715,8 @@ public static class TokenRaderIndexer
 
                     string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
                         totalInput, totalCached, totalOutput, totalReasoning);
-                    if (!seenCumulativeSnapshots.Add(cumulativeKey))
+                    if (!seenCumulativeSnapshots.Observe(cumulativeKey, sessionId,
+                        serviceTier, serviceTierSource))
                     {
                         result.DuplicateEventsDropped++;
                         continue;
@@ -2269,12 +2726,14 @@ public static class TokenRaderIndexer
                     string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                         totalInput, totalCached, totalOutput, totalReasoning,
                         callInput, callCached, callOutput, callReasoning, fingerprint);
-                    AddAggregateLineageCandidate(lineageGroups, eventKey,
-                        new AggregateEventCandidate {
+                    var candidate = new AggregateEventCandidate {
                             SessionId = sessionId,
                             RootSessionId = rootSessionId,
                             SourcePath = sourcePath,
                             Model = model,
+                            ServiceTier = serviceTier,
+                            ServiceTierObservable = !string.IsNullOrWhiteSpace(serviceTier),
+                            ServiceTierSource = serviceTierSource,
                             EventAt = eventAt,
                             HasTimestamp = true,
                             TurnId = turnId,
@@ -2291,7 +2750,10 @@ public static class TokenRaderIndexer
                             CallCached = callCached,
                             CallOutput = callOutput,
                             CallReasoning = callReasoning
-                        }, parentBySession, result);
+                        };
+                    AddAggregateLineageCandidate(lineageGroups, eventKey,
+                        candidate, parentBySession, result);
+                    seenCumulativeSnapshots.Register(cumulativeKey, candidate);
                 }
             }
         }
@@ -2327,7 +2789,7 @@ public static class TokenRaderIndexer
         var result = new TokenRaderIntervalAggregateResult();
         var parentBySession = ReadAggregateParentMap(db);
         var lineageGroups = new Dictionary<string, List<AggregateEventCandidate>>(StringComparer.Ordinal);
-        var seenCumulativeSnapshots = new HashSet<string>(StringComparer.Ordinal);
+        var seenCumulativeSnapshots = new AggregateCumulativeSnapshotIndex();
         var stopwatch = Stopwatch.StartNew();
         string broadStart = startedExclusive.UtcDateTime.Date.AddDays(-1.0)
             .ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
@@ -2350,7 +2812,7 @@ public static class TokenRaderIndexer
                 cmd.CommandText =
                     "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                     "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
+                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source " +
                     "FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<=@end " +
                     "AND timestamp>=@broad_start AND timestamp<@broad_end ORDER BY source_offset_end ASC";
                 cmd.Parameters.AddWithValue("@path", range.Path);
@@ -2395,11 +2857,14 @@ public static class TokenRaderIndexer
                         string longContextSource = ReadReaderString(reader, 22);
                         long cacheCreationTokens = ReadReaderInt64(reader, 23);
                         bool cacheWriteObservable = ReadReaderInt64(reader, 24) != 0L;
+                        string serviceTier = NormalizeServiceTier(ReadReaderString(reader, 25));
+                        string serviceTierSource = NormalizeServiceTierSource(ReadReaderString(reader, 26), serviceTier);
                         if (callInput <= 0L && callOutput <= 0L) continue;
 
                         string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
                             totalInput, totalCached, totalOutput, totalReasoning);
-                        if (!seenCumulativeSnapshots.Add(cumulativeKey))
+                        if (!seenCumulativeSnapshots.Observe(cumulativeKey, sessionId,
+                            serviceTier, serviceTierSource))
                         {
                             result.DuplicateEventsDropped++;
                             continue;
@@ -2408,12 +2873,14 @@ public static class TokenRaderIndexer
                         string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
-                        AddAggregateLineageCandidate(lineageGroups, eventKey,
-                            new AggregateEventCandidate {
+                        var candidate = new AggregateEventCandidate {
                                 SessionId = sessionId,
                                 RootSessionId = rootSessionId,
                                 SourcePath = sourcePath,
                                 Model = model,
+                                ServiceTier = serviceTier,
+                                ServiceTierObservable = !string.IsNullOrWhiteSpace(serviceTier),
+                                ServiceTierSource = serviceTierSource,
                                 EventAt = eventAt,
                                 HasTimestamp = true,
                                 TurnId = turnId,
@@ -2430,7 +2897,10 @@ public static class TokenRaderIndexer
                                 CallCached = callCached,
                                 CallOutput = callOutput,
                                 CallReasoning = callReasoning
-                            }, parentBySession, result);
+                            };
+                        AddAggregateLineageCandidate(lineageGroups, eventKey,
+                            candidate, parentBySession, result);
+                        seenCumulativeSnapshots.Register(cumulativeKey, candidate);
                     }
                 }
             }
@@ -2469,7 +2939,7 @@ public static class TokenRaderIndexer
         SQLiteConnection db,
         IEnumerable<string> sourcePaths,
         DateTimeOffset startedAt,
-        HashSet<string> seenCumulativeSnapshots,
+        AggregateCumulativeSnapshotIndex seenCumulativeSnapshots,
         Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
         Dictionary<string, string> parentBySession,
         TokenRaderIntervalAggregateResult result,
@@ -2484,7 +2954,7 @@ public static class TokenRaderIndexer
                 cmd.CommandText =
                     "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                     "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
+                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source " +
                     "FROM token_records WHERE source_path=@path AND source_offset_end>0 " +
                     "ORDER BY source_offset_end DESC";
                 cmd.Parameters.AddWithValue("@path", path);
@@ -2507,7 +2977,7 @@ public static class TokenRaderIndexer
         SQLiteConnection db,
         OffsetRange range,
         DateTimeOffset startedExclusive,
-        HashSet<string> seenCumulativeSnapshots,
+        AggregateCumulativeSnapshotIndex seenCumulativeSnapshots,
         Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
         Dictionary<string, string> parentBySession,
         TokenRaderIntervalAggregateResult result,
@@ -2519,7 +2989,7 @@ public static class TokenRaderIndexer
             cmd.CommandText =
                 "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                 "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
+                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source " +
                 "FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<=@end " +
                 "ORDER BY source_offset_end DESC";
             cmd.Parameters.AddWithValue("@path", range.Path);
@@ -2596,7 +3066,7 @@ public static class TokenRaderIndexer
         Dictionary<string, string> sessionByPath,
         Dictionary<string, string> parentBySession,
         HashSet<string> seededAncestorSessions,
-        HashSet<string> seenCumulativeSnapshots,
+        AggregateCumulativeSnapshotIndex seenCumulativeSnapshots,
         Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
         TokenRaderIntervalAggregateResult result)
     {
@@ -2816,13 +3286,19 @@ public static class TokenRaderIndexer
                 if (!candidate.CacheWriteObservable) result.CacheWriteObservable = false;
                 string normalizedLongContextSource = NormalizeLongContextSource(
                     candidate.LongContextSource, candidate.Model, candidate.CallInput, threshold);
+                string normalizedTier = NormalizeServiceTier(candidate.ServiceTier);
                 string bucketKey = candidate.Model.ToLowerInvariant() + "|" +
-                    (longContext ? "long" : "standard");
+                    normalizedTier + "|" + (longContext ? "long" : "standard");
                 TokenRaderIntervalAggregateBucket bucket;
                 if (!buckets.TryGetValue(bucketKey, out bucket))
                 {
                     bucket = new TokenRaderIntervalAggregateBucket {
                         Model = candidate.Model,
+                        ServiceTier = normalizedTier,
+                        ServiceTierObservable = candidate.ServiceTierObservable &&
+                            !string.IsNullOrWhiteSpace(normalizedTier),
+                        ServiceTierSource = NormalizeServiceTierSource(
+                            candidate.ServiceTierSource, normalizedTier),
                         LongContext = longContext,
                         ModelContextWindow = candidate.ModelContextWindow,
                         LongContextThreshold = threshold,
@@ -2839,6 +3315,10 @@ public static class TokenRaderIndexer
                 bucket.Events++;
                 if (candidate.ModelContextWindow > bucket.ModelContextWindow) bucket.ModelContextWindow = candidate.ModelContextWindow;
                 bucket.CacheWriteObservable = bucket.CacheWriteObservable && candidate.CacheWriteObservable;
+                bucket.ServiceTierObservable = bucket.ServiceTierObservable &&
+                    candidate.ServiceTierObservable && !string.IsNullOrWhiteSpace(normalizedTier);
+                bucket.ServiceTierSource = MergeServiceTierSource(bucket.ServiceTierSource,
+                    NormalizeServiceTierSource(candidate.ServiceTierSource, normalizedTier));
             }
         }
 
@@ -2856,9 +3336,38 @@ public static class TokenRaderIndexer
         sortedBuckets.Sort(delegate(TokenRaderIntervalAggregateBucket left, TokenRaderIntervalAggregateBucket right) {
             int comparison = StringComparer.OrdinalIgnoreCase.Compare(left.Model, right.Model);
             if (comparison != 0) return comparison;
+            comparison = StringComparer.OrdinalIgnoreCase.Compare(left.ServiceTier, right.ServiceTier);
+            if (comparison != 0) return comparison;
             return left.LongContext.CompareTo(right.LongContext);
         });
         result.Buckets = sortedBuckets.ToArray();
+    }
+
+    private static string MergeServiceTierSource(string current, string next)
+    {
+        string left = current ?? "";
+        string right = next ?? "";
+        if (left.Length == 0) return right;
+        if (right.Length == 0 || string.Equals(left, right, StringComparison.OrdinalIgnoreCase)) return left;
+        return "mixed";
+    }
+
+    private static bool IsStrongerServiceTierEvidence(string existingSource, string nextSource)
+    {
+        int existingRank = GetServiceTierEvidenceRank(existingSource);
+        int nextRank = GetServiceTierEvidenceRank(nextSource);
+        return nextRank > existingRank;
+    }
+
+    private static int GetServiceTierEvidenceRank(string source)
+    {
+        string normalized = (source ?? "").Trim().ToLowerInvariant();
+        if (normalized == "response" || normalized == "response_null") return 4;
+        if (normalized == "service_tier" || normalized == "service_tier_null") return 3;
+        if (normalized == "turn_context" || normalized == "turn_context_null" ||
+            normalized == "turn_context_missing") return 2;
+        if (normalized == "indexed") return 1;
+        return 0;
     }
 
     private static string NormalizeLongContextSource(string source, string model, long callInput, long threshold)
@@ -2991,7 +3500,7 @@ public static class TokenRaderIndexer
     private static void SeedAggregateCumulativeSnapshot(
         SQLiteConnection db,
         OffsetRange range,
-        HashSet<string> seenCumulativeSnapshots,
+        AggregateCumulativeSnapshotIndex seenCumulativeSnapshots,
         Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
         Dictionary<string, string> parentBySession,
         TokenRaderIntervalAggregateResult result)
@@ -3002,7 +3511,7 @@ public static class TokenRaderIndexer
             cmd.CommandText =
                 "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
                 "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable " +
+                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source " +
                 "FROM token_records WHERE source_path=@path AND source_offset_end<=@start " +
                 "ORDER BY source_offset_end DESC LIMIT 1";
             cmd.Parameters.AddWithValue("@path", range.Path);
@@ -3018,7 +3527,7 @@ public static class TokenRaderIndexer
 
     private static void SeedAggregateLineageFromReader(
         SQLiteDataReader reader,
-        HashSet<string> seenCumulativeSnapshots,
+        AggregateCumulativeSnapshotIndex seenCumulativeSnapshots,
         Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
         Dictionary<string, string> parentBySession,
         TokenRaderIntervalAggregateResult result)
@@ -3034,9 +3543,12 @@ public static class TokenRaderIndexer
         long callCached = ReadReaderInt64(reader, 8);
         long callOutput = ReadReaderInt64(reader, 9);
         long callReasoning = ReadReaderInt64(reader, 10);
+        string serviceTier = NormalizeServiceTier(ReadReaderString(reader, 25));
+        string serviceTierSource = NormalizeServiceTierSource(ReadReaderString(reader, 26), serviceTier);
         if (seenCumulativeSnapshots != null)
-            seenCumulativeSnapshots.Add(BuildAggregateCumulativeKey(sessionId,
-                totalInput, totalCached, totalOutput, totalReasoning));
+            seenCumulativeSnapshots.Observe(BuildAggregateCumulativeKey(sessionId,
+                totalInput, totalCached, totalOutput, totalReasoning), sessionId,
+                serviceTier, serviceTierSource);
         if ((callInput <= 0L && callOutput <= 0L) || lineageGroups == null || result == null) return;
 
         DateTimeOffset eventAt;
@@ -3048,12 +3560,14 @@ public static class TokenRaderIndexer
         string eventKey = BuildAggregateEventKey(rootSessionId, eventAt, model,
             totalInput, totalCached, totalOutput, totalReasoning,
             callInput, callCached, callOutput, callReasoning, fingerprint);
-        AddAggregateLineageCandidate(lineageGroups, eventKey,
-            new AggregateEventCandidate {
+        var candidate = new AggregateEventCandidate {
                 SessionId = sessionId,
                 RootSessionId = rootSessionId,
                 SourcePath = ReadReaderString(reader, 12),
                 Model = model,
+                ServiceTier = serviceTier,
+                ServiceTierObservable = !string.IsNullOrWhiteSpace(serviceTier),
+                ServiceTierSource = serviceTierSource,
                 EventAt = eventAt,
                 HasTimestamp = hasTimestamp,
                 TurnId = ReadReaderString(reader, 15),
@@ -3071,7 +3585,11 @@ public static class TokenRaderIndexer
                 CallOutput = callOutput,
                 CallReasoning = callReasoning,
                 IncludeInResult = false
-            }, parentBySession, result);
+            };
+        AddAggregateLineageCandidate(lineageGroups, eventKey,
+            candidate, parentBySession, result);
+        seenCumulativeSnapshots.Register(BuildAggregateCumulativeKey(sessionId,
+            totalInput, totalCached, totalOutput, totalReasoning), candidate);
     }
 
     private static string BuildAggregateCumulativeKey(
@@ -3642,6 +4160,52 @@ public static class TokenRaderIndexer
         {
             cmd.CommandText = "SELECT COUNT(*) FROM token_records WHERE model IS NULL OR model=''";
             return Convert.ToInt64(cmd.ExecuteScalar(), CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static void UpsertFileContextTier(
+        SQLiteConnection db,
+        SQLiteTransaction tx,
+        string path,
+        string sessionId,
+        string rootSessionId,
+        long parsedOffset,
+        string serviceTier,
+        string serviceTierSource)
+    {
+        if (db == null || tx == null || string.IsNullOrWhiteSpace(path)) return;
+        string normalizedTier = NormalizeServiceTier(serviceTier);
+        string normalizedSource = NormalizeServiceTierSource(serviceTierSource, normalizedTier);
+        using (var update = db.CreateCommand())
+        {
+            update.Transaction = tx;
+            update.CommandText =
+                "UPDATE file_metadata SET turn_context_service_tier=@tier,turn_context_service_tier_source=@source WHERE path=@path";
+            update.Parameters.AddWithValue("@tier", normalizedTier);
+            update.Parameters.AddWithValue("@source", normalizedSource);
+            update.Parameters.AddWithValue("@path", path);
+            if (update.ExecuteNonQuery() > 0) return;
+        }
+
+        // ImportFile is also a public low-level API and can be called before
+        // the normal indexer has inserted its catalog row.  Seed a minimal
+        // row so a trailing turn_context (even with no token_count yet) is
+        // available to the next incremental import; the normal metadata
+        // upsert will fill authoritative file times/relationships later.
+        using (var insert = db.CreateCommand())
+        {
+            insert.Transaction = tx;
+            insert.CommandText =
+                "INSERT OR IGNORE INTO file_metadata (path,length,last_write_ticks,parsed_offset,session_id,content_retained,root_session_id,turn_context_service_tier,turn_context_service_tier_source) " +
+                "VALUES (@path,@length,0,@offset,@session,1,@root,@tier,@source)";
+            insert.Parameters.AddWithValue("@path", path);
+            insert.Parameters.AddWithValue("@length", Math.Max(0L, parsedOffset));
+            insert.Parameters.AddWithValue("@offset", Math.Max(0L, parsedOffset));
+            insert.Parameters.AddWithValue("@session", sessionId ?? "");
+            insert.Parameters.AddWithValue("@root", rootSessionId ?? "");
+            insert.Parameters.AddWithValue("@tier", normalizedTier);
+            insert.Parameters.AddWithValue("@source", normalizedSource);
+            insert.ExecuteNonQuery();
         }
     }
 
@@ -4349,6 +4913,60 @@ public static class TokenRaderIndexer
         }
     }
 
+    /// <summary>
+    /// Adds service_tier to the history-model key for indexes created before
+    /// tier-aware history existed.  SQLite cannot add a primary-key column in
+    /// place, so copy the compact table inside one transaction.  The explicit
+    /// column list deliberately preserves every existing history diagnostic.
+    /// </summary>
+    private static void EnsureUsageHistoryModelServiceTierKey(SQLiteConnection db)
+    {
+        bool tierIsInPrimaryKey = false;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(usage_history_models)";
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string name = reader.IsDBNull(1) ? "" : reader.GetString(1);
+                    if (string.Equals(name, "service_tier", StringComparison.OrdinalIgnoreCase))
+                    {
+                        tierIsInPrimaryKey = !reader.IsDBNull(5) && ReadReaderInt64(reader, 5) > 0L;
+                        break;
+                    }
+                }
+            }
+        }
+        if (tierIsInPrimaryKey) return;
+
+        using (var tx = db.BeginTransaction())
+        {
+            using (var cmd = db.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                // The old index follows the renamed table in SQLite.  Drop it
+                // first so the replacement table can receive the same stable
+                // index name after the copy completes.
+                cmd.CommandText = "DROP INDEX IF EXISTS idx_usage_history_models_end";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "ALTER TABLE usage_history_models RENAME TO usage_history_models_legacy";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "CREATE TABLE usage_history_models (window_start_ticks INTEGER NOT NULL, window_end_ticks INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL DEFAULT 0, total_cached INTEGER NOT NULL DEFAULT 0, total_output INTEGER NOT NULL DEFAULT 0, total_reasoning INTEGER NOT NULL DEFAULT 0, input_cost REAL NOT NULL DEFAULT 0, cached_cost REAL NOT NULL DEFAULT 0, output_cost REAL NOT NULL DEFAULT 0, pricing_complete INTEGER NOT NULL DEFAULT 1, events INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_write_observable INTEGER NOT NULL DEFAULT 0, standard_context_events INTEGER NOT NULL DEFAULT 0, long_context_events INTEGER NOT NULL DEFAULT 0, standard_context_input INTEGER NOT NULL DEFAULT 0, long_context_input INTEGER NOT NULL DEFAULT 0, long_context_output INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(window_start_ticks,window_end_ticks,model,service_tier))";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText =
+                    "INSERT INTO usage_history_models (window_start_ticks,window_end_ticks,model,service_tier,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events,cache_creation_tokens,cache_write_observable,standard_context_events,long_context_events,standard_context_input,long_context_input,long_context_output) " +
+                    "SELECT window_start_ticks,window_end_ticks,model,service_tier,total_input,total_cached,total_output,total_reasoning,input_cost,cached_cost,output_cost,pricing_complete,events,cache_creation_tokens,cache_write_observable,standard_context_events,long_context_events,standard_context_input,long_context_input,long_context_output FROM usage_history_models_legacy";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "DROP TABLE usage_history_models_legacy";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_usage_history_models_end ON usage_history_models(window_end_ticks)";
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+    }
+
     private static void EnsureUsageHistoryColumn(SQLiteConnection db, string columnName, string columnDefinition)
     {
         bool exists = false;
@@ -4400,6 +5018,44 @@ public static class TokenRaderIndexer
             cmd.Parameters.AddWithValue("@session", sessionId);
             object value = cmd.ExecuteScalar();
             return value == null || value == DBNull.Value ? "" :
+                (Convert.ToString(value, CultureInfo.InvariantCulture) ?? "");
+        }
+    }
+
+    /// <summary>
+    /// Reads a persisted context value including an intentionally empty value.
+    /// A null return means that this session has no indexed rows at all.  The
+    /// distinction lets incremental import preserve a context tier without
+    /// accidentally inheriting the previous token's one-off override.
+    /// </summary>
+    private static string GetLatestSessionTextColumnIncludingEmpty(
+        SQLiteConnection db, string sessionId, string columnName)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId) || string.IsNullOrWhiteSpace(columnName)) return null;
+        using (var cmd = db.CreateCommand())
+        {
+            // columnName is supplied only by private constant call sites.
+            cmd.CommandText = "SELECT " + columnName + " FROM token_records WHERE session_id=@session ORDER BY id DESC LIMIT 1";
+            cmd.Parameters.AddWithValue("@session", sessionId);
+            object value = cmd.ExecuteScalar();
+            if (value == null) return null;
+            return value == DBNull.Value ? "" :
+                (Convert.ToString(value, CultureInfo.InvariantCulture) ?? "");
+        }
+    }
+
+    private static string GetLatestFileTextColumnIncludingEmpty(
+        SQLiteConnection db, string path, string columnName)
+    {
+        if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(columnName)) return null;
+        using (var cmd = db.CreateCommand())
+        {
+            // columnName is supplied only by private constant call sites.
+            cmd.CommandText = "SELECT " + columnName + " FROM file_metadata WHERE path=@path LIMIT 1";
+            cmd.Parameters.AddWithValue("@path", path);
+            object value = cmd.ExecuteScalar();
+            if (value == null) return null;
+            return value == DBNull.Value ? "" :
                 (Convert.ToString(value, CultureInfo.InvariantCulture) ?? "");
         }
     }

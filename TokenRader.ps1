@@ -782,7 +782,7 @@ function Show-TokenRaderUsageHistoryResult {
     $script:UsageHistoryStatusText.Text = $sourceLabel
     $rows = foreach ($modelResult in @($Result.ModelBreakdown | Sort-Object Model)) {
         [pscustomobject]@{
-            Model = [string]$modelResult.Model
+            Model = ([string]$modelResult.Model) + ' · ' + (Get-ServiceTierLabel $(if ($null -ne $modelResult.PSObject.Properties['ServiceTier']) { [string]$modelResult.ServiceTier } else { '' }))
             Cached = Format-TokenRaderNumber ([Int64]$modelResult.Usage.Cached)
             Uncached = Format-TokenRaderNumber ([Int64]$modelResult.Usage.Uncached)
             Output = Format-TokenRaderNumber ([Int64]$modelResult.Usage.Output)
@@ -1554,30 +1554,9 @@ function Show-IntervalResult {
         (Format-TokenRaderUsd ([double]$Result.InputCost)),
         (Format-TokenRaderUsd ([double]$Result.CachedCost)),
         (Format-TokenRaderUsd ([double]$Result.OutputCost)))
-    $script:LongContextText.Text = '按唯一调用及各自模型 API 价汇总'
+    $script:LongContextText.Text = Get-ResultServiceTierSummary -Result $Result
 
-    if (@($Result.Models).Count -eq 1) {
-        $price = Resolve-TokenRaderPrice -Model ([string]$Result.Models[0]) -PricingDocument $script:Prices
-        if ($null -ne $price) {
-            $script:InputPriceText.Text = ('$' + ([double]$price.input).ToString('0.###'))
-            $script:CachedPriceText.Text = ('$' + ([double]$price.cachedInput).ToString('0.###'))
-            $script:OutputPriceText.Text = ('$' + ([double]$price.output).ToString('0.###'))
-            $script:State.CurrentPriceUrl = [string]$price.source
-            $script:OpenPricingButton.IsEnabled = $true
-        }
-    } elseif (@($Result.Models).Count -gt 1) {
-        $script:InputPriceText.Text = '多模型'
-        $script:CachedPriceText.Text = '多模型'
-        $script:OutputPriceText.Text = '多模型'
-        $script:State.CurrentPriceUrl = ''
-        $script:OpenPricingButton.IsEnabled = $false
-    } else {
-        $script:InputPriceText.Text = '等待调用'
-        $script:CachedPriceText.Text = '等待调用'
-        $script:OutputPriceText.Text = '等待调用'
-        $script:State.CurrentPriceUrl = ''
-        $script:OpenPricingButton.IsEnabled = $false
-    }
+    Set-ResultPricing -Result $Result
     $script:FormulaText.Text = '时间段始终统计全部项目和全部 Codex 会话，不受项目下拉框影响；区间内同一任务树的复制记录只计算一次。'
     $script:CaveatText.Text = ('项目选择已忽略。已检查 {0:N0} 条记录，计入 {1:N0} 次唯一调用；去除共享重复 {2:N0} 条、基线前继承 {3:N0} 条。每次调用按当时模型分别计价，仍是 API 等价估算，不是套餐实际账单。' -f
         [Int64]$Result.RawEvents,
@@ -2065,30 +2044,9 @@ function Update-ProjectView {
         (Format-TokenRaderUsd ([double]$result.InputCost)),
         (Format-TokenRaderUsd ([double]$result.CachedCost)),
         (Format-TokenRaderUsd ([double]$result.OutputCost)))
-    $script:LongContextText.Text = '按任务树去重，并按每次调用的模型计价'
+    $script:LongContextText.Text = Get-ResultServiceTierSummary -Result $result
 
-    if (@($result.Models).Count -eq 1) {
-        $price = Resolve-TokenRaderPrice -Model ([string]$result.Models[0]) -PricingDocument $script:Prices
-        if ($null -ne $price) {
-            $script:InputPriceText.Text = ('$' + ([double]$price.input).ToString('0.###'))
-            $script:CachedPriceText.Text = ('$' + ([double]$price.cachedInput).ToString('0.###'))
-            $script:OutputPriceText.Text = ('$' + ([double]$price.output).ToString('0.###'))
-            $script:State.CurrentPriceUrl = [string]$price.source
-            $script:OpenPricingButton.IsEnabled = $true
-        }
-    } elseif (@($result.Models).Count -gt 1) {
-        $script:InputPriceText.Text = '多模型'
-        $script:CachedPriceText.Text = '多模型'
-        $script:OutputPriceText.Text = '多模型'
-        $script:State.CurrentPriceUrl = ''
-        $script:OpenPricingButton.IsEnabled = $false
-    } else {
-        $script:InputPriceText.Text = '等待调用'
-        $script:CachedPriceText.Text = '等待调用'
-        $script:OutputPriceText.Text = '等待调用'
-        $script:State.CurrentPriceUrl = ''
-        $script:OpenPricingButton.IsEnabled = $false
-    }
+    Set-ResultPricing -Result $Result
 
     $script:FormulaText.Text = '项目累计 = cwd 与所选目录一致的全部本地会话；逐调用汇总，并在同一任务树内去除复制记录。'
     $script:CaveatText.Text = ('共扫描 {0:N0} 条 Token 记录，计入 {1:N0} 条唯一记录，去除任务树重复 {2:N0} 条；覆盖 {3:N0} 个有用量的日志。金额为官方 API 等价估算，不是 Codex 套餐实际账单。' -f
@@ -2183,13 +2141,69 @@ function Stop-IntervalMeasurement {
         -RequestId $requestId
 }
 
+function Get-ServiceTierLabel {
+    param([string]$ServiceTier = '')
+    switch (ConvertTo-TokenRaderServiceTier $ServiceTier) {
+        'priority' { return '快速 Fast' }
+        'default' { return '普通' }
+        '' { return '模式未知（普通价参考）' }
+        default { return $ServiceTier }
+    }
+}
+
+function Get-ResultServiceTierSummary {
+    param($Result)
+    $counts = @{}
+    foreach ($item in @($Result.Items)) {
+        $tier = if ($null -ne $item.PSObject.Properties['ServiceTier']) { ConvertTo-TokenRaderServiceTier ([string]$item.ServiceTier) } else { '' }
+        if (-not $counts.ContainsKey($tier)) { $counts[$tier] = 0L }
+        $counts[$tier] += [Int64]$item.Events
+    }
+    $parts = @(foreach ($tier in @($counts.Keys | Sort-Object)) { '{0} {1:N0} 次' -f (Get-ServiceTierLabel $tier), $counts[$tier] })
+    $longEvents = 0L
+    foreach ($item in @($Result.Items)) {
+        if ($null -ne $item.PSObject.Properties['LongContext'] -and [bool]$item.LongContext) { $longEvents += [Int64]$item.Events }
+    }
+    if ($longEvents -gt 0) { $parts += '长上下文 {0:N0} 次' -f $longEvents }
+    return ($parts -join ' · ')
+}
+
+function Set-ResultPricing {
+    param($Result)
+    $items = @($Result.Items)
+    $tiers = @($items | ForEach-Object { if ($null -ne $_.PSObject.Properties['ServiceTier']) { ConvertTo-TokenRaderServiceTier ([string]$_.ServiceTier) } else { '' } } | Sort-Object -Unique)
+    $price = $null
+    $label = if (@($Result.Models).Count -eq 0) { '等待调用' } elseif (@($Result.Models).Count -gt 1) { '多模型' } elseif ($tiers.Count -gt 1) { '混合模式' } else { '未公布' }
+    $unpricedItems = @($items | Where-Object { $null -ne $_.PSObject.Properties['Cost'] -and $null -ne $_.Cost -and -not [bool]$_.Cost.Known })
+    if (@($Result.Models).Count -eq 1 -and $tiers.Count -le 1 -and $unpricedItems.Count -eq 0) {
+        $tier = if ($tiers.Count -eq 1) { [string]$tiers[0] } else { '' }
+        $basePrice = Resolve-TokenRaderPrice -Model ([string]$Result.Models[0]) -PricingDocument $script:Prices
+        $price = Resolve-TokenRaderServiceTierPrice -Price $basePrice -ServiceTier $tier
+    }
+    $script:InputPriceText.Text = if ($null -ne $price) { '$' + ([double]$price.input).ToString('0.###') } else { $label }
+    $script:CachedPriceText.Text = if ($null -ne $price) { '$' + ([double]$price.cachedInput).ToString('0.###') } else { $label }
+    $script:OutputPriceText.Text = if ($null -ne $price) { '$' + ([double]$price.output).ToString('0.###') } else { $label }
+    $script:State.CurrentPriceUrl = if ($null -ne $price) { [string]$price.source } else { '' }
+    $script:OpenPricingButton.IsEnabled = $null -ne $price
+}
+
 function Set-PricingTable {
     $rows = foreach ($entry in $script:Prices.models) {
         [pscustomobject]@{
-            Model = [string]$entry.displayName
+            Model = ([string]$entry.displayName) + ' · 普通'
             Input = ('$' + ([double]$entry.input).ToString('0.###'))
             Cached = ('$' + ([double]$entry.cachedInput).ToString('0.###'))
             Output = ('$' + ([double]$entry.output).ToString('0.###'))
+        }
+        if ($null -ne $entry.PSObject.Properties['serviceTiers']) {
+            foreach ($tier in $entry.serviceTiers.PSObject.Properties) {
+                [pscustomobject]@{
+                    Model = ([string]$entry.displayName) + ' · ' + (Get-ServiceTierLabel $tier.Name)
+                    Input = '$' + ([double]$tier.Value.input).ToString('0.###')
+                    Cached = '$' + ([double]$tier.Value.cachedInput).ToString('0.###')
+                    Output = '$' + ([double]$tier.Value.output).ToString('0.###')
+                }
+            }
         }
     }
     $script:PricingDataGrid.ItemsSource = @($rows)
@@ -2258,7 +2272,8 @@ function Update-UsageView {
     }
 
     if ($isInheritedTask) {
-        $price = Resolve-TokenRaderPrice -Model ([string]$snapshot.Model) -PricingDocument $script:Prices
+        $basePrice = Resolve-TokenRaderPrice -Model ([string]$snapshot.Model) -PricingDocument $script:Prices
+        $price = Resolve-TokenRaderServiceTierPrice -Price $basePrice -ServiceTier ([string]$snapshot.ServiceTier)
         $script:UsdCostText.Text = '不计算'
         $script:CostBreakdownText.Text = '该子任务的累计值含父任务历史，直接计价会重复放大'
         $script:LongContextText.Text = '请改看“最后一次调用”或使用开始/结束时间段'
@@ -2300,33 +2315,12 @@ function Update-UsageView {
                 (Format-TokenRaderUsd ([double]$taskResult.OutputCost)))
         }
         $taskModels = @($taskResult.Models)
-        if ($taskModels.Count -gt 1) {
-            Set-UsageMetrics -Usage $usage -Model ('{0} 个模型' -f $taskModels.Count)
-            $script:InputPriceText.Text = '混合'
-            $script:CachedPriceText.Text = '混合'
-            $script:OutputPriceText.Text = '混合'
-            $script:OpenPricingButton.IsEnabled = $false
-            $script:State.CurrentPriceUrl = ''
-        } else {
-            $taskPrice = Resolve-TokenRaderPrice -Model ([string]$snapshot.Model) -PricingDocument $script:Prices
-            if ($null -ne $taskPrice) {
-                $script:InputPriceText.Text = ('$' + ([double]$taskPrice.input).ToString('0.###'))
-                $script:CachedPriceText.Text = ('$' + ([double]$taskPrice.cachedInput).ToString('0.###'))
-                $script:OutputPriceText.Text = ('$' + ([double]$taskPrice.output).ToString('0.###'))
-                $script:State.CurrentPriceUrl = [string]$taskPrice.source
-                $script:OpenPricingButton.IsEnabled = $true
-            } else {
-                $script:InputPriceText.Text = '未公布'
-                $script:CachedPriceText.Text = '未公布'
-                $script:OutputPriceText.Text = '未公布'
-                $script:State.CurrentPriceUrl = ''
-                $script:OpenPricingButton.IsEnabled = $false
-            }
-        }
+        Set-ResultPricing -Result $taskResult
         $longCalls = @($taskResult.Items | Where-Object { $_.LongContext })
         $script:LongContextText.Text = if ($longCalls.Count -gt 0) { ('逐调用长上下文加价：{0} 组' -f $longCalls.Count) } else { '逐调用标准上下文费率' }
+        $script:LongContextText.Text += ' · ' + (Get-ResultServiceTierSummary -Result $taskResult)
         $script:FormulaText.Text = '整次任务按每次调用的实际模型分别计价，再汇总未缓存输入、缓存输入和输出金额。'
-        $script:CaveatText.Text = '整次任务已逐调用识别模型和 272K 长上下文；金额仍是标准 API 等价估算，不含工具调用、区域处理或 Priority/Batch/Flex。日志提供缓存写入 token 时按未缓存输入价的 1.25 倍计入；字段缺失时不猜测。账号切换前的历史日志仍无法仅凭日志可靠归属。'
+        $script:CaveatText.Text = '整次任务已逐调用识别模型和 272K 长上下文；金额按日志模式对应的 API 价格折算，不含工具调用、区域处理或 Batch/Flex。日志提供缓存写入 token 时按未缓存输入价的 1.25 倍计入；字段缺失时不猜测。账号切换前的历史日志仍无法仅凭日志可靠归属。'
         $script:StatusText.Text = ('已读取 {0:N0} 次唯一调用 · {1} · 本地处理完成' -f $taskResult.CountedEvents, $scopeLabel)
         Update-QuotaCards
         return
@@ -2335,10 +2329,10 @@ function Update-UsageView {
     $cost = Get-TokenRaderCost -Usage $usage -Model ([string]$snapshot.Model) -PricingDocument $script:Prices -Scope $scope `
         -ModelContextWindow ([Int64]$(if ($null -ne $snapshot.PSObject.Properties['ModelContextWindow']) { $snapshot.ModelContextWindow } else { 0 })) `
         -CacheCreationTokens ([Int64]$(if ($null -ne $snapshot.PSObject.Properties['CacheCreationTokens']) { $snapshot.CacheCreationTokens } else { 0 })) `
-        -CacheWriteObservable $(if ($null -ne $snapshot.PSObject.Properties['CacheWriteObservable']) { [bool]$snapshot.CacheWriteObservable } else { $false })
+        -CacheWriteObservable $(if ($null -ne $snapshot.PSObject.Properties['CacheWriteObservable']) { [bool]$snapshot.CacheWriteObservable } else { $false }) -ServiceTier ([string]$snapshot.ServiceTier)
     if (-not $cost.Known) {
         $script:UsdCostText.Text = '无法估算'
-        $script:CostBreakdownText.Text = '该日志模型没有匹配到公开 API 标准价格'
+        $script:CostBreakdownText.Text = '该模型或服务模式没有匹配到公开 API 价格'
         $script:LongContextText.Text = '价格未知，不按 $0 处理'
         $script:InputPriceText.Text = '未公布'
         $script:CachedPriceText.Text = '未公布'
@@ -2367,8 +2361,9 @@ function Update-UsageView {
         }
         $script:FormulaText.Text = '费用 = 未缓存输入 × 输入价 + 缓存输入 × 缓存价 + 输出 × 输出价；输入计数本身已包含缓存输入。'
     }
+    $script:LongContextText.Text = (Get-ServiceTierLabel ([string]$snapshot.ServiceTier)) + ' · ' + $script:LongContextText.Text
 
-    $script:CaveatText.Text = '最后一次调用使用 last_token_usage；若该次输入超过模型公布的 272K 阈值，会应用官方长上下文倍率。估算不包含工具调用、区域处理或 Priority/Batch/Flex。日志提供缓存写入 token 时按未缓存输入价的 1.25 倍计入；字段缺失时不猜测。'
+    $script:CaveatText.Text = '最后一次调用使用 last_token_usage；若该次输入超过模型公布的 272K 阈值，会应用官方长上下文倍率。快速/普通模式使用对应 API 价格，估算不包含工具调用、区域处理或 Batch/Flex。日志提供缓存写入 token 时按未缓存输入价的 1.25 倍计入；字段缺失时不猜测。'
     $script:StatusText.Text = ('已读取 {0} · {1} · 本地处理完成' -f $model, $scopeLabel)
     Update-QuotaCards
 }

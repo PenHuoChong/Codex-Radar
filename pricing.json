@@ -15,6 +15,19 @@
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 20.00,
+          "cachedInput": 2.00,
+          "cacheWrite": 25.00,
+          "cacheWriteMultiplier": 1.25,
+          "output": 100.00,
+          "longContextThreshold": 272000,
+          "longContextInputMultiplier": 2.0,
+          "longContextOutputMultiplier": 1.5,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-6-astra"
     },
     {
@@ -30,6 +43,19 @@
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 8.00,
+          "cachedInput": 0.80,
+          "cacheWrite": 10.00,
+          "cacheWriteMultiplier": 1.25,
+          "output": 40.00,
+          "longContextThreshold": 272000,
+          "longContextInputMultiplier": 2.0,
+          "longContextOutputMultiplier": 1.5,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
     },
     {
@@ -43,6 +69,19 @@
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 4.00,
+          "cachedInput": 0.40,
+          "cacheWrite": 5.00,
+          "cacheWriteMultiplier": 1.25,
+          "output": 24.00,
+          "longContextThreshold": 272000,
+          "longContextInputMultiplier": 2.0,
+          "longContextOutputMultiplier": 1.5,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra"
     },
     {
@@ -56,6 +95,19 @@
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 0.40,
+          "cachedInput": 0.04,
+          "cacheWrite": 0.50,
+          "cacheWriteMultiplier": 1.25,
+          "output": 2.40,
+          "longContextThreshold": 272000,
+          "longContextInputMultiplier": 2.0,
+          "longContextOutputMultiplier": 1.5,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
     },
     {
@@ -82,6 +134,16 @@
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 12.50,
+          "cachedInput": 1.25,
+          "output": 75.00,
+          "longContextThreshold": 272000,
+          "maximumInputTokens": 272000,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5.5"
     },
     {
@@ -93,6 +155,14 @@
       "output": 4.50,
       "contextWindow": 400000,
       "longContextThreshold": 0,
+      "serviceTiers": {
+        "priority": {
+          "input": 1.50,
+          "cachedInput": 0.15,
+          "output": 9.00,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5.4-mini"
     },
     {
@@ -106,6 +176,16 @@
       "longContextThreshold": 272000,
       "longContextInputMultiplier": 2.0,
       "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 5.00,
+          "cachedInput": 0.50,
+          "output": 30.00,
+          "longContextThreshold": 272000,
+          "maximumInputTokens": 272000,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5.4"
     },
     {
@@ -117,6 +197,14 @@
       "output": 14.00,
       "contextWindow": 400000,
       "longContextThreshold": 0,
+      "serviceTiers": {
+        "priority": {
+          "input": 3.50,
+          "cachedInput": 0.35,
+          "output": 28.00,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5.3-codex"
     },
     {
@@ -139,6 +227,14 @@
       "output": 14.00,
       "contextWindow": 400000,
       "longContextThreshold": 0,
+      "serviceTiers": {
+        "priority": {
+          "input": 3.50,
+          "cachedInput": 0.35,
+          "output": 28.00,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5.2"
     },
     {
@@ -161,6 +257,14 @@
       "output": 2.00,
       "contextWindow": 400000,
       "longContextThreshold": 0,
+      "serviceTiers": {
+        "priority": {
+          "input": 0.45,
+          "cachedInput": 0.045,
+          "output": 3.60,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5-mini"
     },
     {
@@ -172,6 +276,14 @@
       "output": 10.00,
       "contextWindow": 400000,
       "longContextThreshold": 0,
+      "serviceTiers": {
+        "priority": {
+          "input": 2.50,
+          "cachedInput": 0.25,
+          "output": 20.00,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
       "source": "https://developers.openai.com/api/docs/models/gpt-5"
     }
   ]
