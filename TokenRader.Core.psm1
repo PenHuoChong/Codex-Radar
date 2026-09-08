@@ -1175,6 +1175,92 @@ function Resolve-TokenRaderServiceTierPrice {
     return [pscustomobject]$resolved
 }
 
+function Get-TokenRaderManualServiceTier {
+    <#
+    ManualServiceTiers is deliberately a transient measurement-only overlay.
+    It is not part of the official pricing document and is never written to
+    the index/history cache.  A caller may pass either a hashtable or a JSON
+    object whose keys are model ids, aliases, or the model name seen in a log.
+    Only the two priced processing modes are accepted; an invalid/unknown
+    choice is treated as no confirmation.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$PricingDocument,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Model
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Model) -or $null -eq $PricingDocument -or
+        $null -eq $PricingDocument.PSObject.Properties['ManualServiceTiers'] -or
+        $null -eq $PricingDocument.ManualServiceTiers) { return '' }
+
+    $manual = $PricingDocument.ManualServiceTiers
+    $requested = $Model.Trim()
+    $value = $null
+
+    # Do an explicit case-insensitive key walk.  PowerShell hashtables may be
+    # case-sensitive when supplied by a caller, while JSON objects expose
+    # PSObject properties with their original casing.
+    if ($manual -is [Collections.IDictionary]) {
+        foreach ($key in @($manual.Keys)) {
+            if ([string]::Equals(([string]$key).Trim(), $requested, [StringComparison]::OrdinalIgnoreCase)) {
+                $value = $manual[$key]
+                break
+            }
+        }
+    } else {
+        foreach ($property in @($manual.PSObject.Properties)) {
+            if ([string]::Equals(([string]$property.Name).Trim(), $requested, [StringComparison]::OrdinalIgnoreCase)) {
+                $value = $property.Value
+                break
+            }
+        }
+    }
+
+    # If the model was recorded under an alias (or the canonical id), allow
+    # the confirmation to be keyed by the other spelling as well.
+    if ($null -eq $value) {
+        $price = Resolve-TokenRaderPrice -Model $requested -PricingDocument $PricingDocument
+        if ($null -ne $price) {
+            $candidateKeys = @([string]$price.id) + @($price.aliases | ForEach-Object { [string]$_ })
+            foreach ($candidateKey in $candidateKeys) {
+                if ([string]::IsNullOrWhiteSpace($candidateKey)) { continue }
+                if ($manual -is [Collections.IDictionary]) {
+                    foreach ($key in @($manual.Keys)) {
+                        if ([string]::Equals(([string]$key).Trim(), $candidateKey.Trim(), [StringComparison]::OrdinalIgnoreCase)) {
+                            $value = $manual[$key]
+                            break
+                        }
+                    }
+                } else {
+                    foreach ($property in @($manual.PSObject.Properties)) {
+                        if ([string]::Equals(([string]$property.Name).Trim(), $candidateKey.Trim(), [StringComparison]::OrdinalIgnoreCase)) {
+                            $value = $property.Value
+                            break
+                        }
+                    }
+                }
+                if ($null -ne $value) { break }
+            }
+        }
+    }
+    if ($null -eq $value) { return '' }
+
+    # Keep the public shape intentionally simple (model -> "default"|
+    # "priority"), but tolerate an object wrapper so a UI can carry a label
+    # without changing the core contract.
+    if ($value -isnot [string] -and $null -ne $value.PSObject) {
+        foreach ($propertyName in @('ServiceTier', 'Tier', 'Mode', 'Value')) {
+            if ($null -ne $value.PSObject.Properties[$propertyName]) {
+                $value = $value.PSObject.Properties[$propertyName].Value
+                break
+            }
+        }
+    }
+    $tier = ConvertTo-TokenRaderServiceTier ([string]$value)
+    if ($tier -eq 'default' -or $tier -eq 'priority') { return $tier }
+    return ''
+}
+
 function Get-TokenRaderCost {
     param(
         [Parameter(Mandatory = $true)]$Usage,
@@ -1187,10 +1273,29 @@ function Get-TokenRaderCost {
         [Int64]$CacheCreationTokens = 0,
         [Nullable[bool]]$CacheWriteObservable = $null,
         [AllowEmptyString()][string]$ServiceTier = '',
+        [AllowNull()][AllowEmptyString()][string]$ServiceTierSource = $null,
+        [Nullable[bool]]$ServiceTierEvidenceComplete = $null,
         $ResolvedPrice = $null
     )
 
-    $tier = ConvertTo-TokenRaderServiceTier $ServiceTier
+    $observedTier = ConvertTo-TokenRaderServiceTier $ServiceTier
+    # A missing/auto/unknown log tier may be completed by the caller's
+    # transient measurement confirmation.  A non-empty tier is always kept as
+    # observed evidence, even when its price is unsupported: manual input must
+    # never rewrite an explicit log tier.
+    $tierSourceProvided = $PSBoundParameters.ContainsKey('ServiceTierSource')
+    $normalizedTierSource = if ($tierSourceProvided) { ([string]$ServiceTierSource).Trim().ToLowerInvariant() } else { '' }
+    $untrustedTierSource = $tierSourceProvided -and @('', 'indexed', 'mixed', 'missing', 'response_null', 'service_tier_null', 'turn_context_missing') -contains $normalizedTierSource -and
+        ($null -eq $ServiceTierEvidenceComplete -or -not [bool]$ServiceTierEvidenceComplete)
+    $manualTier = if ($observedTier -eq '' -or $untrustedTierSource) { Get-TokenRaderManualServiceTier -PricingDocument $PricingDocument -Model $Model } else { '' }
+    $manualModeAssumption = ($observedTier -eq '' -or $untrustedTierSource) -and $manualTier -ne ''
+    $tier = if ($manualModeAssumption) { $manualTier } else { $observedTier }
+    $modeEvidenceComplete = $observedTier -ne '' -and -not $untrustedTierSource
+    $serviceTierComplete = $tier -ne ''
+    $effectiveServiceTierSource = if ($manualModeAssumption) { 'manual_confirmation' }
+        elseif ($tier -eq '') { 'standard_fallback' }
+        elseif ($untrustedTierSource) { if ($normalizedTierSource -ne '') { $normalizedTierSource } else { 'untrusted' } }
+        else { 'log' }
     $basePrice = if ($null -ne $ResolvedPrice) { $ResolvedPrice } else { Resolve-TokenRaderPrice -Model $Model -PricingDocument $PricingDocument }
     $price = Resolve-TokenRaderServiceTierPrice -Price $basePrice -ServiceTier $tier
     $unsupportedContext = $false
@@ -1211,8 +1316,13 @@ function Get-TokenRaderCost {
             Model = $Model
             Price = $null
             ServiceTier = $tier
-            ServiceTierKnown = $tier -ne ''
-            ServiceTierSource = if ($tier -eq '') { 'standard_fallback' } else { 'log' }
+            ServiceTierKnown = $serviceTierComplete
+            ServiceTierComplete = $serviceTierComplete
+            ServiceTierEvidenceComplete = $modeEvidenceComplete
+            ModeEvidenceComplete = $modeEvidenceComplete
+            ModeAssumptionApplied = $manualModeAssumption
+            ManualServiceTierApplied = $manualModeAssumption
+            ServiceTierSource = $effectiveServiceTierSource
             PricingReason = if ($unsupportedCacheWrite) { 'unsupported_service_tier_cache_write' } elseif ($unsupportedContext) { 'unsupported_service_tier_context' } elseif ($null -eq $basePrice) { 'unknown_model' } else { 'unknown_service_tier_price' }
             InputCost = $null
             CachedCost = $null
@@ -1256,8 +1366,13 @@ function Get-TokenRaderCost {
         Model = $Model
         Price = $price
         ServiceTier = $tier
-        ServiceTierKnown = $tier -ne ''
-        ServiceTierSource = if ($tier -eq '') { 'standard_fallback' } else { 'log' }
+        ServiceTierKnown = $serviceTierComplete
+        ServiceTierComplete = $serviceTierComplete
+        ServiceTierEvidenceComplete = $modeEvidenceComplete
+        ModeEvidenceComplete = $modeEvidenceComplete
+        ModeAssumptionApplied = $manualModeAssumption
+        ManualServiceTierApplied = $manualModeAssumption
+        ServiceTierSource = $effectiveServiceTierSource
         PricingReason = 'priced'
         InputCost = $inputCost
         CachedCost = $cachedCost
@@ -1515,6 +1630,9 @@ function Get-TokenRaderIntervalResult {
     $models = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $unknownModels = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $costBuckets = @{}
+    [bool]$serviceTierComplete = $true
+    [bool]$modeEvidenceComplete = $true
+    [bool]$modeAssumptionApplied = $false
     # Price resolution is deterministic per model string; Resolve-TokenRaderPrice
     # sorts the pricing table on every call, so memoize per call.
     $priceCache = @{}
@@ -1667,6 +1785,32 @@ function Get-TokenRaderIntervalResult {
             -Scope call -LongContextApplied ([bool]$bucket.LongContext) `
             -CacheCreationTokens ([Int64]$bucket.CacheCreationTokens) `
             -CacheWriteObservable ([bool]$bucket.CacheWriteObservable) -ServiceTier ([string]$bucket.ServiceTier)
+        $itemTierComplete = $null -ne $cost.PSObject.Properties['ServiceTierComplete'] -and [bool]$cost.ServiceTierComplete
+        $itemModeComplete = $null -ne $cost.PSObject.Properties['ModeEvidenceComplete'] -and [bool]$cost.ModeEvidenceComplete
+        $itemAssumption = $null -ne $cost.PSObject.Properties['ModeAssumptionApplied'] -and [bool]$cost.ModeAssumptionApplied
+        # A compiled aggregate carries ServiceTierSource even for legacy rows.
+        # A non-empty tier with an explicitly empty source is not proof of an
+        # observed mode; retain its Standard/tier price for compatibility but
+        # keep strict quota evidence incomplete.  Synthetic callers that
+        # predate this property remain compatible when it is absent.
+        $hasTierSource = $null -ne $bucket.PSObject.Properties['ServiceTierSource']
+        $bucketTierSource = if ($hasTierSource) { ([string]$bucket.ServiceTierSource).Trim().ToLowerInvariant() } else { '' }
+        $bucketEvidenceProperty = if ($null -ne $bucket.PSObject.Properties['ServiceTierEvidenceComplete']) {
+            $bucket.PSObject.Properties['ServiceTierEvidenceComplete']
+        } elseif ($null -ne $bucket.PSObject.Properties['ModeEvidenceComplete']) {
+            $bucket.PSObject.Properties['ModeEvidenceComplete']
+        } else { $null }
+        if ($null -ne $bucketEvidenceProperty -and -not $itemAssumption) {
+            $itemModeComplete = [bool]$bucketEvidenceProperty.Value
+        } else {
+            $untrustedTierSource = $bucketTierSource -eq '' -or $bucketTierSource -eq 'indexed' -or $bucketTierSource -eq 'mixed'
+            if ($hasTierSource -and $tier -ne '' -and $untrustedTierSource) {
+                $itemModeComplete = $false
+            }
+        }
+        if (-not $itemTierComplete) { $serviceTierComplete = $false }
+        if (-not $itemModeComplete) { $modeEvidenceComplete = $false }
+        if ($itemAssumption) { $modeAssumptionApplied = $true }
         if ($cost.Known) {
             $bucketInputCost = [double]$cost.InputCost
             $bucketCachedCost = [double]$cost.CachedCost
@@ -1688,7 +1832,13 @@ function Get-TokenRaderIntervalResult {
         }
         [void]$items.Add([pscustomobject]@{
             Model = [string]$bucket.Model
-            ServiceTier = [string]$bucket.ServiceTier
+            ServiceTier = [string]$cost.ServiceTier
+            ServiceTierKnown = [bool]$cost.ServiceTierKnown
+            ServiceTierComplete = $itemTierComplete
+            ModeEvidenceComplete = $itemModeComplete
+            ModeAssumptionApplied = $itemAssumption
+            ManualServiceTierApplied = $itemAssumption
+            ServiceTierSource = [string]$cost.ServiceTierSource
             LongContext = [bool]$bucket.LongContext
             Usage = $bucketUsage
             Cost = $cost
@@ -1732,6 +1882,12 @@ function Get-TokenRaderIntervalResult {
         CacheCreationCost = $cacheCreationCost
         PricingComplete = $pricingComplete
         CostComplete = $pricingComplete
+        ServiceTierComplete = $serviceTierComplete
+        ModeEvidenceComplete = $modeEvidenceComplete
+        ModeAssumptionApplied = $modeAssumptionApplied
+        ManualServiceTierApplied = $modeAssumptionApplied
+        QuotaEvidenceComplete = $pricingComplete -and $serviceTierComplete -and
+            ($modeEvidenceComplete -or $modeAssumptionApplied)
         UnknownModels = @($unknownModels | Sort-Object)
         StartRateLimits = $startRateLimits
         EndRateLimits = $endRateLimits
@@ -1813,6 +1969,11 @@ function Get-TokenRaderProjectResult {
                 CostCoverage = [string]$priced.CostCoverage
                 PricingComplete = [bool]$priced.PricingComplete
                 CostComplete = [bool]$priced.CostComplete
+                ServiceTierComplete = [bool]$priced.ServiceTierComplete
+                ModeEvidenceComplete = [bool]$priced.ModeEvidenceComplete
+                ModeAssumptionApplied = [bool]$priced.ModeAssumptionApplied
+                ManualServiceTierApplied = [bool]$priced.ManualServiceTierApplied
+                QuotaEvidenceComplete = [bool]$priced.QuotaEvidenceComplete
                 UnknownModels = @($priced.UnknownModels)
                 StartRateLimits = $null
                 EndRateLimits = $null
@@ -1882,10 +2043,19 @@ function Get-TokenRaderQuotaEstimate {
         param($StartWindow, $EndWindow, [string]$StartPlanType, [string]$EndPlanType, $Evidence)
         if ($null -eq $EndWindow) { return $null }
         if ($useQuotaEvidence) {
+            $evidenceServiceTierComplete = if ($null -ne $Evidence -and $null -ne $Evidence.PSObject.Properties['ServiceTierComplete']) { [bool]$Evidence.ServiceTierComplete } else { $true }
+            $evidenceModeComplete = if ($null -ne $Evidence -and $null -ne $Evidence.PSObject.Properties['ModeEvidenceComplete']) { [bool]$Evidence.ModeEvidenceComplete } else { $true }
+            $evidenceModeAssumption = if ($null -ne $Evidence -and $null -ne $Evidence.PSObject.Properties['ModeAssumptionApplied']) { [bool]$Evidence.ModeAssumptionApplied } else { $false }
+            $evidenceQuotaComplete = if ($null -ne $Evidence -and $null -ne $Evidence.PSObject.Properties['QuotaEvidenceComplete']) {
+                [bool]$Evidence.QuotaEvidenceComplete
+            } else {
+                $evidenceServiceTierComplete -and ($evidenceModeComplete -or $evidenceModeAssumption)
+            }
             if ($null -eq $Evidence -or $null -eq $Evidence.PSObject.Properties['BoundaryValid'] -or
                 -not [bool]$Evidence.BoundaryValid -or $null -eq $Evidence.PSObject.Properties['EstimateSource'] -or
                 [string]::IsNullOrWhiteSpace([string]$Evidence.EstimateSource) -or
                 $null -eq $Evidence.PSObject.Properties['PricingComplete'] -or -not [bool]$Evidence.PricingComplete -or
+                -not $evidenceQuotaComplete -or
                 $null -eq $Evidence.PSObject.Properties['EstimatedTotalUsd'] -or [double]$Evidence.EstimatedTotalUsd -le 0 -or
                 $null -eq $Evidence.PSObject.Properties['TotalCost'] -or [double]$Evidence.TotalCost -le 0 -or
                 $null -eq $Evidence.PSObject.Properties['EndObservedAt'] -or
@@ -1930,6 +2100,11 @@ function Get-TokenRaderQuotaEstimate {
                 ObservedTokens = if ($null -ne $Evidence.PSObject.Properties['ObservedTokens']) { [Int64]$Evidence.ObservedTokens } else { 0L }
                 EstimateSource = [string]$Evidence.EstimateSource
                 CapacitySource = [string]$Evidence.CapacitySource
+                ServiceTierComplete = if ($null -ne $Evidence.PSObject.Properties['ServiceTierComplete']) { [bool]$Evidence.ServiceTierComplete } else { $true }
+                ModeEvidenceComplete = if ($null -ne $Evidence.PSObject.Properties['ModeEvidenceComplete']) { [bool]$Evidence.ModeEvidenceComplete } else { $true }
+                ModeAssumptionApplied = if ($null -ne $Evidence.PSObject.Properties['ModeAssumptionApplied']) { [bool]$Evidence.ModeAssumptionApplied } else { $false }
+                ManualServiceTierApplied = if ($null -ne $Evidence.PSObject.Properties['ManualServiceTierApplied']) { [bool]$Evidence.ManualServiceTierApplied } else { $false }
+                QuotaEvidenceComplete = if ($null -ne $Evidence.PSObject.Properties['QuotaEvidenceComplete']) { [bool]$Evidence.QuotaEvidenceComplete } else { $true }
                 IdentityComplete = if ($null -ne $Evidence.PSObject.Properties['IdentityComplete']) { [bool]$Evidence.IdentityComplete } else { $false }
                 IdentitySources = if ($null -ne $Evidence.PSObject.Properties['IdentitySources']) { @($Evidence.IdentitySources) } else { @() }
                 UnidentifiedEvents = if ($null -ne $Evidence.PSObject.Properties['UnidentifiedEvents']) { [Int64]$Evidence.UnidentifiedEvents } else { 0L }
@@ -3284,21 +3459,51 @@ function ConvertFrom-TokenRaderPricedAggregate {
     [Int64]$longContextOutput = 0
     $cacheWriteObservable = $true
     $priceCache = @{}
+    [bool]$serviceTierComplete = $true
+    [bool]$modeEvidenceComplete = $true
+    [bool]$modeAssumptionApplied = $false
     $items = foreach ($bucket in @($Aggregate.Buckets)) {
         $bucketObservable = $null -ne $bucket.PSObject.Properties['CacheWriteObservable'] -and [bool]$bucket.CacheWriteObservable
         if (-not $bucketObservable) { $cacheWriteObservable = $false }
         $bucketUsage = New-TokenRaderUsage -InputTokens $bucket.Input -CachedTokens $bucket.Cached -OutputTokens $bucket.Output -ReasoningOutputTokens $bucket.Reasoning
         $model = [string]$bucket.Model
         $tier = if ($null -ne $bucket.PSObject.Properties['ServiceTier']) { [string]$bucket.ServiceTier } else { '' }
-        if (-not $priceCache.ContainsKey($model)) { $priceCache[$model] = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument }
+        # The base price is independent of the selected mode, but include the
+        # transient confirmation in the local key so a caller cannot
+        # accidentally reuse a result from a different measurement overlay.
+        $manualChoice = Get-TokenRaderManualServiceTier -PricingDocument $PricingDocument -Model $model
+        $priceCacheKey = $model.ToLowerInvariant() + '|' + $manualChoice
+        if (-not $priceCache.ContainsKey($priceCacheKey)) { $priceCache[$priceCacheKey] = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument }
         $costArgs = @{
             Usage = $bucketUsage; Model = $model; PricingDocument = $PricingDocument
-            ResolvedPrice = $priceCache[$model]; ServiceTier = $tier; Scope = 'call'
+            ResolvedPrice = $priceCache[$priceCacheKey]; ServiceTier = $tier; Scope = 'call'
             LongContextApplied = [bool]$bucket.LongContext; CacheWriteObservable = $bucketObservable
             CacheCreationTokens = $(if ($null -ne $bucket.PSObject.Properties['CacheCreationTokens']) { [Int64]$bucket.CacheCreationTokens } else { 0L })
             ModelContextWindow = $(if ($null -ne $bucket.PSObject.Properties['ModelContextWindow']) { [Int64]$bucket.ModelContextWindow } else { 0L })
         }
+        if ($null -ne $bucket.PSObject.Properties['ServiceTierSource']) {
+            $costArgs.ServiceTierSource = [string]$bucket.ServiceTierSource
+        }
+        if ($null -ne $bucket.PSObject.Properties['ServiceTierEvidenceComplete']) {
+            $costArgs.ServiceTierEvidenceComplete = [bool]$bucket.ServiceTierEvidenceComplete
+        } elseif ($null -ne $bucket.PSObject.Properties['ModeEvidenceComplete']) {
+            $costArgs.ServiceTierEvidenceComplete = [bool]$bucket.ModeEvidenceComplete
+        }
         $cost = Get-TokenRaderCost @costArgs
+        $itemTier = [string]$cost.ServiceTier
+        $itemTierComplete = $null -ne $cost.PSObject.Properties['ServiceTierComplete'] -and [bool]$cost.ServiceTierComplete
+        $itemModeComplete = $null -ne $cost.PSObject.Properties['ModeEvidenceComplete'] -and [bool]$cost.ModeEvidenceComplete
+        $itemAssumption = $null -ne $cost.PSObject.Properties['ModeAssumptionApplied'] -and [bool]$cost.ModeAssumptionApplied
+        if (-not $itemTierComplete) { $serviceTierComplete = $false }
+        if (-not $itemModeComplete) { $modeEvidenceComplete = $false }
+        if ($itemAssumption) { $modeAssumptionApplied = $true }
+        if ($null -ne $bucket.PSObject.Properties['ServiceTierSource'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$bucket.ServiceTierSource) -and
+            -not $itemAssumption -and $itemTier -ne '') {
+            # Preserve the strongest source carried by the compiled aggregate
+            # (response/service_tier/turn_context) for the visible summary.
+            $cost.ServiceTierSource = [string]$bucket.ServiceTierSource
+        }
         if ($cost.Known) {
             $inputCost += [double]$cost.InputCost
             $cachedCost += [double]$cost.CachedCost
@@ -3319,9 +3524,13 @@ function ConvertFrom-TokenRaderPricedAggregate {
         }
         [pscustomobject]@{
             Model = $model
-            ServiceTier = [string]$cost.ServiceTier
+            ServiceTier = $itemTier
             ServiceTierKnown = [bool]$cost.ServiceTierKnown
-            ServiceTierSource = if ($null -ne $bucket.PSObject.Properties['ServiceTierSource'] -and -not [string]::IsNullOrWhiteSpace([string]$bucket.ServiceTierSource)) { [string]$bucket.ServiceTierSource } else { [string]$cost.ServiceTierSource }
+            ServiceTierComplete = $itemTierComplete
+            ModeEvidenceComplete = $itemModeComplete
+            ModeAssumptionApplied = $itemAssumption
+            ManualServiceTierApplied = $itemAssumption
+            ServiceTierSource = if ($itemAssumption) { 'manual_confirmation' } elseif ($itemTier -eq '') { [string]$cost.ServiceTierSource } elseif ($null -ne $bucket.PSObject.Properties['ServiceTierSource'] -and -not [string]::IsNullOrWhiteSpace([string]$bucket.ServiceTierSource)) { [string]$bucket.ServiceTierSource } else { [string]$cost.ServiceTierSource }
             LongContext = [bool]$bucket.LongContext
             Usage = $bucketUsage
             Events = [Int64]$bucket.Events
@@ -3346,6 +3555,14 @@ function ConvertFrom-TokenRaderPricedAggregate {
         TotalCost = $inputCost + $cachedCost + $outputCost
         PricingComplete = $unknownModels.Count -eq 0
         CostComplete = $unknownModels.Count -eq 0
+        ServiceTierComplete = $serviceTierComplete
+        ModeEvidenceComplete = $modeEvidenceComplete
+        ModeAssumptionApplied = $modeAssumptionApplied
+        ManualServiceTierApplied = $modeAssumptionApplied
+        # Strict quota evidence may use an explicit per-model confirmation as
+        # an assumption, but an unconfirmed/missing tier must not qualify.
+        QuotaEvidenceComplete = $unknownModels.Count -eq 0 -and $serviceTierComplete -and
+            ($modeEvidenceComplete -or $modeAssumptionApplied)
         UnknownModels = @($unknownModels | Sort-Object)
         StandardContextEvents = $standardContextEvents
         LongContextEvents = $longContextEvents
@@ -3388,6 +3605,7 @@ function Get-TokenRaderQuotaWindowEvidence {
     $calibrationStart = $null
     $calibrationEnd = $null
     $historyLookbackApplied = $false
+    [bool]$directPositivePair = $false
     if ($null -ne $StartWindow) {
         if ($null -eq $StartWindow.PSObject.Properties['ObservedAt'] -or $null -eq $StartWindow.ResetsAt -or
             [int]$StartWindow.WindowMinutes -ne [int]$EndWindow.WindowMinutes -or
@@ -3401,8 +3619,60 @@ function Get-TokenRaderQuotaWindowEvidence {
         [double]$directDelta = [double]$EndWindow.UsedPercent - [double]$StartWindow.UsedPercent
         if ($directDelta -lt -0.000000001) { return $null }
         if ($directDelta -gt 0.000000001 -and [DateTimeOffset]$EndWindow.ObservedAt -gt [DateTimeOffset]$StartWindow.ObservedAt) {
-            $calibrationStart = $StartWindow
-            $calibrationEnd = $EndWindow
+            $directPositivePair = $true
+            # The two snapshots are frozen at different offsets, but another
+            # process may have appended an older observation after a newer
+            # one.  A raw positive endpoint delta would then look valid while
+            # spanning a non-monotonic sequence.  Ask the compiled streaming
+            # validator to check the same reset/plan/window envelope before
+            # accepting the direct pair.  It compares both exact endpoints
+            # and the maxima seen before each endpoint, so a later stale
+            # regression cannot make a positive delta look valid.
+            $effectiveLimitId = if ($null -ne $EndWindow.PSObject.Properties['LimitId']) { [string]$EndWindow.LimitId } else { $RateLimitId }
+            $directPairValid = $false
+            $validatorAvailable = $false
+            try {
+                $directPairValid = [TokenRaderIndexer]::ValidateQuotaSnapshotPairByOffsets(
+                    $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
+                    ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
+                    [string]$EndWindow.PlanType, [string]$effectiveLimitId,
+                    [double]$StartWindow.UsedPercent, ([DateTimeOffset]$StartWindow.ObservedAt),
+                    [double]$EndWindow.UsedPercent, ([DateTimeOffset]$EndWindow.ObservedAt),
+                    $CancellationToken)
+                $validatorAvailable = $true
+            } catch {
+                # Keep Core loadable with an older companion DLL.  The
+                # fallback below still requires a complete same-cycle pair;
+                # it is never used when the streaming validator is present.
+                $validatorAvailable = $false
+            }
+            if (-not $validatorAvailable) {
+                $directPair = $null
+                try {
+                    $directPair = [TokenRaderIndexer]::QueryQuotaCalibrationPairByOffsets(
+                        $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
+                        ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
+                        [string]$EndWindow.PlanType, [string]$effectiveLimitId, [double]$EndWindow.UsedPercent,
+                        ([DateTimeOffset]$EndWindow.ObservedAt), $CancellationToken)
+                } catch { $directPair = $null }
+                if ($null -ne $directPair -and $directPair.Rows.Count -eq 2) {
+                    $directPairStartRecord = ConvertFrom-TokenRaderIndexRecord -Row $directPair.Rows[0]
+                    $directPairEndRecord = ConvertFrom-TokenRaderIndexRecord -Row $directPair.Rows[1]
+                    $directPairStart = if ($WindowKind -eq 'FiveHour') { $directPairStartRecord.RateLimits.FiveHour } else { $directPairStartRecord.RateLimits.Weekly }
+                    $directPairEnd = if ($WindowKind -eq 'FiveHour') { $directPairEndRecord.RateLimits.FiveHour } else { $directPairEndRecord.RateLimits.Weekly }
+                    if ($null -ne $directPairStart -and $null -ne $directPairEnd) {
+                        $pairEndWithinFrozenEnd = [DateTimeOffset]$directPairEnd.ObservedAt -le [DateTimeOffset]$EndWindow.ObservedAt -and
+                            [double]$directPairEnd.UsedPercent -le ([double]$EndWindow.UsedPercent + 0.000000001)
+                        $pairIsMonotonic = [DateTimeOffset]$directPairEnd.ObservedAt -gt [DateTimeOffset]$directPairStart.ObservedAt -and
+                            [double]$directPairEnd.UsedPercent -gt ([double]$directPairStart.UsedPercent + 0.000000001)
+                        $directPairValid = $pairEndWithinFrozenEnd -and $pairIsMonotonic
+                    }
+                }
+            }
+            if ($directPairValid) {
+                $calibrationStart = $StartWindow
+                $calibrationEnd = $EndWindow
+            }
         }
     }
 
@@ -3411,6 +3681,11 @@ function Get-TokenRaderQuotaWindowEvidence {
     # plan / reset cycle. If the log exposes tenths or hundredths, the greatest
     # previous value naturally makes the calibration use that finer real step.
     if ($null -eq $calibrationStart) {
+        # A positive direct endpoint pair was present but failed the frozen
+        # monotonic-envelope validation above.  Do not silently replace its
+        # boundaries with a different historical pair: the cost interval must
+        # remain exactly (startObserved,endObserved].
+        if ($directPositivePair) { return $null }
         # A split 5h/weekly record can carry different metadata timestamps. Use
         # the id attached to this exact window row when available, including an
         # explicitly empty id; only legacy window objects fall back to the
@@ -3461,6 +3736,13 @@ function Get-TokenRaderQuotaWindowEvidence {
         $value
     }
     $priced = ConvertFrom-TokenRaderPricedAggregate -Aggregate $aggregate -PricingDocument $PricingDocument
+    # PricingComplete intentionally retains its historical meaning: an
+    # unobserved tier can still be shown at the Standard reference rate.  A
+    # quota calibration is stricter and may proceed only when every bucket has
+    # a known tier, either from the log or from an explicit transient manual
+    # confirmation.  The latter is marked as an assumption below.
+    $quotaEvidenceComplete = $null -ne $priced.PSObject.Properties['QuotaEvidenceComplete'] -and
+        [bool]$priced.QuotaEvidenceComplete
     [Int64]$observedTokens = [Int64]$priced.Usage.Total
     $directUsed = if ($null -ne $EndWindow.PSObject.Properties['UsedTokens']) { $EndWindow.UsedTokens } else { $null }
     $directRemaining = if ($null -ne $EndWindow.PSObject.Properties['RemainingTokens']) { $EndWindow.RemainingTokens } else { $null }
@@ -3489,7 +3771,7 @@ function Get-TokenRaderQuotaWindowEvidence {
     [double]$estimatedRemainingUsd = 0
     $usdEstimateSource = ''
     [double]$estimatedUsedUsd = 0
-    if ([bool]$priced.PricingComplete -and [double]$priced.TotalCost -gt 0 -and $deltaPercent -gt 0) {
+    if ($quotaEvidenceComplete -and [double]$priced.TotalCost -gt 0 -and $deltaPercent -gt 0) {
         if ($observedTokens -gt 0) { $averageUsdPerToken = [double]$priced.TotalCost / [double]$observedTokens }
         $estimatedTotalUsd = [double]$priced.TotalCost / ($deltaPercent / 100.0)
         $estimatedUsedUsd = $estimatedTotalUsd * ($currentUsedPercent / 100.0)
@@ -3525,6 +3807,11 @@ function Get-TokenRaderQuotaWindowEvidence {
         CacheCreationCost = [double]$priced.CacheCreationCost
         PricingComplete = [bool]$priced.PricingComplete
         CostComplete = [bool]$priced.CostComplete
+        ServiceTierComplete = if ($null -ne $priced.PSObject.Properties['ServiceTierComplete']) { [bool]$priced.ServiceTierComplete } else { $true }
+        ModeEvidenceComplete = if ($null -ne $priced.PSObject.Properties['ModeEvidenceComplete']) { [bool]$priced.ModeEvidenceComplete } else { $true }
+        ModeAssumptionApplied = if ($null -ne $priced.PSObject.Properties['ModeAssumptionApplied']) { [bool]$priced.ModeAssumptionApplied } else { $false }
+        ManualServiceTierApplied = if ($null -ne $priced.PSObject.Properties['ManualServiceTierApplied']) { [bool]$priced.ManualServiceTierApplied } else { $false }
+        QuotaEvidenceComplete = $quotaEvidenceComplete
         UnknownModels = @($priced.UnknownModels)
         CountedEvents = [Int64]$aggregate.CountedEvents
         FirstCountedAt = $aggregate.FirstCountedAt
@@ -3651,6 +3938,11 @@ function Get-TokenRaderIndexedIntervalResult {
         TotalCost = [double]$priced.TotalCost
         PricingComplete = [bool]$priced.PricingComplete
         CostComplete = [bool]$priced.CostComplete
+        ServiceTierComplete = [bool]$priced.ServiceTierComplete
+        ModeEvidenceComplete = [bool]$priced.ModeEvidenceComplete
+        ModeAssumptionApplied = [bool]$priced.ModeAssumptionApplied
+        ManualServiceTierApplied = [bool]$priced.ManualServiceTierApplied
+        QuotaEvidenceComplete = [bool]$priced.QuotaEvidenceComplete
         UnknownModels = @($priced.UnknownModels)
         StartRateLimits = $startRateLimits
         EndRateLimits = $endRateLimits
@@ -3702,7 +3994,22 @@ function Get-TokenRaderPricingCacheKey {
             $(if ($null -ne $entry.PSObject.Properties['serviceTiers']) { ConvertTo-Json -InputObject $entry.serviceTiers -Depth 8 -Compress } else { '' })
         ) -join ':'
     }
-    return (@('usage-history-v6', [string]$PricingDocument.verifiedAt, [string]$PricingDocument.unitTokens, ($modelParts -join ';')) -join '|')
+    $manualParts = @()
+    if ($null -ne $PricingDocument.PSObject.Properties['ManualServiceTiers'] -and $null -ne $PricingDocument.ManualServiceTiers) {
+        $manual = $PricingDocument.ManualServiceTiers
+        $manualParts = foreach ($property in @(
+            if ($manual -is [Collections.IDictionary]) {
+                foreach ($key in @($manual.Keys)) { [pscustomobject]@{ Name = [string]$key; Value = $manual[$key] } }
+            } else { @($manual.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Value = $_.Value } }) }
+        ) | Sort-Object @{ Expression = { ([string]$_.Name).Trim().ToLowerInvariant() } }) {
+            $tier = ConvertTo-TokenRaderServiceTier ([string]$property.Value)
+            '{0}={1}' -f ([string]$property.Name).Trim().ToLowerInvariant(), $tier
+        }
+    }
+    # Preserve the v6 prefix for callers that display/diagnose it, while
+    # ensuring a transient manual mode selection cannot reuse a cached result
+    # computed under another selection.
+    return (@('usage-history-v6', [string]$PricingDocument.verifiedAt, [string]$PricingDocument.unitTokens, ($modelParts -join ';'), ('manual:' + ($manualParts -join ','))) -join '|')
 }
 
 function ConvertFrom-TokenRaderUsageHistorySnapshot {
@@ -3812,6 +4119,19 @@ function Get-TokenRaderUsageHistoryWindow {
     )
 
     $anchor = if ($null -eq $AnchorAt) { [DateTimeOffset]::Now } else { [DateTimeOffset]$AnchorAt }
+    # ManualServiceTiers is a transient measurement overlay.  History results
+    # are persisted in the indexer's snapshot cache, so deliberately use a
+    # shallow pricing-document copy without that property.  Do not mutate the
+    # caller's document: the same document may be used by the interval worker
+    # for an explicitly confirmed measurement immediately afterwards.
+    $historyPricingDocument = $PricingDocument
+    if ($null -ne $PricingDocument.PSObject.Properties['ManualServiceTiers']) {
+        $historyPricingDocument = [pscustomobject]@{}
+        foreach ($property in @($PricingDocument.PSObject.Properties)) {
+            if ([string]::Equals([string]$property.Name, 'ManualServiceTiers', [StringComparison]::OrdinalIgnoreCase)) { continue }
+            Add-Member -InputObject $historyPricingDocument -MemberType NoteProperty -Name ([string]$property.Name) -Value $property.Value
+        }
+    }
     # Second-aligned boundaries preserve an exact rolling-24-hour view while
     # avoiding one cache row per sub-second UI request. These are not
     # calendar-day buckets.
@@ -3821,7 +4141,8 @@ function Get-TokenRaderUsageHistoryWindow {
     $windowStart = $windowEnd.AddHours(-24)
     $startTicks = [Int64]$windowStart.UtcDateTime.Ticks
     $endTicks = [Int64]$windowEnd.UtcDateTime.Ticks
-    $pricingKey = Get-TokenRaderPricingCacheKey -PricingDocument $PricingDocument
+    # The cache identity likewise excludes any transient manual selection.
+    $pricingKey = Get-TokenRaderPricingCacheKey -PricingDocument $historyPricingDocument
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '同步最新日志后冻结24小时边界'
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
@@ -3851,7 +4172,7 @@ function Get-TokenRaderUsageHistoryWindow {
         }
 
         $thresholds = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
-        foreach ($entry in @($PricingDocument.models)) {
+        foreach ($entry in @($historyPricingDocument.models)) {
             $threshold = if ($null -ne $entry.PSObject.Properties['longContextThreshold']) { [Int64]$entry.longContextThreshold } else { 0L }
             $id = [string]$entry.id
             if (-not [string]::IsNullOrWhiteSpace($id)) { $thresholds[$id] = $threshold }
@@ -3877,11 +4198,32 @@ function Get-TokenRaderUsageHistoryWindow {
             $bucketUsage = New-TokenRaderUsage -InputTokens $bucket.Input -CachedTokens $bucket.Cached -OutputTokens $bucket.Output -ReasoningOutputTokens $bucket.Reasoning
             $model = [string]$bucket.Model
             $serviceTier = if ($null -ne $bucket.PSObject.Properties['ServiceTier']) { ConvertTo-TokenRaderServiceTier ([string]$bucket.ServiceTier) } else { '' }
-            $modelKey = $model + '|' + $serviceTier
+            $serviceTierSourceProvided = $null -ne $bucket.PSObject.Properties['ServiceTierSource']
+            $serviceTierSource = if ($serviceTierSourceProvided) { [string]$bucket.ServiceTierSource } else { $null }
+            # Keep history on the same per-call/bucket pricing path as the
+            # interval and quota views.  In particular, cache creation tokens
+            # are charged once at 1.25x and a >272K bucket receives the input
+            # and output long-context multipliers exactly once.
+            $costArgs = @{
+                Usage = $bucketUsage; Model = $model; PricingDocument = $historyPricingDocument
+                Scope = 'call'; LongContextApplied = [bool]$bucket.LongContext
+                CacheCreationTokens = [Int64]$bucket.CacheCreationTokens
+                CacheWriteObservable = [bool]$bucket.CacheWriteObservable
+                ServiceTier = $serviceTier
+            }
+            if ($null -ne $bucket.PSObject.Properties['ServiceTierSource']) { $costArgs.ServiceTierSource = $serviceTierSource }
+            if ($null -ne $bucket.PSObject.Properties['ServiceTierEvidenceComplete']) { $costArgs.ServiceTierEvidenceComplete = [bool]$bucket.ServiceTierEvidenceComplete }
+            elseif ($null -ne $bucket.PSObject.Properties['ModeEvidenceComplete']) { $costArgs.ServiceTierEvidenceComplete = [bool]$bucket.ModeEvidenceComplete }
+            $cost = Get-TokenRaderCost @costArgs
+            # Determine the effective tier before choosing the model-total
+            # bucket.  In particular, a missing/untrusted indexed tier stays
+            # Standard-priced for display but remains an empty evidence tier;
+            # it must not be merged into a genuinely observed priority row.
+            $modelKey = $model + '|' + [string]$cost.ServiceTier
             if (-not $modelTotals.ContainsKey($modelKey)) {
                 $modelTotals[$modelKey] = [pscustomobject]@{
                     Model = $model
-                    ServiceTier = $serviceTier
+                    ServiceTier = [string]$cost.ServiceTier
                     TotalInput = [Int64]0
                     TotalCached = [Int64]0
                     TotalOutput = [Int64]0
@@ -3916,14 +4258,7 @@ function Get-TokenRaderUsageHistoryWindow {
                 $modelTotal.StandardContextEvents += [Int64]$bucket.Events
                 $modelTotal.StandardContextInput += [Int64]$bucket.Input
             }
-            # Keep history on the same per-call/bucket pricing path as the
-            # interval and quota views.  In particular, cache creation tokens
-            # are charged once at 1.25x and a >272K bucket receives the input
-            # and output long-context multipliers exactly once.
-            $cost = Get-TokenRaderCost -Usage $bucketUsage -Model $model -PricingDocument $PricingDocument `
-                -Scope call -LongContextApplied ([bool]$bucket.LongContext) `
-                -CacheCreationTokens ([Int64]$bucket.CacheCreationTokens) `
-                -CacheWriteObservable ([bool]$bucket.CacheWriteObservable) -ServiceTier $serviceTier
+            $modelTotal.ServiceTier = [string]$cost.ServiceTier
             if (-not [bool]$cost.Known) {
                 [void]$unknownModels.Add($(if ([string]::IsNullOrWhiteSpace($model)) { '未知模型' } else { $model }))
                 $modelTotal.PricingComplete = $false

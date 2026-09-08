@@ -105,6 +105,12 @@ public sealed class TokenRaderIntervalAggregateBucket
     public string ServiceTier { get; set; }
     public bool ServiceTierObservable { get; set; }
     public string ServiceTierSource { get; set; }
+    /// <summary>
+    /// True only when the tier bucket is backed by an explicit response,
+    /// service-tier, or turn-context observation. Legacy/index-inherited tier
+    /// labels remain visible for diagnostics but cannot override trusted mode.
+    /// </summary>
+    public bool ServiceTierEvidenceComplete { get; set; }
     public bool LongContext { get; set; }
     public long Input { get; set; }
     public long Cached { get; set; }
@@ -618,7 +624,7 @@ public static class TokenRaderIndexer
     {
         using (var cmd = db.CreateCommand())
         {
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS file_metadata (path TEXT PRIMARY KEY, length INTEGER NOT NULL, last_write_ticks INTEGER NOT NULL, parsed_offset INTEGER NOT NULL DEFAULT 0, session_id TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '', parent_thread_id TEXT NOT NULL DEFAULT '', forked_from_id TEXT NOT NULL DEFAULT '', content_retained INTEGER NOT NULL DEFAULT 1, root_session_id TEXT NOT NULL DEFAULT '', turn_context_service_tier TEXT NOT NULL DEFAULT '', turn_context_service_tier_source TEXT NOT NULL DEFAULT '')";
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS file_metadata (path TEXT PRIMARY KEY, length INTEGER NOT NULL, last_write_ticks INTEGER NOT NULL, parsed_offset INTEGER NOT NULL DEFAULT 0, session_id TEXT NOT NULL DEFAULT '', cwd TEXT NOT NULL DEFAULT '', parent_thread_id TEXT NOT NULL DEFAULT '', forked_from_id TEXT NOT NULL DEFAULT '', content_retained INTEGER NOT NULL DEFAULT 1, root_session_id TEXT NOT NULL DEFAULT '', turn_context_service_tier TEXT NOT NULL DEFAULT '', turn_context_service_tier_source TEXT NOT NULL DEFAULT '', turn_context_model TEXT NOT NULL DEFAULT '', turn_context_model_source TEXT NOT NULL DEFAULT '', turn_context_model_timestamp TEXT NOT NULL DEFAULT '', turn_context_model_timestamp_ticks INTEGER NOT NULL DEFAULT 0)";
             cmd.ExecuteNonQuery();
 
             // Existing installations may have a four-column file_metadata table.
@@ -632,8 +638,12 @@ public static class TokenRaderIndexer
             EnsureFileMetadataColumn(db, "root_session_id", "TEXT NOT NULL DEFAULT ''");
             EnsureFileMetadataColumn(db, "turn_context_service_tier", "TEXT NOT NULL DEFAULT ''");
             EnsureFileMetadataColumn(db, "turn_context_service_tier_source", "TEXT NOT NULL DEFAULT ''");
+            EnsureFileMetadataColumn(db, "turn_context_model", "TEXT NOT NULL DEFAULT ''");
+            EnsureFileMetadataColumn(db, "turn_context_model_source", "TEXT NOT NULL DEFAULT ''");
+            EnsureFileMetadataColumn(db, "turn_context_model_timestamp", "TEXT NOT NULL DEFAULT ''");
+            EnsureFileMetadataColumn(db, "turn_context_model_timestamp_ticks", "INTEGER NOT NULL DEFAULT 0");
 
-            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', response_id TEXT NOT NULL DEFAULT '', identity_source TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', service_tier_source TEXT NOT NULL DEFAULT '', turn_context_service_tier TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', rate_limit_id TEXT NOT NULL DEFAULT '', rate_limit_name TEXT NOT NULL DEFAULT '', credits_balance REAL, credits_has INTEGER, credits_unlimited INTEGER, five_hour_used_tokens INTEGER, five_hour_remaining_tokens INTEGER, five_hour_limit_tokens INTEGER, weekly_used_tokens INTEGER, weekly_remaining_tokens INTEGER, weekly_limit_tokens INTEGER, rate_limit_individual INTEGER, rate_limit_reached_type TEXT NOT NULL DEFAULT '', spend_control_reached INTEGER, model_context_window INTEGER, long_context_threshold INTEGER, long_context_applied INTEGER NOT NULL DEFAULT 0, long_context_source TEXT NOT NULL DEFAULT '', cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_write_observable INTEGER NOT NULL DEFAULT 0)";
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', response_id TEXT NOT NULL DEFAULT '', identity_source TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', service_tier_source TEXT NOT NULL DEFAULT '', turn_context_service_tier TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', rate_limit_id TEXT NOT NULL DEFAULT '', rate_limit_name TEXT NOT NULL DEFAULT '', credits_balance REAL, credits_has INTEGER, credits_unlimited INTEGER, five_hour_used_tokens INTEGER, five_hour_remaining_tokens INTEGER, five_hour_limit_tokens INTEGER, weekly_used_tokens INTEGER, weekly_remaining_tokens INTEGER, weekly_limit_tokens INTEGER, rate_limit_individual INTEGER, rate_limit_reached_type TEXT NOT NULL DEFAULT '', spend_control_reached INTEGER, model_context_window INTEGER, long_context_threshold INTEGER, long_context_applied INTEGER NOT NULL DEFAULT 0, long_context_source TEXT NOT NULL DEFAULT '', cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_write_observable INTEGER NOT NULL DEFAULT 0, timestamp_ticks INTEGER NOT NULL DEFAULT 0)";
             cmd.ExecuteNonQuery();
 
             // New columns are additive so databases created by older builds
@@ -672,6 +682,7 @@ public static class TokenRaderIndexer
             EnsureTokenRecordColumn(db, "long_context_source", "TEXT NOT NULL DEFAULT ''");
             EnsureTokenRecordColumn(db, "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0");
             EnsureTokenRecordColumn(db, "cache_write_observable", "INTEGER NOT NULL DEFAULT 0");
+            EnsureTokenRecordColumn(db, "timestamp_ticks", "INTEGER NOT NULL DEFAULT 0");
 
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_records_session ON token_records(session_id)";
             cmd.ExecuteNonQuery();
@@ -682,6 +693,8 @@ public static class TokenRaderIndexer
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_records_source_offset ON token_records(source_path, source_offset_end)";
             cmd.ExecuteNonQuery();
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_records_root_session ON token_records(root_session_id, timestamp)";
+            cmd.ExecuteNonQuery();
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_records_session_timestamp_ticks ON token_records(session_id, timestamp_ticks, id)";
             cmd.ExecuteNonQuery();
             cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_file_metadata_last_write ON file_metadata(last_write_ticks)";
             cmd.ExecuteNonQuery();
@@ -984,17 +997,22 @@ public static class TokenRaderIndexer
 
     // ── Import ──────────────────────────────────────────────────────────
 
-    private static readonly Regex _turnContextModel = new Regex(
-        @"""type""\s*:\s*""turn_context"".*?""model""\s*:\s*""([^""]+)""",
-        RegexOptions.Compiled);
-    private static readonly Regex _turnIdValue = new Regex(
-        @"""turn_id""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
     private static readonly Regex _requestIdValue = new Regex(
         @"""request_id""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
     private static readonly Regex _responseIdValue = new Regex(
         @"""response_id""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
-    private static readonly Regex _reasoningEffortValue = new Regex(
-        @"""reasoning_effort""\s*:\s*""([^""]+)""", RegexOptions.Compiled);
+
+    private static readonly string[][] _turnContextModelPaths = new[] {
+        new[] { "payload", "model" }, new[] { "model" }
+    };
+    private static readonly string[][] _reasoningEffortPaths = new[] {
+        new[] { "payload", "reasoning_effort" },
+        new[] { "payload", "info", "reasoning_effort" },
+        new[] { "reasoning_effort" }
+    };
+    private static readonly string[][] _turnIdPaths = new[] {
+        new[] { "payload", "turn_id" }, new[] { "turn_id" }
+    };
 
     private static readonly Regex _sessionIdFromPath = new Regex(
         @"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
@@ -1019,6 +1037,66 @@ public static class TokenRaderIndexer
         new[] { "payload", "service_tier" },
         new[] { "service_tier" }
     };
+
+    /// <summary>
+    /// Parses only the small event envelope needed for stateful metadata.
+    /// Callers must use the returned top-level record type; a marker appearing
+    /// in arbitrary prompt/response text is never treated as an event.
+    /// </summary>
+    private static bool TryDeserializeMetadataRecord(string line, out TokenRaderJsonRecord record)
+    {
+        record = null;
+        if (string.IsNullOrWhiteSpace(line)) return false;
+        try { record = DeserializeLogRecord(line); }
+        catch { record = null; }
+        return record != null && !string.IsNullOrWhiteSpace(record.Type);
+    }
+
+    private static bool TryGetMetadataString(
+        string line,
+        string[] path,
+        out string value,
+        out bool present)
+    {
+        value = "";
+        present = false;
+        string raw;
+        bool isNull;
+        if (!TryGetJsonStringOrNullAtPath(line, path, out raw, out isNull)) return false;
+        present = true;
+        value = isNull ? "" : (raw ?? "");
+        return true;
+    }
+
+    private static bool TryGetTurnContextModel(
+        string line,
+        out string model,
+        out bool present)
+    {
+        for (int i = 0; i < _turnContextModelPaths.Length; i++)
+        {
+            if (TryGetMetadataString(line, _turnContextModelPaths[i], out model, out present)) return true;
+        }
+        model = "";
+        present = false;
+        return false;
+    }
+
+    private static bool TryGetMetadataStringFromPaths(
+        string line,
+        string[][] paths,
+        out string value,
+        out bool present)
+    {
+        value = "";
+        present = false;
+        if (paths == null) return false;
+        for (int i = 0; i < paths.Length; i++)
+        {
+            if (TryGetMetadataString(line, paths[i], out value, out present)) return true;
+        }
+        return false;
+    }
 
     /// <summary>
     /// Normalizes the small set of documented wire aliases without inferring
@@ -1388,9 +1466,36 @@ public static class TokenRaderIndexer
 
         // Read this before opening the import transaction: the lookup command
         // intentionally uses the connection's normal transaction context.
+        // A child can be imported after its parent has advanced further, so
+        // parent/root model fallback is bounded by the first event in this
+        // source segment rather than blindly using the parent's latest row.
+        DateTimeOffset firstImportedEventAt;
+        bool hasFirstImportedEventAt = TryReadFirstEventTimestamp(
+            filePath, startOffset, endOffset, out firstImportedEventAt);
+        DateTimeOffset? inheritedModelCutoff = hasFirstImportedEventAt
+            ? (DateTimeOffset?)firstImportedEventAt : null;
+        string persistedFileModel = GetLatestFileTextColumnIncludingEmpty(
+            db, sourcePath, "turn_context_model");
+        string persistedFileModelSource = GetLatestFileTextColumnIncludingEmpty(
+            db, sourcePath, "turn_context_model_source");
+        string persistedFileModelTimestamp = GetLatestFileTextColumnIncludingEmpty(
+            db, sourcePath, "turn_context_model_timestamp");
         string inheritedModelSource;
-        string inheritedModel = ResolveInheritedModel(db, sessionId, parentSessionId,
-            effectiveRootSessionId, out inheritedModelSource);
+        string inheritedModel;
+        if (startOffset > 0L && persistedFileModel != null &&
+            !string.IsNullOrWhiteSpace(persistedFileModelSource))
+        {
+            // File metadata is the authoritative trailing model context.  It
+            // survives a context-only chunk that has not emitted a token row.
+            inheritedModel = persistedFileModel;
+            inheritedModelSource = persistedFileModelSource;
+        }
+        else
+        {
+            inheritedModel = ResolveInheritedModel(db, sessionId, parentSessionId,
+                effectiveRootSessionId, inheritedModelCutoff, startOffset > 0L,
+                out inheritedModelSource);
+        }
         string inheritedTurnId = GetLatestSessionTextColumn(db, sessionId, "turn_id");
         string persistedFileContextTier = GetLatestFileTextColumnIncludingEmpty(
             db, sourcePath, "turn_context_service_tier");
@@ -1428,6 +1533,14 @@ public static class TokenRaderIndexer
             inheritedServiceTierSource = "";
         }
         string inheritedReasoningEffort = GetLatestSessionTextColumn(db, sessionId, "reasoning_effort");
+        if (startOffset <= 0L)
+        {
+            // A replacement/full import starts a new source history. Do not
+            // carry turn identity or reasoning metadata from the truncated
+            // incarnation into its first token.
+            inheritedTurnId = "";
+            inheritedReasoningEffort = "";
+        }
         bool insertedUnresolvedModel = false;
 
         using (var tx = db.BeginTransaction())
@@ -1453,6 +1566,8 @@ public static class TokenRaderIndexer
 
                 string currentModel = inheritedModel;
                 string currentModelSource = inheritedModelSource;
+                string currentModelContextTimestamp = startOffset > 0L
+                    ? (persistedFileModelTimestamp ?? "") : "";
                 string currentTurnId = inheritedTurnId;
                 string currentServiceTier = inheritedServiceTier;
                 string currentServiceTierSource = inheritedServiceTierSource;
@@ -1492,14 +1607,40 @@ public static class TokenRaderIndexer
                         if (string.IsNullOrWhiteSpace(line)) continue;
                         line = line.TrimStart('\uFEFF');
 
-                        if (line.Contains("turn_id") &&
-                            (line.Contains("turn_context") || line.Contains("task_started") ||
-                             line.Contains("item_completed") || line.Contains("task_complete")))
+                        // Metadata state is driven only by the top-level event
+                        // envelope.  Prompt/response text can mention words
+                        // such as "turn_context" or "reasoning_effort" and
+                        // must never clear or overwrite the current context.
+                        TokenRaderJsonRecord metadataRecord = null;
+                        string topLevelType = "";
+                        bool metadataMarker = line.IndexOf("turn_context", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            line.IndexOf("task_started", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            line.IndexOf("item_completed", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            line.IndexOf("task_complete", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            line.IndexOf("reasoning_effort", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            line.IndexOf("turn_id", StringComparison.OrdinalIgnoreCase) >= 0;
+                        if (metadataMarker && TryDeserializeMetadataRecord(line, out metadataRecord))
+                            topLevelType = metadataRecord.Type ?? "";
+
+                        bool isTurnContextLine = string.Equals(topLevelType,
+                            "turn_context", StringComparison.OrdinalIgnoreCase);
+                        bool isTurnBoundaryLine = isTurnContextLine ||
+                            string.Equals(topLevelType, "task_started", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(topLevelType, "item_completed", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(topLevelType, "task_complete", StringComparison.OrdinalIgnoreCase);
+                        if (isTurnBoundaryLine)
                         {
-                            Match turnMatch = _turnIdValue.Match(line);
-                            if (turnMatch.Success) currentTurnId = turnMatch.Groups[1].Value;
+                            string turnId = metadataRecord == null || metadataRecord.Payload == null
+                                ? "" : (metadataRecord.Payload.TurnId ?? "");
+                            bool turnIdPresent;
+                            string parsedTurnId;
+                            if (string.IsNullOrWhiteSpace(turnId) &&
+                                TryGetMetadataStringFromPaths(line, _turnIdPaths,
+                                    out parsedTurnId, out turnIdPresent) &&
+                                turnIdPresent)
+                                turnId = parsedTurnId;
+                            if (!string.IsNullOrWhiteSpace(turnId)) currentTurnId = turnId;
                         }
-                        bool isTurnContextLine = line.IndexOf("turn_context", StringComparison.OrdinalIgnoreCase) >= 0;
                         if (isTurnContextLine)
                         {
                             string contextTier;
@@ -1520,21 +1661,28 @@ public static class TokenRaderIndexer
                                 currentServiceTier = "";
                                 currentServiceTierSource = "turn_context_missing";
                             }
-                        }
-                        if (line.Contains("reasoning_effort"))
-                        {
-                            Match effortMatch = _reasoningEffortValue.Match(line);
-                            if (effortMatch.Success) currentReasoningEffort = effortMatch.Groups[1].Value;
-                        }
 
-                        if (line.Contains("turn_context"))
-                        {
-                            var m = _turnContextModel.Match(line);
-                            if (m.Success)
+                            string contextModel;
+                            bool modelPresent;
+                            if (TryGetTurnContextModel(line, out contextModel, out modelPresent))
                             {
-                                currentModel = m.Groups[1].Value;
-                                currentModelSource = "turn_context";
+                                currentModel = modelPresent ? (contextModel ?? "") : "";
+                                currentModelSource = modelPresent && !string.IsNullOrWhiteSpace(currentModel)
+                                    ? "turn_context" : "turn_context_missing";
                             }
+                            else
+                            {
+                                currentModel = "";
+                                currentModelSource = "turn_context_missing";
+                            }
+                            currentModelContextTimestamp = metadataRecord == null
+                                ? "" : (Convert.ToString(metadataRecord.Timestamp, CultureInfo.InvariantCulture) ?? "");
+
+                            string effort;
+                            bool effortPresent;
+                            currentReasoningEffort = TryGetMetadataStringFromPaths(
+                                line, _reasoningEffortPaths, out effort, out effortPresent) && effortPresent
+                                ? (effort ?? "") : "";
                             continue;
                         }
                         if (MightContainToolMetadata(line))
@@ -1734,6 +1882,9 @@ public static class TokenRaderIndexer
                 UpsertFileContextTier(db, tx, sourcePath, sessionId,
                     effectiveRootSessionId, effectiveEnd, currentServiceTier,
                     currentServiceTierSource);
+                UpsertFileContextModel(db, tx, sourcePath, sessionId,
+                    effectiveRootSessionId, effectiveEnd, currentModel,
+                    currentModelSource, currentModelContextTimestamp);
             }
             tx.Commit();
         }
@@ -2061,10 +2212,14 @@ public static class TokenRaderIndexer
                     if (!lineTerminated) break;
                     if (string.IsNullOrWhiteSpace(line)) continue;
                     line = line.TrimStart('\uFEFF');
-                    if (line.Contains("turn_context"))
+                    TokenRaderJsonRecord metadataRecord;
+                    if (TryDeserializeMetadataRecord(line, out metadataRecord) &&
+                        string.Equals(metadataRecord.Type, "turn_context", StringComparison.OrdinalIgnoreCase))
                     {
-                        var modelMatch = _turnContextModel.Match(line);
-                        if (modelMatch.Success) currentModel = modelMatch.Groups[1].Value;
+                        string model;
+                        bool modelPresent;
+                        currentModel = TryGetTurnContextModel(line, out model, out modelPresent) && modelPresent
+                            ? (model ?? "") : "";
                         continue;
                     }
                     if (!MightContainToolMetadata(line)) continue;
@@ -2554,7 +2709,8 @@ public static class TokenRaderIndexer
                         if (callInput <= 0L && callOutput <= 0L) continue;
 
                         string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
-                            totalInput, totalCached, totalOutput, totalReasoning);
+                            totalInput, totalCached, totalOutput, totalReasoning,
+                            requestId, responseId);
                         if (!seenCumulativeSnapshots.Observe(cumulativeKey, sessionId,
                             serviceTier, serviceTierSource))
                         {
@@ -2714,7 +2870,8 @@ public static class TokenRaderIndexer
                     if (callInput <= 0L && callOutput <= 0L) continue;
 
                     string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
-                        totalInput, totalCached, totalOutput, totalReasoning);
+                        totalInput, totalCached, totalOutput, totalReasoning,
+                        requestId, responseId);
                     if (!seenCumulativeSnapshots.Observe(cumulativeKey, sessionId,
                         serviceTier, serviceTierSource))
                     {
@@ -2862,7 +3019,8 @@ public static class TokenRaderIndexer
                         if (callInput <= 0L && callOutput <= 0L) continue;
 
                         string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
-                            totalInput, totalCached, totalOutput, totalReasoning);
+                            totalInput, totalCached, totalOutput, totalReasoning,
+                            requestId, responseId);
                         if (!seenCumulativeSnapshots.Observe(cumulativeKey, sessionId,
                             serviceTier, serviceTierSource))
                         {
@@ -3287,8 +3445,11 @@ public static class TokenRaderIndexer
                 string normalizedLongContextSource = NormalizeLongContextSource(
                     candidate.LongContextSource, candidate.Model, candidate.CallInput, threshold);
                 string normalizedTier = NormalizeServiceTier(candidate.ServiceTier);
+                string tierEvidenceClass = IsReliableServiceTierSource(
+                    candidate.ServiceTierSource) ? "trusted" : "untrusted";
                 string bucketKey = candidate.Model.ToLowerInvariant() + "|" +
-                    normalizedTier + "|" + (longContext ? "long" : "standard");
+                    normalizedTier + "|" + (longContext ? "long" : "standard") +
+                    "|" + tierEvidenceClass;
                 TokenRaderIntervalAggregateBucket bucket;
                 if (!buckets.TryGetValue(bucketKey, out bucket))
                 {
@@ -3299,6 +3460,7 @@ public static class TokenRaderIndexer
                             !string.IsNullOrWhiteSpace(normalizedTier),
                         ServiceTierSource = NormalizeServiceTierSource(
                             candidate.ServiceTierSource, normalizedTier),
+                        ServiceTierEvidenceComplete = tierEvidenceClass == "trusted",
                         LongContext = longContext,
                         ModelContextWindow = candidate.ModelContextWindow,
                         LongContextThreshold = threshold,
@@ -3319,6 +3481,8 @@ public static class TokenRaderIndexer
                     candidate.ServiceTierObservable && !string.IsNullOrWhiteSpace(normalizedTier);
                 bucket.ServiceTierSource = MergeServiceTierSource(bucket.ServiceTierSource,
                     NormalizeServiceTierSource(candidate.ServiceTierSource, normalizedTier));
+                bucket.ServiceTierEvidenceComplete = bucket.ServiceTierEvidenceComplete &&
+                    IsReliableServiceTierSource(candidate.ServiceTierSource);
             }
         }
 
@@ -3338,7 +3502,11 @@ public static class TokenRaderIndexer
             if (comparison != 0) return comparison;
             comparison = StringComparer.OrdinalIgnoreCase.Compare(left.ServiceTier, right.ServiceTier);
             if (comparison != 0) return comparison;
-            return left.LongContext.CompareTo(right.LongContext);
+            comparison = left.LongContext.CompareTo(right.LongContext);
+            if (comparison != 0) return comparison;
+            if (left.ServiceTierEvidenceComplete != right.ServiceTierEvidenceComplete)
+                return left.ServiceTierEvidenceComplete ? -1 : 1;
+            return StringComparer.OrdinalIgnoreCase.Compare(left.ServiceTierSource, right.ServiceTierSource);
         });
         result.Buckets = sortedBuckets.ToArray();
     }
@@ -3368,6 +3536,14 @@ public static class TokenRaderIndexer
             normalized == "turn_context_missing") return 2;
         if (normalized == "indexed") return 1;
         return 0;
+    }
+
+    private static bool IsReliableServiceTierSource(string source)
+    {
+        // Rank zero includes legacy rows with no provenance and the
+        // inherited-index fallback. "indexed" is intentionally untrusted:
+        // it may be a response-tier override copied into an older row.
+        return GetServiceTierEvidenceRank(source) >= 2;
     }
 
     private static string NormalizeLongContextSource(string source, string model, long callInput, long threshold)
@@ -3543,11 +3719,14 @@ public static class TokenRaderIndexer
         long callCached = ReadReaderInt64(reader, 8);
         long callOutput = ReadReaderInt64(reader, 9);
         long callReasoning = ReadReaderInt64(reader, 10);
+        string requestId = ReadReaderString(reader, 16);
+        string responseId = ReadReaderString(reader, 17);
         string serviceTier = NormalizeServiceTier(ReadReaderString(reader, 25));
         string serviceTierSource = NormalizeServiceTierSource(ReadReaderString(reader, 26), serviceTier);
         if (seenCumulativeSnapshots != null)
             seenCumulativeSnapshots.Observe(BuildAggregateCumulativeKey(sessionId,
-                totalInput, totalCached, totalOutput, totalReasoning), sessionId,
+                totalInput, totalCached, totalOutput, totalReasoning,
+                requestId, responseId), sessionId,
                 serviceTier, serviceTierSource);
         if ((callInput <= 0L && callOutput <= 0L) || lineageGroups == null || result == null) return;
 
@@ -3571,8 +3750,8 @@ public static class TokenRaderIndexer
                 EventAt = eventAt,
                 HasTimestamp = hasTimestamp,
                 TurnId = ReadReaderString(reader, 15),
-                RequestId = ReadReaderString(reader, 16),
-                ResponseId = ReadReaderString(reader, 17),
+                RequestId = requestId,
+                ResponseId = responseId,
                 IdentitySource = ReadReaderString(reader, 18),
                 ModelContextWindow = ReadReaderInt64(reader, 19),
                 LongContextThreshold = ReadReaderInt64(reader, 20),
@@ -3589,7 +3768,8 @@ public static class TokenRaderIndexer
         AddAggregateLineageCandidate(lineageGroups, eventKey,
             candidate, parentBySession, result);
         seenCumulativeSnapshots.Register(BuildAggregateCumulativeKey(sessionId,
-            totalInput, totalCached, totalOutput, totalReasoning), candidate);
+            totalInput, totalCached, totalOutput, totalReasoning,
+            requestId, responseId), candidate);
     }
 
     private static string BuildAggregateCumulativeKey(
@@ -3597,9 +3777,19 @@ public static class TokenRaderIndexer
         long totalInput,
         long totalCached,
         long totalOutput,
-        long totalReasoning)
+        long totalReasoning,
+        string requestId = "",
+        string responseId = "")
     {
-        return (sessionId ?? "").ToLowerInvariant() + "|" +
+        // Cumulative totals identify ordinary status refreshes only while no
+        // stronger lifecycle identity is available. Distinct request/response
+        // ids must survive this early gate and reach lineage reconciliation.
+        string strongIdentity = !string.IsNullOrWhiteSpace(requestId)
+            ? "|request:" + requestId.ToLowerInvariant()
+            : (!string.IsNullOrWhiteSpace(responseId)
+                ? "|response:" + responseId.ToLowerInvariant()
+                : "");
+        return (sessionId ?? "").ToLowerInvariant() + strongIdentity + "|" +
             string.Format(CultureInfo.InvariantCulture, "{0}:{1}:{2}:{3}",
                 totalInput, totalCached, totalOutput, totalReasoning);
     }
@@ -3851,6 +4041,131 @@ public static class TokenRaderIndexer
         }
     }
 
+    /// <summary>
+    /// Validates quota endpoint evidence against every matching snapshot in
+    /// the caller's frozen file-offset set.  This is deliberately streaming:
+    /// it keeps only the two running maxima and endpoint-match flags, never
+    /// sorts or substitutes a boundary snapshot, and accepts a legitimate
+    /// zero-percent start endpoint.
+    /// </summary>
+    public static bool ValidateQuotaSnapshotPairByOffsets(
+        SQLiteConnection db,
+        IDictionary endOffsets,
+        string windowKind,
+        int windowMinutes,
+        long resetUnixSeconds,
+        string planType,
+        string rateLimitId,
+        double startUsedPercent,
+        DateTimeOffset startObservedAt,
+        double endUsedPercent,
+        DateTimeOffset endObservedAt,
+        CancellationToken cancellationToken)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        if (endOffsets == null || windowMinutes <= 0 || resetUnixSeconds <= 0L ||
+            double.IsNaN(startUsedPercent) || double.IsInfinity(startUsedPercent) ||
+            double.IsNaN(endUsedPercent) || double.IsInfinity(endUsedPercent) ||
+            startUsedPercent < 0.0 || startUsedPercent > 100.0 ||
+            endUsedPercent < 0.0 || endUsedPercent > 100.0 ||
+            endObservedAt <= startObservedAt) return false;
+
+        string usedColumn;
+        string windowColumn;
+        string resetColumn;
+        if (string.Equals(windowKind, "FiveHour", StringComparison.OrdinalIgnoreCase))
+        {
+            usedColumn = "five_hour_used";
+            windowColumn = "five_hour_window";
+            resetColumn = "five_hour_resets";
+        }
+        else if (string.Equals(windowKind, "Weekly", StringComparison.OrdinalIgnoreCase))
+        {
+            usedColumn = "weekly_used";
+            windowColumn = "weekly_window";
+            resetColumn = "weekly_resets";
+        }
+        else return false;
+
+        List<OffsetRange> ranges = ReadAggregateOffsetRanges(null, endOffsets);
+        if (ranges.Count == 0) return false;
+
+        const double epsilon = 0.000000001;
+        double maximumAtStart = -1.0;
+        double maximumAtEnd = -1.0;
+        bool matchedStart = false;
+        bool matchedEnd = false;
+        const int chunkSize = 100;
+        long resetMinute = (long)Math.Floor(resetUnixSeconds / 60.0);
+        for (int offset = 0; offset < ranges.Count; offset += chunkSize)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int count = Math.Min(chunkSize, ranges.Count - offset);
+            using (var cmd = db.CreateCommand())
+            {
+                var predicates = new StringBuilder();
+                for (int i = 0; i < count; i++)
+                {
+                    if (i > 0) predicates.Append(" OR ");
+                    predicates.Append("(source_path=@path");
+                    predicates.Append(i.ToString(CultureInfo.InvariantCulture));
+                    predicates.Append(" AND source_offset_end>0 AND source_offset_end<=@end");
+                    predicates.Append(i.ToString(CultureInfo.InvariantCulture));
+                    predicates.Append(")");
+                    OffsetRange range = ranges[offset + i];
+                    cmd.Parameters.AddWithValue("@path" + i.ToString(CultureInfo.InvariantCulture), range.Path);
+                    cmd.Parameters.AddWithValue("@end" + i.ToString(CultureInfo.InvariantCulture), range.End);
+                }
+                cmd.CommandText =
+                    "SELECT timestamp," + usedColumn + " FROM token_records WHERE (" + predicates + ") " +
+                    "AND " + usedColumn + " IS NOT NULL AND " + windowColumn + "=@window " +
+                    "AND " + resetColumn + ">=@reset_min AND " + resetColumn + "<=@reset_max " +
+                    "AND (@plan='' OR plan_type=@plan COLLATE NOCASE) " +
+                    "AND (@limit_id='' OR rate_limit_id=@limit_id COLLATE NOCASE)";
+                cmd.Parameters.AddWithValue("@window", windowMinutes);
+                cmd.Parameters.AddWithValue("@reset_min", resetMinute * 60L);
+                cmd.Parameters.AddWithValue("@reset_max", resetMinute * 60L + 59L);
+                cmd.Parameters.AddWithValue("@plan", planType ?? "");
+                cmd.Parameters.AddWithValue("@limit_id", rateLimitId ?? "");
+                using (var reader = cmd.ExecuteReader())
+                {
+                    int inspected = 0;
+                    while (reader.Read())
+                    {
+                        if ((inspected++ & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
+                        DateTimeOffset observedAt;
+                        double usedPercent;
+                        if (!TryParseTimestamp(ReadReaderString(reader, 0), out observedAt) ||
+                            !TryConvertDouble(reader.GetValue(1), out usedPercent) ||
+                            usedPercent < -epsilon || usedPercent > 100.0 + epsilon ||
+                            observedAt > endObservedAt) continue;
+                        if (usedPercent < 0.0) usedPercent = 0.0;
+                        if (usedPercent > 100.0) usedPercent = 100.0;
+
+                        if (observedAt <= startObservedAt)
+                        {
+                            if (usedPercent > maximumAtStart) maximumAtStart = usedPercent;
+                            if (observedAt == startObservedAt &&
+                                Math.Abs(usedPercent - startUsedPercent) <= epsilon)
+                                matchedStart = true;
+                        }
+                        if (observedAt <= endObservedAt)
+                        {
+                            if (usedPercent > maximumAtEnd) maximumAtEnd = usedPercent;
+                            if (observedAt == endObservedAt &&
+                                Math.Abs(usedPercent - endUsedPercent) <= epsilon)
+                                matchedEnd = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return matchedStart && matchedEnd && maximumAtStart >= -epsilon &&
+            maximumAtEnd >= -epsilon && maximumAtStart <= startUsedPercent + epsilon &&
+            maximumAtEnd <= endUsedPercent + epsilon;
+    }
+
     public static void UpdateFileMetadata(SQLiteConnection db, string path, long length, long lastWriteTicks, long parsedOffset)
     {
         // Keep relationship metadata untouched for callers compiled against
@@ -4044,13 +4359,22 @@ public static class TokenRaderIndexer
                             if (!lineTerminated) break;
                             if (string.IsNullOrWhiteSpace(line)) continue;
                             line = line.TrimStart('\uFEFF');
-                            if (line.Contains("turn_context"))
+                            TokenRaderJsonRecord metadataRecord;
+                            if (TryDeserializeMetadataRecord(line, out metadataRecord) &&
+                                string.Equals(metadataRecord.Type, "turn_context", StringComparison.OrdinalIgnoreCase))
                             {
-                                Match match = _turnContextModel.Match(line);
-                                if (match.Success)
+                                string model;
+                                bool modelPresent;
+                                if (TryGetTurnContextModel(line, out model, out modelPresent) && modelPresent)
                                 {
-                                    currentModel = match.Groups[1].Value;
-                                    modelSource = "turn_context";
+                                    currentModel = model ?? "";
+                                    modelSource = string.IsNullOrWhiteSpace(currentModel)
+                                        ? "turn_context_missing" : "turn_context";
+                                }
+                                else
+                                {
+                                    currentModel = "";
+                                    modelSource = "turn_context_missing";
                                 }
                                 continue;
                             }
@@ -4205,6 +4529,52 @@ public static class TokenRaderIndexer
             insert.Parameters.AddWithValue("@root", rootSessionId ?? "");
             insert.Parameters.AddWithValue("@tier", normalizedTier);
             insert.Parameters.AddWithValue("@source", normalizedSource);
+            insert.ExecuteNonQuery();
+        }
+    }
+
+    private static void UpsertFileContextModel(
+        SQLiteConnection db,
+        SQLiteTransaction tx,
+        string path,
+        string sessionId,
+        string rootSessionId,
+        long parsedOffset,
+        string model,
+        string modelSource,
+        string modelTimestamp)
+    {
+        if (db == null || tx == null || string.IsNullOrWhiteSpace(path)) return;
+        using (var update = db.CreateCommand())
+        {
+            update.Transaction = tx;
+            update.CommandText =
+                "UPDATE file_metadata SET turn_context_model=@model,turn_context_model_source=@source,turn_context_model_timestamp=@timestamp WHERE path=@path";
+            update.Parameters.AddWithValue("@model", model ?? "");
+            update.Parameters.AddWithValue("@source", modelSource ?? "");
+            update.Parameters.AddWithValue("@timestamp", modelTimestamp ?? "");
+            update.Parameters.AddWithValue("@path", path);
+            if (update.ExecuteNonQuery() > 0) return;
+        }
+
+        // ImportFile is a public low-level API and may run before the normal
+        // file catalog update.  Keep a compact trailing model snapshot so a
+        // later append can restore context even when this segment had no
+        // token_count row.
+        using (var insert = db.CreateCommand())
+        {
+            insert.Transaction = tx;
+            insert.CommandText =
+                "INSERT OR IGNORE INTO file_metadata (path,length,last_write_ticks,parsed_offset,session_id,content_retained,root_session_id,turn_context_model,turn_context_model_source,turn_context_model_timestamp) " +
+                "VALUES (@path,@length,0,@offset,@session,1,@root,@model,@source,@timestamp)";
+            insert.Parameters.AddWithValue("@path", path);
+            insert.Parameters.AddWithValue("@length", Math.Max(0L, parsedOffset));
+            insert.Parameters.AddWithValue("@offset", Math.Max(0L, parsedOffset));
+            insert.Parameters.AddWithValue("@session", sessionId ?? "");
+            insert.Parameters.AddWithValue("@root", rootSessionId ?? "");
+            insert.Parameters.AddWithValue("@model", model ?? "");
+            insert.Parameters.AddWithValue("@source", modelSource ?? "");
+            insert.Parameters.AddWithValue("@timestamp", modelTimestamp ?? "");
             insert.ExecuteNonQuery();
         }
     }
@@ -4996,15 +5366,132 @@ public static class TokenRaderIndexer
 
     private static string GetLatestSessionModel(SQLiteConnection db, string sessionId)
     {
+        return GetLatestSessionModel(db, sessionId, null);
+    }
+
+    private static string GetLatestSessionModel(
+        SQLiteConnection db,
+        string sessionId,
+        DateTimeOffset? atOrBefore)
+    {
         if (string.IsNullOrWhiteSpace(sessionId)) return "";
+
+        string bestModel = "";
+        DateTimeOffset bestObservedAt = default(DateTimeOffset);
+        bool bestHasTimestamp = false;
+        long bestSequence = long.MinValue;
+        bool bestIsContext = false;
+
+        // Do not use SQLite's textual timestamp ordering here.  Logs can
+        // legally mix Z and explicit offsets, and fractional-second widths
+        // are not guaranteed to be identical.  Parse every candidate so the
+        // as-of boundary is an actual instant comparison.
         using (var cmd = db.CreateCommand())
         {
-            cmd.CommandText = "SELECT model FROM token_records WHERE session_id = @p AND model IS NOT NULL AND model <> '' ORDER BY id DESC LIMIT 1";
+            cmd.CommandText = "SELECT id,model,timestamp FROM token_records WHERE session_id=@p AND model IS NOT NULL AND model<>''";
             cmd.Parameters.AddWithValue("@p", sessionId);
-            object value = cmd.ExecuteScalar();
-            if (value == null || value == DBNull.Value) return "";
-            return Convert.ToString(value, CultureInfo.InvariantCulture) ?? "";
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string model = ReadReaderString(reader, 1);
+                    if (string.IsNullOrWhiteSpace(model)) continue;
+                    long sequence = ReadReaderInt64(reader, 0);
+                    DateTimeOffset observedAt;
+                    bool hasTimestamp = TryParseTimestamp(ReadReaderString(reader, 2), out observedAt);
+                    if (atOrBefore.HasValue)
+                    {
+                        if (!hasTimestamp || observedAt > atOrBefore.Value) continue;
+                        if (!bestHasTimestamp || observedAt > bestObservedAt ||
+                            (observedAt == bestObservedAt && sequence >= bestSequence))
+                        {
+                            bestModel = model;
+                            bestObservedAt = observedAt;
+                            bestHasTimestamp = true;
+                            bestSequence = sequence;
+                            bestIsContext = false;
+                        }
+                    }
+                    else if (hasTimestamp &&
+                        (!bestHasTimestamp || observedAt > bestObservedAt ||
+                         (observedAt == bestObservedAt && !bestIsContext && sequence >= bestSequence)))
+                    {
+                        // Prefer the latest actual instant.  The sequence id
+                        // only breaks ties or covers legacy rows lacking a
+                        // parseable timestamp.
+                        bestModel = model;
+                        bestObservedAt = observedAt;
+                        bestHasTimestamp = true;
+                        bestSequence = sequence;
+                        bestIsContext = false;
+                    }
+                    else if (!bestHasTimestamp && !bestIsContext && sequence >= bestSequence)
+                    {
+                        bestModel = model;
+                        bestSequence = sequence;
+                        bestIsContext = false;
+                    }
+                }
+            }
         }
+
+        // A trailing turn_context may have no token row yet.  Its persisted
+        // snapshot is a first-class model observation, but only when its own
+        // timestamp is parsed and is not in the future relative to an as-of
+        // child event.  Context observations at the same instant supersede a
+        // token row because they are the explicit boundary for that turn.
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT turn_context_model,turn_context_model_timestamp,path FROM file_metadata " +
+                "WHERE session_id=@p AND turn_context_model IS NOT NULL AND turn_context_model<>'' " +
+                "AND turn_context_model_source IS NOT NULL AND turn_context_model_source<>''";
+            cmd.Parameters.AddWithValue("@p", sessionId);
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string model = ReadReaderString(reader, 0);
+                    if (string.IsNullOrWhiteSpace(model)) continue;
+                    DateTimeOffset observedAt;
+                    bool hasTimestamp = TryParseTimestamp(ReadReaderString(reader, 1), out observedAt);
+                    if (atOrBefore.HasValue)
+                    {
+                        if (!hasTimestamp || observedAt > atOrBefore.Value) continue;
+                        if (!bestHasTimestamp || observedAt > bestObservedAt ||
+                            (observedAt == bestObservedAt && !bestIsContext))
+                        {
+                            bestModel = model;
+                            bestObservedAt = observedAt;
+                            bestHasTimestamp = true;
+                            bestSequence = long.MaxValue;
+                            bestIsContext = true;
+                        }
+                    }
+                    else if (hasTimestamp &&
+                        (!bestHasTimestamp || observedAt > bestObservedAt ||
+                         (observedAt == bestObservedAt && !bestIsContext)))
+                    {
+                        bestModel = model;
+                        bestObservedAt = observedAt;
+                        bestHasTimestamp = true;
+                        bestSequence = long.MaxValue;
+                        bestIsContext = true;
+                    }
+                    else if (string.IsNullOrWhiteSpace(bestModel) && !bestHasTimestamp)
+                    {
+                        // A legacy/new metadata row without a parseable
+                        // timestamp is usable only when no dated observation
+                        // exists; it must never displace a dated candidate in
+                        // an as-of lookup.
+                        bestModel = model;
+                        bestSequence = long.MaxValue;
+                        bestIsContext = true;
+                    }
+                }
+            }
+        }
+        return bestModel;
     }
 
     private static string GetLatestSessionTextColumn(SQLiteConnection db, string sessionId, string columnName)
@@ -5065,9 +5552,12 @@ public static class TokenRaderIndexer
         string sessionId,
         string parentSessionId,
         string rootSessionId,
+        DateTimeOffset? asOf,
+        bool includeSameSession,
         out string modelSource)
     {
-        string model = GetLatestSessionModel(db, sessionId);
+        string model = includeSameSession
+            ? GetLatestSessionModel(db, sessionId, asOf) : "";
         if (!string.IsNullOrWhiteSpace(model))
         {
             modelSource = "same_session";
@@ -5076,7 +5566,7 @@ public static class TokenRaderIndexer
         if (!string.IsNullOrWhiteSpace(parentSessionId) &&
             !string.Equals(parentSessionId, sessionId, StringComparison.OrdinalIgnoreCase))
         {
-            model = GetLatestSessionModel(db, parentSessionId);
+            model = GetLatestSessionModel(db, parentSessionId, asOf);
             if (!string.IsNullOrWhiteSpace(model))
             {
                 modelSource = "parent";
@@ -5087,7 +5577,7 @@ public static class TokenRaderIndexer
             !string.Equals(rootSessionId, sessionId, StringComparison.OrdinalIgnoreCase) &&
             !string.Equals(rootSessionId, parentSessionId, StringComparison.OrdinalIgnoreCase))
         {
-            model = GetLatestSessionModel(db, rootSessionId);
+            model = GetLatestSessionModel(db, rootSessionId, asOf);
             if (!string.IsNullOrWhiteSpace(model))
             {
                 modelSource = "root";
@@ -5098,11 +5588,72 @@ public static class TokenRaderIndexer
         return "";
     }
 
+    private static string ResolveInheritedModel(
+        SQLiteConnection db,
+        string sessionId,
+        string parentSessionId,
+        string rootSessionId,
+        out string modelSource)
+    {
+        return ResolveInheritedModel(db, sessionId, parentSessionId, rootSessionId,
+            null, true, out modelSource);
+    }
+
     private static string ExtractSessionId(string filePath)
     {
         string name = Path.GetFileNameWithoutExtension(filePath);
         var m = _sessionIdFromPath.Match(name);
         return m.Success ? m.Groups[1].Value.ToLowerInvariant() : name.ToLowerInvariant();
+    }
+
+    private static bool TryReadFirstEventTimestamp(
+        string filePath,
+        long startOffset,
+        long endOffset,
+        out DateTimeOffset timestamp)
+    {
+        timestamp = default(DateTimeOffset);
+        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath)) return false;
+        try
+        {
+            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete))
+            {
+                long safeStart = Math.Max(0L, startOffset);
+                long requestedEnd = endOffset < 0L ? 0L : endOffset;
+                long effectiveEnd = Math.Min(fs.Length, requestedEnd);
+                if (safeStart >= effectiveEnd) return false;
+                bool skipPartialLine = false;
+                if (safeStart > 0L)
+                {
+                    fs.Seek(safeStart - 1L, SeekOrigin.Begin);
+                    int previousByte = fs.ReadByte();
+                    skipPartialLine = previousByte != '\n' && previousByte != '\r';
+                }
+                using (var lineReader = new Utf8JsonlLineReader(fs, safeStart, effectiveEnd))
+                {
+                    if (skipPartialLine)
+                    {
+                        string discarded; long discardedEnd; bool discardedTerminated;
+                        lineReader.ReadLine(out discarded, out discardedEnd, out discardedTerminated);
+                    }
+                    string line; long lineEnd; bool terminated;
+                    while (lineReader.ReadLine(out line, out lineEnd, out terminated))
+                    {
+                        if (!terminated) break;
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        line = line.TrimStart('\uFEFF');
+                        TokenRaderJsonRecord record;
+                        if (!TryDeserializeMetadataRecord(line, out record)) continue;
+                        if (TryParseTimestamp(record.Timestamp, out timestamp)) return true;
+                    }
+                }
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+        catch (ArgumentException) { }
+        return false;
     }
 
     private static string GetCanonicalPath(string filePath)

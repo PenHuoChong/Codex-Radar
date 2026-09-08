@@ -80,7 +80,8 @@ function New-TestTokenRecord {
         [Int64]$CallInput,
         [Int64]$CallCached,
         [Int64]$CallOutput,
-        $RateLimits = $null
+        $RateLimits = $null,
+        [AllowNull()][string]$ServiceTier = 'default'
     )
     $record = [ordered]@{
         timestamp = $Timestamp
@@ -95,6 +96,9 @@ function New-TestTokenRecord {
         }
     }
     if ($null -ne $RateLimits) { $record.payload['rate_limits'] = $RateLimits }
+    # These general cost/boundary fixtures represent known Standard calls.
+    # Missing-mode rejection is covered independently by the evidence suite.
+    if (-not [string]::IsNullOrWhiteSpace($ServiceTier)) { $record.payload['service_tier'] = $ServiceTier }
     return $record
 }
 
@@ -1882,11 +1886,15 @@ try {
     else { & $aggregateTestScript }
     & (Join-Path $PSScriptRoot 'Run-ModelBackfillTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ServiceTierTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-IndexEvidenceTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-QuotaEvidenceFixTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-MeasurementPricingUiTests.ps1')
 
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     [xml]$xaml = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
+    if ($null -eq $window.FindName('MeasurementPricingButton')) { throw 'ASSERT FAILED: missing measurement pricing control' }
     foreach ($controlName in @('ProjectComboBox', 'ScopeComboBox', 'SessionListBox', 'HistoryRangeComboBox', 'RefreshButton', 'RebuildIndexButton', 'PurgeOldIndexButton', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'IntervalStatusText', 'ModelMetricText', 'CachedMetricText', 'UncachedMetricText', 'OutputMetricText', 'TotalMetricText', 'HitRateMetricText', 'UsdCostText', 'FiveHourUsageText', 'FiveHourDollarText', 'WeeklyUsageText', 'WeeklyDollarText', 'PricingDataGrid', 'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText', 'UsageHistoryModelText', 'UsageHistoryStatusText', 'UsageHistoryModelGrid', 'BackfillToolUsageButton', 'ToolCallCountText', 'InputImageCountText', 'GeneratedImageCountText', 'ComputerScreenshotCountText', 'ToolUsageGrid', 'ToolUsageStatusText', 'UnpricedUsageText')) {
         if ($null -eq $window.FindName($controlName)) { throw "ASSERT FAILED: missing XAML control $controlName" }
     }

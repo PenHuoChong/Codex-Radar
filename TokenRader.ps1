@@ -61,6 +61,7 @@ $script:State = @{
     QuotaCalibrationMessage = '美元总额需通过一次使额度百分比上升的时间段测量进行反推。'
     Projects = @()
     ProjectCache = @{}
+    ManualServiceTiers = @{}
 }
 
 $script:WindowClosing = $false
@@ -82,12 +83,14 @@ $script:IntervalComputeScript = {
         [string]$SessionsRoot,
         [bool]$ScanRateLimits,
         [Threading.CancellationToken]$CancellationToken,
-        [hashtable]$ProgressState
+        [hashtable]$ProgressState,
+        [hashtable]$ManualServiceTiers = @{}
     )
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
     $prices = Get-TokenRaderPrices -PricingPath $PricingPath
+    $prices | Add-Member -NotePropertyName ManualServiceTiers -NotePropertyValue $ManualServiceTiers -Force
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '同步增量日志'
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
@@ -260,7 +263,7 @@ $controlNames = @(
     'TotalMetricText', 'HitRateMetricText', 'HitRateProgress', 'UsdCostText', 'CostBreakdownText',
     'LongContextText', 'PricingVerifiedText', 'OpenPricingButton', 'InputPriceText', 'CachedPriceText',
     'OutputPriceText', 'FormulaText', 'PricingDataGrid', 'CaveatText', 'StatusText'
-    'IntervalStatusText', 'IntervalTimeText', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton'
+    'IntervalStatusText', 'IntervalTimeText', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'MeasurementPricingButton'
     'FiveHourUsageText', 'FiveHourProgress', 'FiveHourDollarText', 'FiveHourResetText',
     'WeeklyUsageText', 'WeeklyProgress', 'WeeklyDollarText', 'WeeklyResetText', 'QuotaEstimateHintText',
     'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText',
@@ -336,6 +339,7 @@ function Set-TokenRaderUiState {
     $script:StopMeasureButton.IsEnabled = ($NewState -in @('Starting', 'Measuring'))
     $script:StopMeasureButton.Content = if ($NewState -eq 'Starting') { '取消准备' } else { '结束计算' }
     $script:ViewIntervalButton.IsEnabled = ($canViewInterval -and $null -ne $script:State.IntervalBaseline)
+    $script:MeasurementPricingButton.IsEnabled = ($NewState -in @('Measuring', 'Ready') -and $null -ne $script:State.IntervalBaseline)
     $script:RefreshButton.IsEnabled = ($canOperate -and -not [bool]$script:State.IndexSyncing)
     $script:RebuildIndexButton.IsEnabled = ($canOperate -and $indexReady)
     $script:PurgeOldIndexButton.IsEnabled = ($canOperate -and $indexReady)
@@ -1302,6 +1306,22 @@ function Merge-LatestRateLimits {
     $currentWeeklyObserved = if ($null -ne $current.Weekly -and $null -ne $current.Weekly.PSObject.Properties['ObservedAt']) { [DateTimeOffset]$current.Weekly.ObservedAt } else { [DateTimeOffset]$current.ObservedAt }
     $useCandidateFive = ($null -ne $Candidate.FiveHour -and ($null -eq $current.FiveHour -or $candidateFiveObserved -ge $currentFiveObserved))
     $useCandidateWeekly = ($null -ne $Candidate.Weekly -and ($null -eq $current.Weekly -or $candidateWeeklyObserved -ge $currentWeeklyObserved))
+    foreach ($windowName in @('FiveHour', 'Weekly')) {
+        $oldWindow = $current.$windowName
+        $newWindow = $Candidate.$windowName
+        if ($null -eq $oldWindow -or $null -eq $newWindow -or $null -eq $oldWindow.ResetsAt -or $null -eq $newWindow.ResetsAt) { continue }
+        $sameReset = (Get-TokenRaderResetIdentity -WindowMinutes $oldWindow.WindowMinutes -ResetsAt $oldWindow.ResetsAt) -eq
+            (Get-TokenRaderResetIdentity -WindowMinutes $newWindow.WindowMinutes -ResetsAt $newWindow.ResetsAt)
+        $oldPlan = if ($null -ne $oldWindow.PSObject.Properties['PlanType']) { [string]$oldWindow.PlanType } else { '' }
+        $newPlan = if ($null -ne $newWindow.PSObject.Properties['PlanType']) { [string]$newWindow.PlanType } else { '' }
+        $samePlan = [string]::IsNullOrWhiteSpace($oldPlan) -or [string]::IsNullOrWhiteSpace($newPlan) -or
+            [string]::Equals($oldPlan, $newPlan, [StringComparison]::OrdinalIgnoreCase)
+        if ($sameReset -and $samePlan -and [double]$newWindow.UsedPercent -lt [double]$oldWindow.UsedPercent) {
+            # Keep the entire earlier observation, not its percentage grafted
+            # onto a later timestamp: cost/percentage boundaries stay paired.
+            if ($windowName -eq 'FiveHour') { $useCandidateFive = $false } else { $useCandidateWeekly = $false }
+        }
+    }
     $fiveHour = if ($useCandidateFive) { $Candidate.FiveHour } else { $current.FiveHour }
     $weekly = if ($useCandidateWeekly) { $Candidate.Weekly } else { $current.Weekly }
     $fiveObserved = if ($null -ne $fiveHour -and $null -ne $fiveHour.PSObject.Properties['ObservedAt']) { [DateTimeOffset]$fiveHour.ObservedAt } else { [DateTimeOffset]::MinValue }
@@ -1351,11 +1371,14 @@ function Set-QuotaWindowCard {
             ' · 从 {0:0.####}% 开始 · 校准增量 +{1:0.####}%' -f ([double]$Estimate.StartUsedPercent), ([double]$Estimate.EffectiveDeltaPercent)
         } else { '' }
         $historyLabel = if ($null -ne $Estimate.PSObject.Properties['HistoryLookbackApplied'] -and [bool]$Estimate.HistoryLookbackApplied) { ' · 已回查本窗口历史完整步长' } else { '' }
+        if ($null -ne $Estimate.PSObject.Properties['ManualServiceTierApplied'] -and [bool]$Estimate.ManualServiceTierApplied) {
+            $historyLabel += ' · 模式经人工确认'
+        }
         $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 已用≈{2} · 剩余≈{3}{4}{5} · 来源：{6}{7}' -f
             $currentPercent,
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
-            (Format-TokenRaderUsd ([double]$Estimate.UsedUsd)),
-            (Format-TokenRaderUsd ([double]$Estimate.RemainingUsd)),
+            (Format-TokenRaderUsd ([double]$Estimate.TotalUsd * $currentPercent / 100.0)),
+            (Format-TokenRaderUsd ([double]$Estimate.TotalUsd * [Math]::Max(0.0, 100.0 - $currentPercent) / 100.0)),
             $startLabel,
             $historyLabel,
             $sourceLabel,
@@ -1386,6 +1409,8 @@ function Update-QuotaCards {
 function Test-TokenRaderQuotaEstimateMatchesWindow {
     param($Estimate, $Window)
     if ($null -eq $Estimate) { return $false }
+    if ($null -ne $Estimate.PSObject.Properties['ResetsAt'] -and $null -ne $Estimate.ResetsAt -and
+        [DateTimeOffset]$Estimate.ResetsAt -le [DateTimeOffset]::Now) { return $false }
     # A transient result may omit rate_limits entirely. The estimate belongs
     # to the current measurement generation, so retain it until a concrete
     # incompatible window is observed.
@@ -1406,9 +1431,9 @@ function Test-TokenRaderQuotaEstimateMatchesWindow {
         $windowReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$Window.WindowMinutes) -ResetsAt $Window.ResetsAt
         if ([string]::IsNullOrWhiteSpace($estimateReset) -or $estimateReset -ne $windowReset) { return $false }
     }
-    if ($null -ne $Estimate.PSObject.Properties['CurrentObservedAt'] -and $null -ne $Estimate.CurrentObservedAt -and
-        $null -ne $Window.PSObject.Properties['ObservedAt'] -and $null -ne $Window.ObservedAt -and
-        [DateTimeOffset]$Estimate.CurrentObservedAt -ne [DateTimeOffset]$Window.ObservedAt) { return $false }
+    # A later observation in the same reset cycle does not invalidate an
+    # already aligned calibration. The card uses the current percentage to
+    # recompute used/remaining dollars rather than reusing stale amounts.
     return $true
 }
 
@@ -1459,6 +1484,14 @@ function Update-QuotaEstimatesFromInterval {
     $startRateLimits = if ($null -ne $Result.PSObject.Properties['StartRateLimits']) { $Result.StartRateLimits } else { $script:State.IntervalBaseline.RateLimits }
     $endRateLimits = if ($null -ne $Result.PSObject.Properties['EndRateLimits']) { $Result.EndRateLimits } else { $Result.RateLimits }
     $pricingComplete = if ($null -ne $Result.PSObject.Properties['PricingComplete']) { [bool]$Result.PricingComplete } else { [bool]$Result.CostComplete }
+    $quotaModesIncomplete = $null -ne $Result.PSObject.Properties['ServiceTierComplete'] -and -not [bool]$Result.ServiceTierComplete
+    if ($null -ne $Result.PSObject.Properties['QuotaEvidence'] -and $null -ne $Result.QuotaEvidence) {
+        foreach ($name in @('FiveHour', 'Weekly')) {
+            $evidence = $Result.QuotaEvidence.$name
+            if ($null -ne $evidence -and $null -ne $evidence.PSObject.Properties['ServiceTierComplete'] -and
+                -not [bool]$evidence.ServiceTierComplete) { $quotaModesIncomplete = $true }
+        }
+    }
     $newEstimates = Get-TokenRaderQuotaEstimate `
         -StartRateLimits $(if ($accountUnchanged) { $startRateLimits } else { $null }) `
         -EndRateLimits $(if ($accountUnchanged) { $endRateLimits } else { $null }) `
@@ -1520,6 +1553,8 @@ function Update-QuotaEstimatesFromInterval {
         '测量期间账号标签发生变化，本次不估算美金额度。'
     } elseif (-not $pricingComplete) {
         ''
+    } elseif ($quotaModesIncomplete) {
+        '日志未明确提供计价模式；可在“本次计价模式…”中按模型确认普通或 Fast 后重新计算额度。'
     } elseif ([double]$Result.TotalCost -le 0) {
         '当前时间段尚无可计价消耗，点击“查看结果”会再次检查。'
     } else {
@@ -1777,6 +1812,7 @@ function Start-TokenRaderIntervalComputeAsync {
             ScanRateLimits = $ScanRateLimits
             CancellationToken = $cancellationSource.Token
             ProgressState = $progressState
+            ManualServiceTiers = (@{} + $script:State.ManualServiceTiers)
         } `
         -Kind 'IntervalCompute' `
         -Generation $effectiveGeneration `
@@ -2060,6 +2096,7 @@ function Update-ProjectView {
 
 function Start-IntervalMeasurement {
     if ([string]$script:State.UiState -notin @('Idle', 'Ready', 'Error')) { return }
+    Reset-MeasurementPricingConfirmation
     $waitForIndex = (-not [bool]$script:State.IndexReady -or [bool]$script:State.IndexSyncing)
     $generation = [Int64]$script:State.MeasurementGeneration + 1
     $requestId = New-TokenRaderRequestId
@@ -2141,6 +2178,123 @@ function Stop-IntervalMeasurement {
         -RequestId $requestId
 }
 
+function Reset-MeasurementPricingConfirmation {
+    if ($script:State.ContainsKey('ManualServiceTiers') -and $script:State.ManualServiceTiers.Count -gt 0) {
+        $script:State.QuotaEstimates = $null
+        $script:State.QuotaEstimateAccountIdentity = ''
+    }
+    $script:State.ManualServiceTiers = @{}
+    if ($null -ne $script:MeasurementPricingButton) { $script:MeasurementPricingButton.Content = '本次计价模式…' }
+}
+
+function Set-MeasurementPricingConfirmation {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Selections)
+    if ($script:State.UiState -notin @('Measuring', 'Ready') -or $null -eq $script:State.IntervalBaseline -or
+        [bool]$script:State.IntervalComputing) { return $false }
+    $clean = @{}
+    foreach ($model in $Selections.Keys) {
+        $tier = ConvertTo-TokenRaderServiceTier ([string]$Selections[$model])
+        if ($tier -notin @('default', 'priority')) { continue }
+        $basePrice = Resolve-TokenRaderPrice -Model ([string]$model) -PricingDocument $script:Prices
+        if ($null -eq $basePrice) { continue }
+        if ($null -eq (Resolve-TokenRaderServiceTierPrice -Price $basePrice -ServiceTier $tier)) { return $false }
+        $clean[[string]$model] = $tier
+    }
+    $script:State.ManualServiceTiers = $clean
+    # Results priced under a different assumption cannot calibrate this one.
+    $script:State.QuotaEstimates = $null
+    $script:State.QuotaEstimateAccountIdentity = ''
+    $script:State.IntervalCache = $null
+    $script:State.QuotaCalibrationMessage = '正在按本次计价模式重新计算额度…'
+    $script:MeasurementPricingButton.Content = if ($clean.Count -gt 0) { '本次计价模式（人工确认）…' } else { '本次计价模式…' }
+    Update-QuotaCards
+    Update-IntervalView -Manual
+    return $true
+}
+
+function Show-MeasurementPricingDialog {
+    if ($script:State.UiState -notin @('Measuring', 'Ready') -or $null -eq $script:State.IntervalBaseline) { return }
+    if ([bool]$script:State.IntervalComputing) {
+        $script:StatusText.Text = '请等待本次结果更新完成后，再确认计价模式。'
+        return
+    }
+    $dialog = New-Object Windows.Window
+    $dialog.Title = '本次测量：人工确认计价模式'
+    $dialog.Owner = $script:Window
+    $dialog.Width = 560
+    $dialog.Height = 590
+    $dialog.WindowStartupLocation = 'CenterOwner'
+    $dialog.Background = [Windows.Media.Brushes]::White
+    $panel = New-Object Windows.Controls.DockPanel
+    $panel.Margin = '16'
+    $dialog.Content = $panel
+    $note = New-Object Windows.Controls.TextBlock
+    $note.Text = '仅填写你能确认的模式。设置应用于本次测量及其额度校准快照区间中，该模型的模式缺失记录；明确的日志模式优先。不会把子代理自动设成父任务的模式，也不会修改日志或周期历史。开始新测量后清空。'
+    $note.TextWrapping = 'Wrap'
+    $note.Margin = '0,0,0,14'
+    [Windows.Controls.DockPanel]::SetDock($note, 'Top')
+    [void]$panel.Children.Add($note)
+    $buttons = New-Object Windows.Controls.StackPanel
+    $buttons.Orientation = 'Horizontal'
+    $buttons.HorizontalAlignment = 'Right'
+    $buttons.Margin = '0,12,0,0'
+    [Windows.Controls.DockPanel]::SetDock($buttons, 'Bottom')
+    [void]$panel.Children.Add($buttons)
+    $apply = New-Object Windows.Controls.Button
+    $apply.Content = '确认并重新计算'
+    $apply.Padding = '12,7'
+    $apply.Tag = $dialog
+    $apply.Add_Click({ param($sender, $eventArgs) $sender.Tag.DialogResult = $true })
+    [void]$buttons.Children.Add($apply)
+    $cancel = New-Object Windows.Controls.Button
+    $cancel.Content = '取消'
+    $cancel.Padding = '12,7'
+    $cancel.Margin = '8,0,0,0'
+    $cancel.IsCancel = $true
+    [void]$buttons.Children.Add($cancel)
+    $scroll = New-Object Windows.Controls.ScrollViewer
+    $scroll.VerticalScrollBarVisibility = 'Auto'
+    [void]$panel.Children.Add($scroll)
+    $list = New-Object Windows.Controls.StackPanel
+    $scroll.Content = $list
+    $selectors = @{}
+    foreach ($price in @($script:Prices.models)) {
+        $row = New-Object Windows.Controls.StackPanel
+        $row.Orientation = 'Horizontal'
+        $row.Margin = '0,0,0,10'
+        $label = New-Object Windows.Controls.TextBlock
+        $label.Text = [string]$price.displayName
+        $label.Width = 225
+        $label.VerticalAlignment = 'Center'
+        [void]$row.Children.Add($label)
+        $combo = New-Object Windows.Controls.ComboBox
+        $combo.Width = 240
+        foreach ($choice in @(@('', '未确认（普通价参考）'), @('default', '确认普通模式'), @('priority', '确认 Fast 模式'))) {
+            if ($choice[0] -eq 'priority' -and $null -eq (Resolve-TokenRaderServiceTierPrice -Price $price -ServiceTier 'priority')) { continue }
+            $item = New-Object Windows.Controls.ComboBoxItem
+            $item.Tag = $choice[0]
+            $item.Content = $choice[1]
+            [void]$combo.Items.Add($item)
+            if ($script:State.ManualServiceTiers.ContainsKey([string]$price.id) -and
+                [string]$script:State.ManualServiceTiers[[string]$price.id] -eq [string]$choice[0]) { $combo.SelectedItem = $item }
+        }
+        if ($combo.SelectedIndex -lt 0) { $combo.SelectedIndex = 0 }
+        $selectors[[string]$price.id] = $combo
+        [void]$row.Children.Add($combo)
+        [void]$list.Children.Add($row)
+    }
+    if ($dialog.ShowDialog() -eq $true) {
+        $selections = @{}
+        foreach ($model in $selectors.Keys) {
+            $value = [string]$selectors[$model].SelectedItem.Tag
+            if ($value -ne '') { $selections[$model] = $value }
+        }
+        if (-not (Set-MeasurementPricingConfirmation -Selections $selections)) {
+            $script:StatusText.Text = '后台状态已变化，本次模式确认尚未应用；请在结果更新完成后重试。'
+        }
+    }
+}
+
 function Get-ServiceTierLabel {
     param([string]$ServiceTier = '')
     switch (ConvertTo-TokenRaderServiceTier $ServiceTier) {
@@ -2165,6 +2319,13 @@ function Get-ResultServiceTierSummary {
         if ($null -ne $item.PSObject.Properties['LongContext'] -and [bool]$item.LongContext) { $longEvents += [Int64]$item.Events }
     }
     if ($longEvents -gt 0) { $parts += '长上下文 {0:N0} 次' -f $longEvents }
+    $manualEvents = 0L
+    foreach ($item in @($Result.Items)) {
+        if ($null -ne $item.PSObject.Properties['ServiceTierSource'] -and [string]$item.ServiceTierSource -eq 'manual_confirmation') {
+            $manualEvents += [Int64]$item.Events
+        }
+    }
+    if ($manualEvents -gt 0) { $parts += '模式人工确认 {0:N0} 次' -f $manualEvents }
     return ($parts -join ' · ')
 }
 
@@ -2528,6 +2689,7 @@ $script:ScopeComboBox.Add_SelectionChanged({
     }
 })
 $script:StartMeasureButton.Add_Click({ Start-IntervalMeasurement })
+$script:MeasurementPricingButton.Add_Click({ Show-MeasurementPricingDialog })
 $script:StopMeasureButton.Add_Click({ Stop-IntervalMeasurement })
 $script:ViewIntervalButton.Add_Click({
     if ($null -ne $script:State.IntervalBaseline) {
