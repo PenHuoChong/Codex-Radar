@@ -330,6 +330,118 @@ try {
     $db.Dispose()
 }
 
+# Measurement calibration is anchored independently of the main measurement
+# boundary. With a 26% baseline, the selector may look back to the first
+# complete 25% -> 26% step, then uses 26% -> 27% once that baseline is reached;
+# subsequent reads keep the fixed first-step anchor (27%) while preserving decimal
+# snapshot values and the first endpoint observed at a plateau. The offsets
+# remain frozen for every query so this exercises the selector's evidence
+# boundary rather than mutable log state.
+$db = New-QuotaCycleDb
+try {
+    $path = 'synthetic://quota-measurement-calibration'
+    $t25 = [DateTimeOffset]::Parse('2030-03-07T00:00:00Z')
+    $t26 = [DateTimeOffset]::Parse('2030-03-07T00:00:10Z')
+    $t26Partial = [DateTimeOffset]::Parse('2030-03-07T00:00:15Z')
+    $t27 = [DateTimeOffset]::Parse('2030-03-07T00:00:20Z')
+    $t28 = [DateTimeOffset]::Parse('2030-03-07T00:00:30Z')
+    $t28Decimal = [DateTimeOffset]::Parse('2030-03-07T00:00:35Z')
+    $t29 = [DateTimeOffset]::Parse('2030-03-07T00:00:37Z')
+    $t30 = [DateTimeOffset]::Parse('2030-03-07T00:00:40Z')
+    $t30Plateau = [DateTimeOffset]::Parse('2030-03-07T00:00:50Z')
+    $t31 = [DateTimeOffset]::Parse('2030-03-07T00:01:00Z')
+    Add-QuotaCycleRow $db 'measurement-session' $t25.ToString('o') $path 10 'measurement-25' -PlanType 'team' -RateLimitId 'quota-synthetic' -FiveHourUsed 25.0 -FiveHourWindow 300 -FiveHourReset $reset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'measurement-session' $t26.ToString('o') $path 20 'measurement-26' -PlanType 'team' -RateLimitId 'quota-synthetic' -FiveHourUsed 26.0 -FiveHourWindow 300 -FiveHourReset $reset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'measurement-session' $t26Partial.ToString('o') $path 25 'measurement-26-partial' -PlanType 'team' -RateLimitId 'quota-synthetic' -FiveHourUsed 26.5 -FiveHourWindow 300 -FiveHourReset $reset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'measurement-session' $t27.ToString('o') $path 30 'measurement-27' -PlanType 'team' -RateLimitId 'quota-synthetic' -FiveHourUsed 27.0 -FiveHourWindow 300 -FiveHourReset $reset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'measurement-session' $t28.ToString('o') $path 40 'measurement-28' -PlanType 'team' -RateLimitId 'quota-synthetic' -FiveHourUsed 28.0 -FiveHourWindow 300 -FiveHourReset $reset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'measurement-session' $t28Decimal.ToString('o') $path 45 'measurement-28-decimal' -PlanType 'team' -RateLimitId 'quota-synthetic' -FiveHourUsed 28.375 -FiveHourWindow 300 -FiveHourReset $reset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    # The call row intentionally omits quota metadata; the same-session
+    # inheritance path should still count it in the wrapper-level estimate.
+    Add-QuotaCycleRow $db 'measurement-session' $t29.ToString('o') $path 50 'measurement-call' -PlanType '' -RateLimitId '' -FiveHourUsed $null -FiveHourWindow $null -FiveHourReset $null -TotalInput 1000 -CallInput 1000 -TotalOutput 100 -CallOutput 100
+    Add-QuotaCycleRow $db 'measurement-session' $t30.ToString('o') $path 60 'measurement-30-first' -PlanType 'team' -RateLimitId 'quota-synthetic' -FiveHourUsed 30.0 -FiveHourWindow 300 -FiveHourReset $reset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'measurement-session' $t30Plateau.ToString('o') $path 70 'measurement-30-plateau' -PlanType 'team' -RateLimitId 'quota-synthetic' -FiveHourUsed 30.0 -FiveHourWindow 300 -FiveHourReset $reset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    # This row is deliberately outside the frozen end offset. A query made
+    # after it is appended must continue to use the frozen 30% endpoint.
+    Add-QuotaCycleRow $db 'measurement-session' $t31.ToString('o') $path 200 'measurement-post-frozen' -PlanType 'team' -RateLimitId 'quota-synthetic' -FiveHourUsed 31.0 -FiveHourWindow 300 -FiveHourReset $reset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+
+    $frozenOffsets = @{ $path = 100L }
+    $baselineAt = $t26
+    $baselinePercent = 26.0
+    $select = {
+        param($currentPercent, $currentAt, $priorAt, $priorPercent)
+        [TokenRaderIndexer]::QueryQuotaMeasurementCalibrationPairWithDiagnostics(
+            $db, $frozenOffsets, 'FiveHour', 300, $reset, 'team', 'quota-synthetic',
+            [double]$currentPercent, [DateTimeOffset]$currentAt, $none,
+            [DateTimeOffset]$priorAt, [double]$priorPercent)
+    }
+    $getPair = {
+        param($selection, $label, $expectedStart, $expectedEnd, $expectedEndAt)
+        Assert-QuotaCycleEqual 'ok' $selection.ReasonCode ($label + ' did not return a calibration pair')
+        Assert-QuotaCycle ($selection.Rows.Rows.Count -eq 2) ($label + ' returned an unexpected row count')
+        $startRow = $selection.Rows.Rows[0]
+        $endRow = $selection.Rows.Rows[1]
+        Assert-QuotaCycle ([Math]::Abs([double]$startRow.five_hour_used - [double]$expectedStart) -lt 0.000000001) ($label + ' selected the wrong start percentage')
+        Assert-QuotaCycle ([Math]::Abs([double]$endRow.five_hour_used - [double]$expectedEnd) -lt 0.000000001) ($label + ' selected the wrong end percentage')
+        Assert-QuotaCycleEqual ([DateTimeOffset]$expectedEndAt).ToUniversalTime().ToString('o') ([DateTimeOffset]::Parse([string]$endRow.timestamp).ToUniversalTime().ToString('o')) ($label + ' selected the wrong endpoint')
+        return $selection
+    }
+
+    # A baseline at the current 26% endpoint still permits the historical
+    # 25% -> 26% fallback; this is the first full step for the measurement.
+    $pair26 = & $select 26.0 $t26 $baselineAt $baselinePercent
+    [void](& $getPair $pair26 '26 percent history' 25.0 26.0 $t26)
+
+    # Before the first complete post-baseline point, retain the historical
+    # 25% -> 26% step; do not bill the partial 26% -> 26.5% interval.
+    $pair26Partial = & $select 26.5 $t26Partial $baselineAt $baselinePercent
+    [void](& $getPair $pair26Partial '26.5 percent partial step' 25.0 26.0 $t26)
+
+    # A MinValue/NaN baseline denotes a new cycle, so it starts from the
+    # earliest frozen snapshot rather than inheriting an older measurement.
+    $pairNewCycle = & $select 26.0 $t26 ([DateTimeOffset]::MinValue) ([double]::NaN)
+    [void](& $getPair $pairNewCycle 'new cycle earliest step' 25.0 26.0 $t26)
+
+    # At 27%, the measurement baseline itself is the complete step start.
+    $pair27 = & $select 27.0 $t27 $baselineAt $baselinePercent
+    [void](& $getPair $pair27 '27 percent baseline' 26.0 27.0 $t27)
+
+    # At 28%, retain the 27% anchor rather than using the full 26% -> 28%
+    # measurement span.
+    $pair28 = & $select 28.0 $t28 $baselineAt $baselinePercent
+    [void](& $getPair $pair28 '28 percent anchored step' 27.0 28.0 $t28)
+
+    # Decimal API values remain exact after the anchor is established.
+    $pair28Decimal = & $select 28.375 $t28Decimal $baselineAt $baselinePercent
+    [void](& $getPair $pair28Decimal '28.375 percent anchored step' 27.0 28.375 $t28Decimal)
+
+    # A larger jump still uses the fixed 27% anchor, rather than the full
+    # 26% -> 30% measurement span or the intermediate 28% point.
+    $pair30 = & $select 30.0 $t30 $baselineAt $baselinePercent
+    [void](& $getPair $pair30 '30 percent anchored step' 27.0 30.0 $t30)
+
+    # Repeated 30% snapshots are a plateau: retain the first 30% endpoint.
+    $pair30Plateau = & $select 30.0 $t30Plateau $baselineAt $baselinePercent
+    [void](& $getPair $pair30Plateau '30 percent plateau' 27.0 30.0 $t30)
+    $pair30FrozenAfterAppend = & $select 30.0 $t31 $baselineAt $baselinePercent
+    [void](& $getPair $pair30FrozenAfterAppend '30 percent frozen endpoint' 27.0 30.0 $t30)
+
+    # The production wrapper must use the same 27% -> 30% pair for both the
+    # calibration delta and the cost interval, including the inherited call.
+    $evidenceDiagnostic = @{}
+    $evidence = & $coreModule {
+        param($start, $end, $connection, $offsets, $thresholds, $prices, $diag)
+        Get-TokenRaderQuotaWindowEvidence -StartWindow $start -EndWindow $end -MainLastCountedAt $null -WindowKind FiveHour -RateLimitId 'quota-synthetic' -Connection $connection -EndOffsets $offsets -Thresholds $thresholds -PricingDocument $prices -CancellationToken ([Threading.CancellationToken]::None) -ProgressState @{} -Cache @{} -DiagnosticState $diag -AccountIdentity 'synthetic-account'
+    } (New-QuotaCycleWindow 26 $t26.ToString('o') $reset 'team') (New-QuotaCycleWindow 30 $t30.ToString('o') $reset 'team') $db $frozenOffsets $thresholds $pricing $evidenceDiagnostic
+    Assert-QuotaCycle ($null -ne $evidence) 'wrapper discarded the anchored 27% -> 30% calibration pair'
+    Assert-QuotaCycle ([Math]::Abs([double]$evidence.StartUsedPercent - 27.0) -lt 0.000000001) 'wrapper used the measurement baseline instead of the anchor'
+    Assert-QuotaCycle ([Math]::Abs([double]$evidence.CalibrationEndUsedPercent - 30.0) -lt 0.000000001) 'wrapper selected the wrong 30% endpoint'
+    Assert-QuotaCycle ([Math]::Abs([double]$evidence.DeltaPercent - 3.0) -lt 0.000000001) 'wrapper reported the wrong anchored calibration delta'
+    Assert-QuotaCycle ([double]$evidence.TotalCost -gt 0) 'wrapper did not price the inherited call in the anchored interval'
+} finally {
+    $db.Dispose()
+}
+
 # Dense split-window metadata must not cause a prefix replay for every call.
 $db = New-QuotaCycleDb
 try {

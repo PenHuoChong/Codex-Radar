@@ -2033,7 +2033,7 @@ try {
     if ($uiSource -match '按 1% 反推' -or $coreSource -match 'Max\(1\.0,\s*\$deltaPercent\)') {
         throw 'QUOTA CONTRACT FAILED: quota inference must use the exact positive precision provided by logs'
     }
-    if ($coreSource -notmatch 'snapshot_delta_usd_estimate' -or $coreSource -notmatch 'QueryQuotaCalibrationPairWithDiagnostics' -or
+    if ($coreSource -notmatch 'snapshot_delta_usd_estimate' -or $coreSource -notmatch 'QueryQuotaMeasurementCalibrationPairWithDiagnostics' -or
         $uiSource -notmatch '请求级去重不完整' -or $uiSource -notmatch '已回查本窗口历史完整步长') {
         throw 'QUOTA CONTRACT FAILED: quota delta source, historical calibration or identity completeness is not surfaced'
     }

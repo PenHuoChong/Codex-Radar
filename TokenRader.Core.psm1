@@ -3641,11 +3641,8 @@ function Get-TokenRaderQuotaWindowEvidence {
     # Main measurement and current quota cycle have independent boundaries.
     # The selector validates the current cycle's monotonic envelope itself.
 
-    # Always recover the latest completed percentage step from this exact
-    # account / plan / reset cycle.  The compiled selector chooses the
-    # earliest observation of the greatest prior percentage and the first
-    # later observation that reaches the current percentage, using its
-    # monotonic envelope; endpoint measurements are never substituted.
+    # Historical fallback precedes the first full percentage point. Its
+    # endpoint then becomes a fixed cumulative anchor for this measurement.
     # A split 5h/weekly record can carry different metadata timestamps. Use
     # the id attached to this exact window row when available, including an
     # explicitly empty id; only legacy window objects fall back to the
@@ -3658,11 +3655,26 @@ function Get-TokenRaderQuotaWindowEvidence {
         $DiagnosticState.CurrentUsedPercent=$currentUsedPercent; $DiagnosticState.CurrentObservedAt=$currentObservedAt
         $DiagnosticState.ResetsAt=$EndWindow.ResetsAt
     }
-    $selection = [TokenRaderIndexer]::QueryQuotaCalibrationPairWithDiagnostics(
+    $baselineAt = [DateTimeOffset]::MinValue
+    $baselinePercent = [double]::NaN
+    if ($null -ne $StartWindow -and $null -ne $StartWindow.ObservedAt -and
+        $null -ne $StartWindow.ResetsAt -and
+        [int]$StartWindow.WindowMinutes -eq [int]$EndWindow.WindowMinutes -and
+        [string]$StartWindow.PlanType -eq [string]$EndWindow.PlanType -and
+        (Get-TokenRaderResetIdentity -WindowMinutes ([int]$StartWindow.WindowMinutes) -ResetsAt $StartWindow.ResetsAt) -eq $endReset -and
+        ($null -eq $StartWindow.PSObject.Properties['LimitId'] -or [string]$StartWindow.LimitId -eq $effectiveLimitId)) {
+        $baselineAt = [DateTimeOffset]$StartWindow.ObservedAt
+        $baselinePercent = [double]$StartWindow.UsedPercent
+    }
+    if ($null -ne $QuotaNotBefore -and $baselineAt -lt [DateTimeOffset]$QuotaNotBefore) {
+        $baselineAt = [DateTimeOffset]$QuotaNotBefore
+        $baselinePercent = [double]::NaN
+    }
+    $selection = [TokenRaderIndexer]::QueryQuotaMeasurementCalibrationPairWithDiagnostics(
         $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
         ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
         [string]$EndWindow.PlanType, [string]$effectiveLimitId, $currentUsedPercent,
-        $currentObservedAt, $CancellationToken)
+        $currentObservedAt, $CancellationToken, $baselineAt, $baselinePercent)
     $historyRows = $selection.Rows
     if ($null -eq $historyRows -or $historyRows.Rows.Count -ne 2) {
         $code=[string]$selection.ReasonCode

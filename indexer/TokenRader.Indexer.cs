@@ -391,6 +391,19 @@ public static class TokenRaderIndexer
             currentUsedPercent, currentObservedAt, cancellationToken, true);
     }
 
+    public static TokenRaderQuotaCalibrationPairDiagnostics QueryQuotaMeasurementCalibrationPairWithDiagnostics(
+        SQLiteConnection db, IDictionary endOffsets, string windowKind,
+        int windowMinutes, long resetUnixSeconds, string planType, string rateLimitId,
+        double currentUsedPercent, DateTimeOffset currentObservedAt,
+        CancellationToken cancellationToken, DateTimeOffset baselineObservedAt,
+        double baselineUsedPercent)
+    {
+        return QueryQuotaCalibrationPairWithDiagnosticsInternal(db, endOffsets,
+            windowKind, windowMinutes, resetUnixSeconds, planType, rateLimitId,
+            currentUsedPercent, currentObservedAt, cancellationToken, true,
+            true, baselineObservedAt, baselineUsedPercent);
+    }
+
     /// <summary>
     /// Only quota-window metadata is retained here.  No prompt, response, or
     /// other private log content is read by the cycle attribution index.
@@ -4553,7 +4566,10 @@ public static class TokenRaderIndexer
         double currentUsedPercent,
         DateTimeOffset currentObservedAt,
         CancellationToken cancellationToken,
-        bool strictScope)
+        bool strictScope,
+        bool cumulativeCalibration = false,
+        DateTimeOffset baselineObservedAt = default(DateTimeOffset),
+        double baselineUsedPercent = double.NaN)
     {
         if (db == null) throw new ArgumentNullException("db");
         DataTable empty = CreateEmptyTokenRecordsTable(db);
@@ -4708,6 +4724,59 @@ public static class TokenRaderIndexer
             {
                 end = point;
                 break;
+            }
+        }
+        if (cumulativeCalibration)
+        {
+            // Reconstruct the anchor from frozen evidence, never from mutable UI
+            // state. A changed cycle starts independently at its first snapshot.
+            QuotaSnapshotCandidate baseline = null;
+            foreach (QuotaSnapshotCandidate point in candidates)
+            {
+                if ((double.IsNaN(baselineUsedPercent) && point.ObservedAt >= baselineObservedAt) ||
+                    (point.ObservedAt == baselineObservedAt &&
+                     Math.Abs(point.UsedPercent - baselineUsedPercent) <= epsilon))
+                { baseline = point; break; }
+            }
+            QuotaSnapshotCandidate anchor = null;
+            if (baseline != null)
+                foreach (QuotaSnapshotCandidate point in candidates)
+                    if (point.ObservedAt > baseline.ObservedAt &&
+                        point.UsedPercent - baseline.UsedPercent >= 1.0 - epsilon)
+                    { anchor = point; break; }
+            if (baseline != null && anchor == null && !double.IsNaN(baselineUsedPercent))
+            {
+                // A partial first percentage point must not replace the
+                // historical fallback with an unfinished measurement step.
+                double historicalPrevious = -1.0;
+                foreach (QuotaSnapshotCandidate point in candidates)
+                    if (point.ObservedAt <= baseline.ObservedAt &&
+                        point.UsedPercent < baseline.UsedPercent - epsilon &&
+                        point.UsedPercent > historicalPrevious)
+                        historicalPrevious = point.UsedPercent;
+                start = null;
+                end = null;
+                foreach (QuotaSnapshotCandidate point in candidates)
+                {
+                    if (point.ObservedAt > baseline.ObservedAt) break;
+                    if (start == null && Math.Abs(point.UsedPercent - historicalPrevious) <= epsilon)
+                        start = point;
+                    else if (start != null && point.ObservedAt > start.ObservedAt &&
+                        point.UsedPercent > historicalPrevious + epsilon)
+                    { end = point; break; }
+                }
+            }
+            if (anchor != null)
+            {
+                start = baseline;
+                end = anchor;
+                // Until a further real increase, retain the first full-step
+                // evidence. Thereafter the anchor never slides forward.
+                if (currentUsedPercent > anchor.UsedPercent + epsilon)
+                    foreach (QuotaSnapshotCandidate point in candidates)
+                        if (point.ObservedAt > anchor.ObservedAt &&
+                            Math.Abs(point.UsedPercent - currentUsedPercent) <= epsilon)
+                        { start = anchor; end = point; break; }
             }
         }
         if (start == null || end == null || end.UsedPercent <= start.UsedPercent + epsilon)
