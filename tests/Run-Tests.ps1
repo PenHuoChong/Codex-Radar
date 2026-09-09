@@ -1918,6 +1918,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-ServiceTierTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IndexEvidenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaEvidenceFixTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-QuotaCycleTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-MeasurementPricingUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ExplorerTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ExplorerBackfillTests.ps1')
@@ -2018,8 +2019,8 @@ try {
     if (-not $uiSource.Contains('（部分）')) {
         throw 'UI CONTRACT FAILED: compact partial-pricing marker was removed'
     }
-    if ($uiSource -notmatch '\$canRetainPrevious\s*=\s*\$accountUnchanged\s*(\r?\n|$)' -or
-        $uiSource -match '\$canRetainPrevious\s*=\s*\$accountUnchanged\s*-and\s*\$pricingComplete') {
+    if ($uiSource -notmatch '\$canRetainPrevious\s*=' -or
+        $uiSource -match '\$canRetainPrevious\s*=[^\r\n]*\$pricingComplete') {
         throw 'QUOTA CONTRACT FAILED: transient partial pricing must retain a same-window prior estimate'
     }
     if ($uiSource -notmatch '暂无当前窗口' -or $coreSource -notmatch 'StartReferenceAt' -or $coreSource -notmatch 'EndReferenceAt') {
@@ -2032,7 +2033,7 @@ try {
     if ($uiSource -match '按 1% 反推' -or $coreSource -match 'Max\(1\.0,\s*\$deltaPercent\)') {
         throw 'QUOTA CONTRACT FAILED: quota inference must use the exact positive precision provided by logs'
     }
-    if ($coreSource -notmatch 'snapshot_delta_usd_estimate' -or $coreSource -notmatch 'QueryQuotaCalibrationPairByOffsets' -or
+    if ($coreSource -notmatch 'snapshot_delta_usd_estimate' -or $coreSource -notmatch 'QueryQuotaCalibrationPairWithDiagnostics' -or
         $uiSource -notmatch '请求级去重不完整' -or $uiSource -notmatch '已回查本窗口历史完整步长') {
         throw 'QUOTA CONTRACT FAILED: quota delta source, historical calibration or identity completeness is not surfaced'
     }

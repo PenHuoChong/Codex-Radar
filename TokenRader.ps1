@@ -59,6 +59,12 @@ $script:State = @{
     RateLimitSnapshotCache = @{}
     QuotaEstimates = $null
     QuotaEstimateAccountIdentity = ''
+    # When the locally known account tag changes, quota evidence before this
+    # boundary belongs to the previous account and must not be calibrated into
+    # the new account's estimate.  This is populated from the existing runtime
+    # snapshot in Refresh-Application; it never reads auth data here.
+    QuotaAccountEpochAt = $null
+    QuotaDiagnostics = $null
     QuotaCalibrationMessage = '美元总额需通过一次使额度百分比上升的时间段测量进行反推。'
     Projects = @()
     ProjectCache = @{}
@@ -85,7 +91,9 @@ $script:IntervalComputeScript = {
         [bool]$ScanRateLimits,
         [Threading.CancellationToken]$CancellationToken,
         [hashtable]$ProgressState,
-        [hashtable]$ManualServiceTiers = @{}
+        [hashtable]$ManualServiceTiers = @{},
+        [string]$AccountIdentity = '',
+        $QuotaNotBefore = $null
     )
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
@@ -113,6 +121,13 @@ $script:IntervalComputeScript = {
     if ($indexedCommand.Parameters.ContainsKey('SessionsRoot')) { $indexedParameters.SessionsRoot = $SessionsRoot }
     if ($indexedCommand.Parameters.ContainsKey('CancellationToken')) { $indexedParameters.CancellationToken = $CancellationToken }
     if ($indexedCommand.Parameters.ContainsKey('ProgressState')) { $indexedParameters.ProgressState = $ProgressState }
+    # AccountIdentity and QuotaNotBefore are non-secret runtime boundaries.  The
+    # core accepts them optionally so older modules remain usable during an
+    # in-place upgrade; never perform a new account/auth lookup in this worker.
+    if ($indexedCommand.Parameters.ContainsKey('AccountIdentity')) { $indexedParameters.AccountIdentity = $AccountIdentity }
+    if ($indexedCommand.Parameters.ContainsKey('QuotaNotBefore') -and $null -ne $QuotaNotBefore) {
+        $indexedParameters.QuotaNotBefore = $QuotaNotBefore
+    }
     $result = & $indexedCommand.Name @indexedParameters
     $latest = if ($null -ne $result -and $null -ne $result.PSObject.Properties['EndRateLimits']) { $result.EndRateLimits }
               elseif ($null -ne $result -and $null -ne $result.PSObject.Properties['RateLimits']) { $result.RateLimits }
@@ -445,8 +460,21 @@ function Reset-TokenRaderBackgroundFailureState {
     $script:State.ToolBackfillRunning = $false
     $script:State.ToolBackfillRequestId = 0L
     $script:State.PendingMeasurementStart = $false
-    $script:State.QuotaEstimates = $null
     $script:State.QuotaCalibrationMessage = $Message
+    # A dispatcher/worker failure is transient with respect to a still-valid
+    # quota cycle.  Keep same-cycle estimates when the current window and
+    # account still match; Retain-... clears expired or account-mismatched
+    # values, so failure handling never turns an old account into a new one.
+    try {
+        Retain-TokenRaderQuotaEstimatesForCurrentWindow `
+            -RateLimits $(if ($script:State.ContainsKey('RateLimits')) { $script:State.RateLimits } else { $null }) `
+            -AccountIdentity $(if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' })
+        try { Mark-TokenRaderQuotaEstimatesRetainedAfterFailure } catch { }
+    } catch {
+        $script:State.QuotaEstimates = $null
+        $script:State.QuotaEstimateAccountIdentity = ''
+        if ($script:State.ContainsKey('QuotaDiagnostics')) { $script:State.QuotaDiagnostics = $null }
+    }
     try {
         Set-TokenRaderUiState -NewState 'Error' -StatusMessage $Message
     } catch {
@@ -1050,6 +1078,16 @@ function Complete-TokenRaderIntervalComputeJob {
     $baselineStartedAt = [DateTimeOffset](Get-TokenRaderCallbackContextValue -Context $Context -Name 'BaselineStartedAt')
     $final = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'Final' -Default $false)
     $scanRateLimits = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'ScanRateLimits' -Default $true)
+    # Older core modules may not yet stamp AccountIdentity on the result.  The
+    # worker context is the captured non-secret runtime tag, so attach it only
+    # when the result has no property at all; a present value (including empty)
+    # remains authoritative for exact boundary checking.
+    $workerAccount = [string](Get-TokenRaderCallbackContextValue -Context $Context -Name 'AccountIdentity' -Default '')
+    if ($null -ne $Payload -and $null -ne $Payload.PSObject.Properties['Result'] -and
+        $null -ne $Payload.Result -and -not [string]::IsNullOrWhiteSpace($workerAccount) -and
+        $null -eq $Payload.Result.PSObject.Properties['AccountIdentity']) {
+        Add-Member -InputObject $Payload.Result -NotePropertyName AccountIdentity -NotePropertyValue $workerAccount -Force
+    }
     Complete-TokenRaderIntervalCompute -BaselineStartedAt $baselineStartedAt -Payload $Payload -Final $final `
         -ScanRateLimits $scanRateLimits -Generation $Generation -RequestId $RequestId
 }
@@ -1317,7 +1355,11 @@ function Merge-LatestRateLimits {
         $newPlan = if ($null -ne $newWindow.PSObject.Properties['PlanType']) { [string]$newWindow.PlanType } else { '' }
         $samePlan = [string]::IsNullOrWhiteSpace($oldPlan) -or [string]::IsNullOrWhiteSpace($newPlan) -or
             [string]::Equals($oldPlan, $newPlan, [StringComparison]::OrdinalIgnoreCase)
-        if ($sameReset -and $samePlan -and [double]$newWindow.UsedPercent -lt [double]$oldWindow.UsedPercent) {
+        $oldLimitId = if ($null -ne $oldWindow.PSObject.Properties['LimitId']) { [string]$oldWindow.LimitId } else { '' }
+        $newLimitId = if ($null -ne $newWindow.PSObject.Properties['LimitId']) { [string]$newWindow.LimitId } else { '' }
+        $sameLimitId = [string]::IsNullOrWhiteSpace($oldLimitId) -or [string]::IsNullOrWhiteSpace($newLimitId) -or
+            [string]::Equals($oldLimitId, $newLimitId, [StringComparison]::OrdinalIgnoreCase)
+        if ($sameReset -and $samePlan -and $sameLimitId -and [double]$newWindow.UsedPercent -lt [double]$oldWindow.UsedPercent) {
             # Keep the entire earlier observation, not its percentage grafted
             # onto a later timestamp: cost/percentage boundaries stay paired.
             if ($windowName -eq 'FiveHour') { $useCandidateFive = $false } else { $useCandidateWeekly = $false }
@@ -1342,6 +1384,68 @@ function Merge-LatestRateLimits {
     }
 }
 
+function Get-TokenRaderQuotaDiagnostic {
+    param($Diagnostics, [Parameter(Mandatory = $true)][string]$WindowName)
+    if ($null -eq $Diagnostics) { return $null }
+    if ($Diagnostics -is [System.Collections.IDictionary]) {
+        if ($Diagnostics.Contains($WindowName)) { return $Diagnostics[$WindowName] }
+        return $null
+    }
+    $property = $Diagnostics.PSObject.Properties[$WindowName]
+    if ($null -ne $property) { return $property.Value }
+    return $null
+}
+
+function Get-TokenRaderQuotaDiagnosticValue {
+    param($Diagnostic, [Parameter(Mandatory = $true)][string]$Name, $Default = $null)
+    if ($null -eq $Diagnostic) { return $Default }
+    if ($Diagnostic -is [System.Collections.IDictionary]) {
+        if ($Diagnostic.Contains($Name) -and $null -ne $Diagnostic[$Name]) { return $Diagnostic[$Name] }
+        return $Default
+    }
+    $property = $Diagnostic.PSObject.Properties[$Name]
+    if ($null -ne $property -and $null -ne $property.Value) { return $property.Value }
+    return $Default
+}
+
+function Get-TokenRaderQuotaDiagnosticMessage {
+    param($Diagnostic, [string]$Fallback = '')
+    $message = [string](Get-TokenRaderQuotaDiagnosticValue -Diagnostic $Diagnostic -Name 'Message' -Default '')
+    if (-not [string]::IsNullOrWhiteSpace($message)) { return $message }
+    $reasonCode = ([string](Get-TokenRaderQuotaDiagnosticValue -Diagnostic $Diagnostic -Name 'ReasonCode' -Default '')).ToLowerInvariant()
+    switch -Regex ($reasonCode) {
+        'account|identity|boundary' { return '账号边界不一致，本次不估算' }
+        'expired|reset_expired' { return '额度窗口已过期' }
+        'window|missing_window' { return '没有可用的额度窗口证据' }
+        'pricing|cost' { return '计价证据不完整，暂不可估' }
+        'failure|error|exception|timeout' { return '本次更新失败，暂无可用结果' }
+        'evidence|delta|calibrat|attribution' { return '缺少可靠的额度变化证据，暂不可估' }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Fallback)) { return $Fallback }
+    return '缺少可靠证据，暂不可估'
+}
+
+function Test-TokenRaderQuotaDiagnosticRetained {
+    param($Diagnostic)
+    if ($null -eq $Diagnostic) { return $false }
+    $retained = Get-TokenRaderQuotaDiagnosticValue -Diagnostic $Diagnostic -Name 'Retained' -Default $false
+    if ([bool]$retained) { return $true }
+    return ([string](Get-TokenRaderQuotaDiagnosticValue -Diagnostic $Diagnostic -Name 'Status' -Default '') -match '(?i)retain|reuse|沿用')
+}
+
+function Get-TokenRaderQuotaDiagnosticAccountIdentity {
+    param($Diagnostic, $Result)
+    foreach ($candidate in @(
+            (Get-TokenRaderQuotaDiagnosticValue -Diagnostic $Diagnostic -Name 'AccountIdentity' -Default ''),
+            (Get-TokenRaderQuotaDiagnosticValue -Diagnostic (Get-TokenRaderQuotaDiagnosticValue -Diagnostic $Diagnostic -Name 'Estimate' -Default $null) -Name 'AccountIdentity' -Default ''),
+            (Get-TokenRaderQuotaDiagnosticValue -Diagnostic (Get-TokenRaderQuotaDiagnosticValue -Diagnostic $Diagnostic -Name 'Evidence' -Default $null) -Name 'AccountIdentity' -Default ''),
+            $(if ($null -ne $Result -and $null -ne $Result.PSObject.Properties['AccountIdentity']) { [string]$Result.AccountIdentity } else { '' })
+        )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$candidate)) { return [string]$candidate }
+    }
+    return ''
+}
+
 function Set-QuotaWindowCard {
     param(
         $Window,
@@ -1349,7 +1453,10 @@ function Set-QuotaWindowCard {
         [Parameter(Mandatory = $true)]$UsageText,
         [Parameter(Mandatory = $true)]$Progress,
         [Parameter(Mandatory = $true)]$DollarText,
-        [Parameter(Mandatory = $true)]$ResetText
+        [Parameter(Mandatory = $true)]$ResetText,
+        # Optional for compatibility with existing callers and synthetic UI
+        # tests.  The core supplies one diagnostic object per quota window.
+        $Diagnostic = $null
     )
 
     $usingPreviousSnapshot = $false
@@ -1366,7 +1473,7 @@ function Set-QuotaWindowCard {
     if ($null -eq $Window -or $windowExpired) {
         $UsageText.Text = '暂无'
         $Progress.Value = 0
-        $DollarText.Text = '美金额度：暂无当前窗口'
+        $DollarText.Text = '美金额度：不可估 · ' + (Get-TokenRaderQuotaDiagnosticMessage -Diagnostic $Diagnostic -Fallback '暂无当前窗口')
         $ResetText.Text = '暂无当前窗口'
         return
     }
@@ -1387,6 +1494,17 @@ function Set-QuotaWindowCard {
         if ($null -ne $Estimate.PSObject.Properties['ReferencePricingApplied'] -and [bool]$Estimate.ReferencePricingApplied) {
             $historyLabel += ' · 未知模式按普通价参考'
         }
+        $estimateStateLabel = if (Test-TokenRaderQuotaDiagnosticRetained -Diagnostic $Diagnostic) {
+            '沿用上次结果'
+        } else { '本次更新' }
+        $diagnosticMessage = [string](Get-TokenRaderQuotaDiagnosticValue -Diagnostic $Diagnostic -Name 'Message' -Default '')
+        $diagnosticLabel = if ([string]::IsNullOrWhiteSpace($diagnosticMessage)) {
+            ' · ' + $estimateStateLabel
+        } elseif ($diagnosticMessage -eq $estimateStateLabel) {
+            ' · ' + $estimateStateLabel
+        } else {
+            ' · ' + $estimateStateLabel + ' · ' + $diagnosticMessage
+        }
         $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 已用≈{2} · 剩余≈{3}{4}{5} · 来源：{6}{7}' -f
             $currentPercent,
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
@@ -1395,16 +1513,24 @@ function Set-QuotaWindowCard {
             $startLabel,
             $historyLabel,
             $sourceLabel,
-            $identityLabel)
+            ($identityLabel + $diagnosticLabel))
         if ($usingPreviousSnapshot) { $DollarText.Text += ' · 沿用最近有效快照，正在更新' }
     } else {
-        $DollarText.Text = '美金额度：尚无有效估算结果'
+        $DollarText.Text = '美金额度：不可估 · ' + (Get-TokenRaderQuotaDiagnosticMessage -Diagnostic $Diagnostic -Fallback '尚无有效估算结果')
     }
 }
 
 function Update-QuotaCards {
     $rateLimits = $script:State.RateLimits
+    # Keep state aligned with what is rendered: an expired estimate must not
+    # remain available for a later transient refresh or account switch.
+    try {
+        Retain-TokenRaderQuotaEstimatesForCurrentWindow `
+            -RateLimits $rateLimits `
+            -AccountIdentity $(if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' })
+    } catch { }
     $estimates = $script:State.QuotaEstimates
+    $diagnostics = if ($script:State.ContainsKey('QuotaDiagnostics')) { $script:State.QuotaDiagnostics } else { $null }
     $fiveWindow = if ($null -ne $rateLimits) { $rateLimits.FiveHour } else { $null }
     $weeklyWindow = if ($null -ne $rateLimits) { $rateLimits.Weekly } else { $null }
     $fiveEstimate = if ($null -ne $estimates -and
@@ -1415,8 +1541,10 @@ function Update-QuotaCards {
         (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $estimates.Weekly -Window $weeklyWindow)) {
         $estimates.Weekly
     } else { $null }
-    Set-QuotaWindowCard -Window $fiveWindow -Estimate $fiveEstimate -UsageText $script:FiveHourUsageText -Progress $script:FiveHourProgress -DollarText $script:FiveHourDollarText -ResetText $script:FiveHourResetText
-    Set-QuotaWindowCard -Window $weeklyWindow -Estimate $weeklyEstimate -UsageText $script:WeeklyUsageText -Progress $script:WeeklyProgress -DollarText $script:WeeklyDollarText -ResetText $script:WeeklyResetText
+    Set-QuotaWindowCard -Window $fiveWindow -Estimate $fiveEstimate -Diagnostic (Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName 'FiveHour') `
+        -UsageText $script:FiveHourUsageText -Progress $script:FiveHourProgress -DollarText $script:FiveHourDollarText -ResetText $script:FiveHourResetText
+    Set-QuotaWindowCard -Window $weeklyWindow -Estimate $weeklyEstimate -Diagnostic (Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName 'Weekly') `
+        -UsageText $script:WeeklyUsageText -Progress $script:WeeklyProgress -DollarText $script:WeeklyDollarText -ResetText $script:WeeklyResetText
     $script:QuotaEstimateHintText.Text = [string]$script:State.QuotaCalibrationMessage
 }
 
@@ -1432,6 +1560,13 @@ function Test-TokenRaderQuotaEstimateMatchesWindow {
     if ($null -ne $Window.ResetsAt -and [DateTimeOffset]$Window.ResetsAt -le [DateTimeOffset]::Now) { return $false }
     if ($null -ne $Estimate.PSObject.Properties['WindowMinutes'] -and
         [int]$Estimate.WindowMinutes -ne [int]$Window.WindowMinutes) { return $false }
+    if ($null -ne $Estimate.PSObject.Properties['LimitId'] -and
+        $null -ne $Window.PSObject.Properties['LimitId'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Estimate.LimitId) -and
+        -not [string]::IsNullOrWhiteSpace([string]$Window.LimitId) -and
+        -not [string]::Equals([string]$Estimate.LimitId, [string]$Window.LimitId, [StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
     if ($null -ne $Estimate.PSObject.Properties['PlanType'] -and
         -not [string]::IsNullOrWhiteSpace([string]$Estimate.PlanType) -and
         $null -ne $Window.PSObject.Properties['PlanType'] -and
@@ -1453,16 +1588,36 @@ function Test-TokenRaderQuotaEstimateMatchesWindow {
 
 function Retain-TokenRaderQuotaEstimatesForCurrentWindow {
     param(
-        $RateLimits = $script:State.RateLimits,
-        [string]$AccountIdentity = [string]$script:State.AccountIdentity
+        $RateLimits = $null,
+        [string]$AccountIdentity = ''
     )
-    $estimates = $script:State.QuotaEstimates
+    if ($null -eq $RateLimits -and $script:State -is [System.Collections.IDictionary] -and $script:State.ContainsKey('RateLimits')) {
+        $RateLimits = $script:State['RateLimits']
+    } elseif ($null -eq $RateLimits -and $null -ne $script:State.PSObject.Properties['RateLimits']) {
+        $RateLimits = $script:State.RateLimits
+    }
+    if ([string]::IsNullOrWhiteSpace($AccountIdentity)) {
+        if ($script:State -is [System.Collections.IDictionary] -and $script:State.ContainsKey('AccountIdentity')) {
+            $AccountIdentity = [string]$script:State['AccountIdentity']
+        } elseif ($null -ne $script:State.PSObject.Properties['AccountIdentity']) {
+            $AccountIdentity = [string]$script:State.AccountIdentity
+        }
+    }
+    $estimates = if ($script:State -is [System.Collections.IDictionary] -and $script:State.ContainsKey('QuotaEstimates')) {
+        $script:State['QuotaEstimates']
+    } elseif ($null -ne $script:State.PSObject.Properties['QuotaEstimates']) {
+        $script:State.QuotaEstimates
+    } else { $null }
     if ($null -eq $estimates) { return }
-    $estimateAccount = [string]$script:State.QuotaEstimateAccountIdentity
-    if (-not [string]::IsNullOrWhiteSpace($estimateAccount) -and
-        -not [string]::Equals($estimateAccount, $AccountIdentity, [StringComparison]::Ordinal)) {
+    $estimateAccount = if ($script:State -is [System.Collections.IDictionary] -and $script:State.ContainsKey('QuotaEstimateAccountIdentity')) {
+        [string]$script:State['QuotaEstimateAccountIdentity']
+    } elseif ($null -ne $script:State.PSObject.Properties['QuotaEstimateAccountIdentity']) {
+        [string]$script:State.QuotaEstimateAccountIdentity
+    } else { '' }
+    if (-not [string]::Equals($estimateAccount, $AccountIdentity, [StringComparison]::Ordinal)) {
         $script:State.QuotaEstimates = $null
         $script:State.QuotaEstimateAccountIdentity = ''
+        if ($script:State.ContainsKey('QuotaDiagnostics')) { $script:State.QuotaDiagnostics = $null }
         return
     }
     $fiveWindow = if ($null -ne $RateLimits) { $RateLimits.FiveHour } else { $null }
@@ -1478,8 +1633,46 @@ function Retain-TokenRaderQuotaEstimatesForCurrentWindow {
     if ($null -eq $five -and $null -eq $weekly) {
         $script:State.QuotaEstimates = $null
         $script:State.QuotaEstimateAccountIdentity = ''
+        if ($script:State.ContainsKey('QuotaDiagnostics')) { $script:State.QuotaDiagnostics = $null }
     } else {
         $script:State.QuotaEstimates = [pscustomobject]@{ FiveHour = $five; Weekly = $weekly }
+    }
+}
+
+function Mark-TokenRaderQuotaEstimatesRetainedAfterFailure {
+    # A transient callback/measurement failure should be visible in the same
+    # card line while a still-valid estimate is explicitly labelled as reused.
+    # This helper never creates an estimate; it only annotates values that
+    # Retain-TokenRaderQuotaEstimatesForCurrentWindow left intact.
+    if ($null -eq $script:State.QuotaEstimates -or -not $script:State.ContainsKey('QuotaDiagnostics')) { return }
+    $diagnostics = $script:State.QuotaDiagnostics
+    if ($null -eq $diagnostics) {
+        $diagnostics = [pscustomobject]@{ FiveHour = $null; Weekly = $null }
+        $script:State.QuotaDiagnostics = $diagnostics
+    }
+    foreach ($windowName in @('FiveHour', 'Weekly')) {
+        $estimate = $script:State.QuotaEstimates.$windowName
+        if ($null -eq $estimate) { continue }
+        $diagnostic = Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName $windowName
+        if ($null -eq $diagnostic) {
+            $diagnostic = [pscustomobject]@{
+                Status = 'retained'
+                ReasonCode = 'transient_failure'
+                Message = '本次更新失败，沿用上次结果'
+                Retained = $true
+            }
+            if ($diagnostics -is [System.Collections.IDictionary]) { $diagnostics[$windowName] = $diagnostic }
+            else { Add-Member -InputObject $diagnostics -NotePropertyName $windowName -NotePropertyValue $diagnostic -Force }
+        } else {
+            if ($null -ne $diagnostic.PSObject.Properties['Status']) { $diagnostic.Status = 'retained' }
+            else { Add-Member -InputObject $diagnostic -NotePropertyName Status -NotePropertyValue 'retained' -Force }
+            if ($null -ne $diagnostic.PSObject.Properties['ReasonCode']) { $diagnostic.ReasonCode = 'transient_failure' }
+            else { Add-Member -InputObject $diagnostic -NotePropertyName ReasonCode -NotePropertyValue 'transient_failure' -Force }
+            if ($null -ne $diagnostic.PSObject.Properties['Message']) { $diagnostic.Message = '本次更新失败，沿用上次结果' }
+            else { Add-Member -InputObject $diagnostic -NotePropertyName Message -NotePropertyValue '本次更新失败，沿用上次结果' -Force }
+            if ($null -ne $diagnostic.PSObject.Properties['Retained']) { $diagnostic.Retained = $true }
+            else { Add-Member -InputObject $diagnostic -NotePropertyName Retained -NotePropertyValue $true -Force }
+        }
     }
 }
 
@@ -1490,11 +1683,49 @@ function Update-QuotaEstimatesFromInterval {
     )
 
     if ($null -eq $script:State.IntervalBaseline -or $null -eq $Result) { return }
-    $accountUnchanged = $true
-    if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['AccountIdentity']) {
-        $currentAccount = Get-TokenRaderAccount -CodexRoot $script:Paths.CodexRoot
-        $accountUnchanged = ([string]$script:State.IntervalBaseline.AccountIdentity -eq [string]$currentAccount.AccountId)
+    # Account identity is already captured in State by Refresh-Application and
+    # (when supported by the core) bound to this worker's result.  Do not read
+    # auth/account data again from a callback: a refresh can legitimately have
+    # switched accounts while an older worker is still finishing.
+    $currentAccount = if ($script:State -is [System.Collections.IDictionary] -and $script:State.ContainsKey('AccountIdentity')) {
+        [string]$script:State['AccountIdentity']
+    } elseif ($null -ne $script:State.PSObject.Properties['AccountIdentity']) {
+        [string]$script:State.AccountIdentity
+    } else { '' }
+    $baselineAccount = if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['AccountIdentity']) {
+        [string]$script:State.IntervalBaseline.AccountIdentity
+    } else { '' }
+    $resultAccountPropertyPresent = $null -ne $Result.PSObject.Properties['AccountIdentity']
+    $resultAccount = if ($resultAccountPropertyPresent) { [string]$Result.AccountIdentity } else { '' }
+    $accountUnchanged = [string]::IsNullOrWhiteSpace($baselineAccount) -or
+        (-not [string]::IsNullOrWhiteSpace($currentAccount) -and
+            [string]::Equals($baselineAccount, $currentAccount, [StringComparison]::Ordinal))
+    # A result produced before an account switch is never allowed to contribute
+    # quota evidence to the new account.  A new worker result tagged with the
+    # current account is accepted even when the frozen measurement baseline has
+    # the previous account tag; the core's QuotaNotBefore boundary then keeps
+    # the selected calibration pair on the new side of the switch.
+    $resultAccountMatchesCurrent = if ($resultAccountPropertyPresent) {
+        # A present-but-empty tag is still a bound value; compare it exactly so
+        # a stale tagged result cannot pass through an empty current tag (or
+        # vice versa).  Older cores with no property use the legacy baseline
+        # check below.
+        if (-not [string]::IsNullOrWhiteSpace($baselineAccount) -and
+            [string]::IsNullOrWhiteSpace($currentAccount) -and
+            [string]::IsNullOrWhiteSpace($resultAccount)) {
+            $false
+        } else {
+            [string]::Equals($resultAccount, $currentAccount, [StringComparison]::Ordinal)
+        }
+    } else { $true }
+    $accountBoundaryValid = if ($resultAccountPropertyPresent) {
+        $resultAccountMatchesCurrent
+    } else {
+        # Once the frozen baseline is known to be from another account, an
+        # untagged result is not enough to prove that its quota evidence is new.
+        $accountUnchanged
     }
+
     $startRateLimits = if ($null -ne $Result.PSObject.Properties['StartRateLimits']) { $Result.StartRateLimits } else { $script:State.IntervalBaseline.RateLimits }
     $endRateLimits = if ($null -ne $Result.PSObject.Properties['EndRateLimits']) { $Result.EndRateLimits } else { $Result.RateLimits }
     $pricingComplete = if ($null -ne $Result.PSObject.Properties['PricingComplete']) { [bool]$Result.PricingComplete } else { [bool]$Result.CostComplete }
@@ -1506,23 +1737,49 @@ function Update-QuotaEstimatesFromInterval {
                 -not [bool]$evidence.ServiceTierComplete) { $quotaModesIncomplete = $true }
         }
     }
-    $newEstimates = Get-TokenRaderQuotaEstimate `
-        -StartRateLimits $(if ($accountUnchanged) { $startRateLimits } else { $null }) `
-        -EndRateLimits $(if ($accountUnchanged) { $endRateLimits } else { $null }) `
-        -IntervalCost ([double]$Result.TotalCost) `
-        -CostComplete $pricingComplete `
-        -StartReferenceAt $script:State.IntervalBaseline.StartedAt `
-        -EndReferenceAt $(if ($null -ne $Result.PSObject.Properties['EndedAt']) { $Result.EndedAt } else { [DateTimeOffset]::Now }) `
-        -QuotaEvidence $(if ($null -ne $Result.PSObject.Properties['QuotaEvidence']) { $Result.QuotaEvidence } else { $null })
+
+    $resultDiagnostics = if ($null -ne $Result.PSObject.Properties['QuotaDiagnostics']) { $Result.QuotaDiagnostics } else { $null }
+    $hasDiagnostics = $null -ne $resultDiagnostics
+    $diagnosticFive = Get-TokenRaderQuotaDiagnostic -Diagnostics $resultDiagnostics -WindowName 'FiveHour'
+    $diagnosticWeekly = Get-TokenRaderQuotaDiagnostic -Diagnostics $resultDiagnostics -WindowName 'Weekly'
+    $diagnosticFiveAccount = Get-TokenRaderQuotaDiagnosticAccountIdentity -Diagnostic $diagnosticFive -Result $Result
+    $diagnosticWeeklyAccount = Get-TokenRaderQuotaDiagnosticAccountIdentity -Diagnostic $diagnosticWeekly -Result $Result
+    $diagnosticFiveAccountValid = [string]::IsNullOrWhiteSpace($diagnosticFiveAccount) -or
+        [string]::IsNullOrWhiteSpace($currentAccount) -or
+        [string]::Equals($diagnosticFiveAccount, $currentAccount, [StringComparison]::Ordinal)
+    $diagnosticWeeklyAccountValid = [string]::IsNullOrWhiteSpace($diagnosticWeeklyAccount) -or
+        [string]::IsNullOrWhiteSpace($currentAccount) -or
+        [string]::Equals($diagnosticWeeklyAccount, $currentAccount, [StringComparison]::Ordinal)
+
+    # Diagnostics are status/reason metadata.  The estimate itself remains the
+    # core's normal Get-TokenRaderQuotaEstimate result, which consumes the
+    # boundary-checked QuotaEvidence supplied by the worker.
+    $newEstimates = $null
+    if ($accountBoundaryValid) {
+        $newEstimates = Get-TokenRaderQuotaEstimate `
+            -StartRateLimits $startRateLimits `
+            -EndRateLimits $endRateLimits `
+            -IntervalCost ([double]$Result.TotalCost) `
+            -CostComplete $pricingComplete `
+            -StartReferenceAt $script:State.IntervalBaseline.StartedAt `
+            -EndReferenceAt $(if ($null -ne $Result.PSObject.Properties['EndedAt']) { $Result.EndedAt } else { [DateTimeOffset]::Now }) `
+            -QuotaEvidence $(if ($null -ne $Result.PSObject.Properties['QuotaEvidence']) { $Result.QuotaEvidence } else { $null })
+    }
+    if ($null -eq $newEstimates) {
+        $newEstimates = [pscustomobject]@{ FiveHour = $null; Weekly = $null }
+    }
     $previousEstimates = $script:State.QuotaEstimates
     $validationRateLimits = if ($null -ne $endRateLimits) { $endRateLimits } else { $script:State.RateLimits }
     $validationFive = if ($null -ne $validationRateLimits) { $validationRateLimits.FiveHour } else { $null }
     $validationWeekly = if ($null -ne $validationRateLimits) { $validationRateLimits.Weekly } else { $null }
     $previousFive = if ($null -ne $previousEstimates) { $previousEstimates.FiveHour } else { $null }
     $previousWeekly = if ($null -ne $previousEstimates) { $previousEstimates.Weekly } else { $null }
-    # Price incompleteness blocks a new estimate but must not erase a valid
-    # estimate already calibrated for the same account/window/reset cycle.
-    $canRetainPrevious = $accountUnchanged
+    # Price incompleteness, transient worker failures, and an absent diagnostic
+    # estimate must not erase a valid estimate from the same account/window/
+    # reset cycle.  Account switches and explicit boundary failures are the
+    # exceptions: those old values are never retained.
+    $canRetainPrevious = $accountBoundaryValid -and $resultAccountMatchesCurrent -and
+        (-not $hasDiagnostics -or ($diagnosticFiveAccountValid -and $diagnosticWeeklyAccountValid))
     $retainedFive = $false
     $retainedWeekly = $false
     $effectiveFive = $newEstimates.FiveHour
@@ -1537,36 +1794,77 @@ function Update-QuotaEstimatesFromInterval {
         $effectiveWeekly = $previousWeekly
         $retainedWeekly = $true
     }
+
+    # Diagnostics are result-scoped.  Keep them even when no estimate exists so
+    # the existing dollar line can explain why the window is currently
+    # unavailable instead of falling back to a blank or guessed value.  When a
+    # legacy core has no diagnostics, synthesize only the UI retention marker;
+    # no quota amount or reason is invented here.
+    if ($script:State.ContainsKey('QuotaDiagnostics')) {
+        if ($hasDiagnostics) {
+            foreach ($diagnosticRetention in @(
+                    [pscustomobject]@{ Diagnostic = $diagnosticFive; Retained = $retainedFive },
+                    [pscustomobject]@{ Diagnostic = $diagnosticWeekly; Retained = $retainedWeekly })) {
+                if ($null -eq $diagnosticRetention.Diagnostic) { continue }
+                if ($null -ne $diagnosticRetention.Diagnostic.PSObject.Properties['Retained']) {
+                    $diagnosticRetention.Diagnostic.Retained = [bool]$diagnosticRetention.Retained
+                } else {
+                    Add-Member -InputObject $diagnosticRetention.Diagnostic -NotePropertyName Retained -NotePropertyValue ([bool]$diagnosticRetention.Retained) -Force
+                }
+            }
+            $script:State.QuotaDiagnostics = $resultDiagnostics
+        } elseif ($retainedFive -or $retainedWeekly) {
+            $retainedFiveDiagnostic = if ($retainedFive) {
+                [pscustomobject]@{ Status = 'retained'; ReasonCode = 'retained_previous'; Message = '沿用上次结果'; Retained = $true }
+            } else { $null }
+            $retainedWeeklyDiagnostic = if ($retainedWeekly) {
+                [pscustomobject]@{ Status = 'retained'; ReasonCode = 'retained_previous'; Message = '沿用上次结果'; Retained = $true }
+            } else { $null }
+            $script:State.QuotaDiagnostics = [pscustomobject]@{
+                FiveHour = $retainedFiveDiagnostic
+                Weekly = $retainedWeeklyDiagnostic
+            }
+        } else {
+            $script:State.QuotaDiagnostics = $null
+        }
+    }
     $script:State.QuotaEstimates = [pscustomobject]@{
         FiveHour = $effectiveFive
         Weekly = $effectiveWeekly
     }
     $script:State.QuotaEstimateAccountIdentity = if ($null -ne $effectiveFive -or $null -ne $effectiveWeekly) {
-        if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['AccountIdentity']) {
-            [string]$script:State.IntervalBaseline.AccountIdentity
-        } else { [string]$script:State.AccountIdentity }
+        if (-not [string]::IsNullOrWhiteSpace($resultAccount) -and $resultAccountMatchesCurrent) {
+            $resultAccount
+        } else { $currentAccount }
     } else { '' }
 
     $calibrated = @()
-    if ($null -ne $newEstimates.FiveHour) {
-        $calibrated += ('5 小时 API等价美元≈{0}' -f (Format-TokenRaderUsd ([double]$newEstimates.FiveHour.TotalUsd)))
+    if ($null -ne $effectiveFive -and -not $retainedFive) {
+        $calibrated += ('5 小时 API等价美元≈{0}' -f (Format-TokenRaderUsd ([double]$effectiveFive.TotalUsd)))
     }
-    if ($null -ne $newEstimates.Weekly) {
-        $calibrated += ('周 API等价美元≈{0}' -f (Format-TokenRaderUsd ([double]$newEstimates.Weekly.TotalUsd)))
+    if ($null -ne $effectiveWeekly -and -not $retainedWeekly) {
+        $calibrated += ('周 API等价美元≈{0}' -f (Format-TokenRaderUsd ([double]$effectiveWeekly.TotalUsd)))
     }
     $retained = @()
-    if ($retainedFive) { $retained += '5 小时' }
-    if ($retainedWeekly) { $retained += '周' }
+    if ($retainedFive -or (Test-TokenRaderQuotaDiagnosticRetained -Diagnostic $diagnosticFive)) { $retained += '5 小时' }
+    if ($retainedWeekly -or (Test-TokenRaderQuotaDiagnosticRetained -Diagnostic $diagnosticWeekly)) { $retained += '周' }
     $phase = if ($Final) { '最终' } else { '实时' }
+    $diagnosticMessages = @(
+        [string](Get-TokenRaderQuotaDiagnosticValue -Diagnostic $diagnosticFive -Name 'Message' -Default ''),
+        [string](Get-TokenRaderQuotaDiagnosticValue -Diagnostic $diagnosticWeekly -Name 'Message' -Default '')
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
     $script:State.QuotaCalibrationMessage = if ($calibrated.Count -gt 0) {
         $retainedSuffix = if ($retained.Count -gt 0) { '；{0}继续显示同一窗口的最近有效结果' -f ($retained -join '、') } else { '' }
         ('{0}额度估算已同步：{1}{2}。' -f $phase, ($calibrated -join '，'), $retainedSuffix)
     } elseif ($retained.Count -gt 0) {
         ('本次查看未形成新的反推基准，{0}继续显示同一额度窗口的最近有效结果。' -f ($retained -join '、'))
-    } elseif (-not $accountUnchanged) {
-        '测量期间账号标签发生变化，本次不估算美金额度。'
+    } elseif (-not $accountBoundaryValid -or -not $resultAccountMatchesCurrent -or
+              ($hasDiagnostics -and (-not $diagnosticFiveAccountValid -or -not $diagnosticWeeklyAccountValid))) {
+        '账号边界发生变化或证据不属于当前账号，本次不估算美金额度。'
     } elseif (-not $pricingComplete) {
-        ''
+        '计价信息不完整，暂不可估；请等待可计价证据或确认本次计价模式。'
+    } elseif ($hasDiagnostics -and $diagnosticMessages.Count -gt 0) {
+        ($diagnosticMessages -join '；')
     } elseif ($quotaModesIncomplete) {
         '日志未明确提供计价模式；边界有效时直接显示普通价参考额度，也可按模型确认 Fast 后重算。'
     } elseif ([double]$Result.TotalCost -le 0) {
@@ -1735,8 +2033,17 @@ function Fail-TokenRaderMeasurementRequest {
     $script:State.IntervalComputePending = $false
     $script:State.IntervalComputePendingRequest = $null
     $script:State.PendingMeasurementStart = $false
-    $script:State.QuotaEstimates = $null
     $script:State.QuotaCalibrationMessage = [string]$Message
+    try {
+        Retain-TokenRaderQuotaEstimatesForCurrentWindow `
+            -RateLimits $(if ($script:State.ContainsKey('RateLimits')) { $script:State.RateLimits } else { $null }) `
+            -AccountIdentity $(if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' })
+        try { Mark-TokenRaderQuotaEstimatesRetainedAfterFailure } catch { }
+    } catch {
+        $script:State.QuotaEstimates = $null
+        $script:State.QuotaEstimateAccountIdentity = ''
+        if ($script:State.ContainsKey('QuotaDiagnostics')) { $script:State.QuotaDiagnostics = $null }
+    }
     Set-TokenRaderUiState -NewState 'Error' -StatusMessage ([string]$Message)
     Update-QuotaCards
 }
@@ -1750,7 +2057,9 @@ function Start-TokenRaderIntervalComputeAsync {
         [bool]$Final = $false,
         [bool]$ScanRateLimits = $false,
         [Int64]$Generation = 0,
-        [Int64]$RequestId = 0
+        [Int64]$RequestId = 0,
+        [string]$AccountIdentity = '',
+        $QuotaNotBefore = $null
     )
 
     if ($script:WindowClosing) { return }
@@ -1827,6 +2136,10 @@ function Start-TokenRaderIntervalComputeAsync {
             CancellationToken = $cancellationSource.Token
             ProgressState = $progressState
             ManualServiceTiers = (@{} + $script:State.ManualServiceTiers)
+            AccountIdentity = if ([string]::IsNullOrWhiteSpace($AccountIdentity)) { [string]$script:State.AccountIdentity } else { $AccountIdentity }
+            QuotaNotBefore = if ($null -ne $QuotaNotBefore) { $QuotaNotBefore } else {
+                if ($script:State.ContainsKey('QuotaAccountEpochAt')) { $script:State.QuotaAccountEpochAt } else { $null }
+            }
         } `
         -Kind 'IntervalCompute' `
         -Generation $effectiveGeneration `
@@ -1840,6 +2153,10 @@ function Start-TokenRaderIntervalComputeAsync {
             EndRevision = $EndRevision
             EndedAt = $EndedAt
             ScanRateLimits = $ScanRateLimits
+            AccountIdentity = if ([string]::IsNullOrWhiteSpace($AccountIdentity)) { [string]$script:State.AccountIdentity } else { $AccountIdentity }
+            QuotaNotBefore = if ($null -ne $QuotaNotBefore) { $QuotaNotBefore } else {
+                if ($script:State.ContainsKey('QuotaAccountEpochAt')) { $script:State.QuotaAccountEpochAt } else { $null }
+            }
         } `
         -TimeoutSeconds $(if ($Final) { 60 } else { 15 }) `
         -SoftWarningSeconds 3 `
@@ -1882,9 +2199,14 @@ function Complete-TokenRaderIntervalCompute {
         $script:State.IntervalResult = $result
         $script:State.IntervalLastError = ''
         if ($Final) { $script:State.IntervalFinalRetry = $null }
-        if ($null -ne $Payload.PSObject.Properties['LatestRateLimits']) { Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits }
         $endLimits = if ($null -ne $result.PSObject.Properties['EndRateLimits']) { $result.EndRateLimits } else { $result.RateLimits }
-        Merge-LatestRateLimits -Candidate $endLimits
+        $currentTag = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
+        $resultTagValid = $null -eq $result.PSObject.Properties['AccountIdentity'] -or
+            [string]::Equals([string]$result.AccountIdentity, $currentTag, [StringComparison]::Ordinal)
+        if ($resultTagValid) {
+            if ($null -ne $Payload.PSObject.Properties['LatestRateLimits']) { Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits }
+            Merge-LatestRateLimits -Candidate $endLimits
+        }
         # A caller may explicitly skip the quota query. Its null EndRateLimits
         # must not erase the last estimate calibrated by a quota-aware preview
         # or the final frozen settlement.
@@ -2566,7 +2888,22 @@ function Refresh-Application {
         }
 
         $account = Get-TokenRaderAccount -CodexRoot $script:Paths.CodexRoot
-        $script:State.AccountIdentity = [string]$account.AccountId
+        $previousAccountIdentity = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
+        $newAccountIdentity = [string]$account.AccountId
+        if ((-not [string]::IsNullOrWhiteSpace($previousAccountIdentity) -or $null -ne $script:State.QuotaEstimates) -and
+            -not [string]::Equals($previousAccountIdentity, $newAccountIdentity, [StringComparison]::Ordinal)) {
+            # The account label is already available from this normal refresh.
+            # Mark the switch as a quota attribution boundary and discard only
+            # old-account quota state; the measurement/token view itself may
+            # continue while a worker gathers post-switch evidence.
+            $script:State.QuotaAccountEpochAt = [DateTimeOffset]::Now
+            $script:State.RateLimits = $null
+            $script:State.QuotaEstimates = $null
+            $script:State.QuotaEstimateAccountIdentity = ''
+            $script:State.QuotaDiagnostics = $null
+            $script:State.QuotaCalibrationMessage = '账号已切换；等待当前账号形成新的额度证据。'
+        }
+        $script:State.AccountIdentity = $newAccountIdentity
         $script:AccountNameText.Text = [string]$account.DisplayName
         $script:AccountIdText.Text = if ([string]::IsNullOrWhiteSpace([string]$account.AccountIdShort)) { '' } else { [string]$account.AccountIdShort }
         if ($null -ne $account.WrittenAt) {

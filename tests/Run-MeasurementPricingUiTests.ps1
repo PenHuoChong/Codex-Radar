@@ -7,7 +7,9 @@ Import-Module (Join-Path $projectRoot 'TokenRader.Core.psm1') -Force
 $source = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'TokenRader.ps1')
 foreach ($name in @('Reset-MeasurementPricingConfirmation','Set-MeasurementPricingConfirmation',
     'Test-TokenRaderQuotaEstimateMatchesWindow','Set-QuotaWindowCard','Merge-LatestRateLimits',
-    'Get-ServiceTierLabel','Get-ResultServiceTierSummary')) {
+    'Get-ServiceTierLabel','Get-ResultServiceTierSummary','Get-TokenRaderQuotaDiagnostic',
+    'Get-TokenRaderQuotaDiagnosticValue','Get-TokenRaderQuotaDiagnosticMessage','Test-TokenRaderQuotaDiagnosticRetained',
+    'Get-TokenRaderQuotaDiagnosticAccountIdentity','Update-QuotaEstimatesFromInterval','Retain-TokenRaderQuotaEstimatesForCurrentWindow')) {
     $match = [regex]::Match($source, '(?s)function ' + $name + '\b.*?(?=\r?\nfunction |\z)')
     if (-not $match.Success) { throw "Missing production function: $name" }
     Invoke-Expression $match.Value
@@ -71,8 +73,16 @@ Set-QuotaWindowCard -Window $null -Estimate $estimate -UsageText $usage -Progres
 Assert-UiPricing ($dollar.Text.Contains((Format-TokenRaderUsd 100.0)) -and $dollar.Text.Contains('沿用最近有效快照')) 'transient missing snapshot hid available dollars'
 $estimate.ResetsAt=$now.AddSeconds(-1)
 Set-QuotaWindowCard -Window $null -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
-Assert-UiPricing ($dollar.Text -eq '美金额度：暂无当前窗口') 'expired estimate was presented as current dollars'
+Assert-UiPricing ($dollar.Text.Contains('不可估') -and -not $dollar.Text.Contains((Format-TokenRaderUsd 100.0))) 'expired estimate was presented as current dollars'
 $estimate.ResetsAt=$reset
+$diagnostic=[pscustomobject]@{Status='retained';ReasonCode='unknown_attribution';Message='校准区间存在归属不明调用';Retained=$true}
+Set-QuotaWindowCard -Window $window -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText -Diagnostic $diagnostic
+Assert-UiPricing ($dollar.Text.Contains('沿用上次结果') -and $dollar.Text.Contains('归属不明') -and $dollar.Text.Contains((Format-TokenRaderUsd 100.0))) 'retained quota lost dollars or diagnostic'
+Set-QuotaWindowCard -Window $window -Estimate $null -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText -Diagnostic $diagnostic
+Assert-UiPricing ($dollar.Text.Contains('不可估') -and $dollar.Text.Contains('归属不明')) 'missing estimate did not explain why'
+$otherPool=$window.PSObject.Copy();$otherPool|Add-Member -NotePropertyName LimitId -NotePropertyValue 'other'
+$estimate|Add-Member -NotePropertyName LimitId -NotePropertyValue 'codex'
+Assert-UiPricing (-not (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $estimate -Window $otherPool)) 'different quota pools shared an estimate'
 $script:State.RateLimits=[pscustomobject]@{FiveHour=$null;Weekly=$window;ObservedAt=$now;PlanType='synthetic'}
 $late=[pscustomobject]@{UsedPercent=29.0;WindowMinutes=10080;PlanType='synthetic';ResetsAt=$reset;ObservedAt=$now.AddSeconds(1)}
 Merge-LatestRateLimits -Candidate ([pscustomobject]@{FiveHour=$null;Weekly=$late;ObservedAt=$late.ObservedAt;PlanType='synthetic'})
@@ -85,4 +95,37 @@ Merge-LatestRateLimits -Candidate ([pscustomobject]@{FiveHour=$null;Weekly=$late
 Assert-UiPricing ($script:State.RateLimits.Weekly.UsedPercent -eq 1.0) 'actual reset blocked'
 [xml]$xaml=Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $projectRoot 'MainWindow.xaml')
 Assert-UiPricing ($xaml.OuterXml.Contains('MeasurementPricingButton')) 'manual confirmation control missing'
+# Exercise the real callback with diagnostics present: these are descriptions,
+# not a replacement for converting QuotaEvidence into a dollar estimate.
+$script:State.AccountIdentity='current-tag'
+$script:State.IntervalBaseline=[pscustomobject]@{StartedAt=$now.AddMinutes(-5);AccountIdentity='previous-tag';RateLimits=$null}
+$script:State.QuotaDiagnostics=$null
+$script:State.QuotaEstimates=$null
+$script:State.QuotaEstimateAccountIdentity=''
+$script:State.RateLimits=[pscustomobject]@{FiveHour=$null;Weekly=$window}
+$script:EstimateConversions=0
+function Get-TokenRaderQuotaEstimate {
+    param($StartRateLimits,$EndRateLimits,$IntervalCost,$CostComplete,$StartReferenceAt,$EndReferenceAt,$QuotaEvidence)
+    $script:EstimateConversions++
+    [pscustomobject]@{FiveHour=$null;Weekly=$(if ($null -ne $QuotaEvidence) {$estimate} else {$null})}
+}
+$callbackResult=[pscustomobject]@{AccountIdentity='current-tag';StartRateLimits=$null;EndRateLimits=$script:State.RateLimits;PricingComplete=$true;TotalCost=1.0;EndedAt=$now;QuotaEvidence=[pscustomobject]@{FiveHour=$null;Weekly=[pscustomobject]@{}};QuotaDiagnostics=[pscustomobject]@{FiveHour=[pscustomobject]@{Status='unavailable';ReasonCode='missing_window';Message='没有当前额度窗口';Retained=$false};Weekly=[pscustomobject]@{Status='updated';ReasonCode='ok';Message='本次更新';Retained=$false;AccountIdentity='current-tag'}}}
+Update-QuotaEstimatesFromInterval -Result $callbackResult
+Assert-UiPricing ($script:EstimateConversions -eq 1 -and $null -ne $script:State.QuotaEstimates.Weekly) 'diagnostics-present callback failed to convert quota evidence'
+Assert-UiPricing ($script:State.QuotaEstimateAccountIdentity -eq 'current-tag') 'old measurement account was assigned to new-cycle estimate'
+$callbackResult.QuotaEvidence=$null
+$callbackResult.PricingComplete=$false
+$callbackResult.QuotaDiagnostics.Weekly.Status='unavailable'
+$callbackResult.QuotaDiagnostics.Weekly.ReasonCode='pricing_incomplete'
+$callbackResult.QuotaDiagnostics.Weekly.Message='校准区间价格不完整'
+Update-QuotaEstimatesFromInterval -Result $callbackResult
+Assert-UiPricing ($null -ne $script:State.QuotaEstimates.Weekly -and $script:State.QuotaDiagnostics.Weekly.Retained) 'transient incomplete pricing discarded a same-cycle estimate'
+$callbackResult.AccountIdentity='previous-tag'
+$callbackResult.QuotaDiagnostics.Weekly.AccountIdentity='previous-tag'
+Update-QuotaEstimatesFromInterval -Result $callbackResult
+Assert-UiPricing ($script:EstimateConversions -eq 2) 'late previous-account result was recalibrated into current account'
+$script:State.QuotaEstimates=[pscustomobject]@{FiveHour=$null;Weekly=$estimate}
+$script:State.QuotaEstimateAccountIdentity=''
+Retain-TokenRaderQuotaEstimatesForCurrentWindow -RateLimits $script:State.RateLimits -AccountIdentity 'newly-known-account'
+Assert-UiPricing ($null -eq $script:State.QuotaEstimates) 'unknown-account dollars migrated into a newly identified account'
 Write-Output 'MEASUREMENT_PRICING_UI_TESTS_PASSED'

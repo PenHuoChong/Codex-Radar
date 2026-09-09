@@ -99,6 +99,7 @@ try {
     # explicitly allowed to recalibrate (or clear) it from synchronized limits.
     $script:QuotaUpdateCalls = 0
     $script:ExpectQuotaBeforeResult = $false
+
     $script:QuotaUpdatedBeforeResult = $false
     function Update-QuotaEstimatesFromInterval {
         param($Result, [bool]$Final)
@@ -148,6 +149,16 @@ try {
     Assert-UiTest ($null -ne $script:State.QuotaEstimates.FiveHour) 'manual preview omitted the 5-hour dollar estimate'
     Assert-UiTest ($null -ne $script:State.QuotaEstimates.Weekly) 'manual preview omitted the weekly dollar estimate'
     $script:ExpectQuotaBeforeResult = $false
+    $script:QuotaMergeCalls = 0
+    function Merge-LatestRateLimits { param($Candidate) $script:QuotaMergeCalls++ }
+    $script:State.AccountIdentity = 'current-account'
+    $intervalResult | Add-Member -NotePropertyName AccountIdentity -NotePropertyValue 'previous-account'
+    $script:State.IntervalComputeRequestId = 91L
+    $script:State.IntervalComputing = $true
+    Complete-TokenRaderIntervalComputeJob $intervalPayload 3L 91L 'IntervalCompute' @{
+        BaselineStartedAt = $baseline.StartedAt; Final = $false; ScanRateLimits = $false
+    }
+    Assert-UiTest ($script:QuotaMergeCalls -eq 0) 'late old-account result mutated current quota snapshots before validation'
 
     # A live preview timeout is recoverable: it must retain the baseline and
     # last result instead of invalidating the whole measurement.

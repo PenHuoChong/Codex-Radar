@@ -2053,6 +2053,7 @@ function Get-TokenRaderQuotaEstimate {
             }
             if ($null -eq $Evidence -or $null -eq $Evidence.PSObject.Properties['BoundaryValid'] -or
                 -not [bool]$Evidence.BoundaryValid -or $null -eq $Evidence.PSObject.Properties['EstimateSource'] -or
+                ($null -ne $Evidence.PSObject.Properties['AttributionComplete'] -and -not [bool]$Evidence.AttributionComplete) -or
                 [string]::IsNullOrWhiteSpace([string]$Evidence.EstimateSource) -or
                 $null -eq $Evidence.PSObject.Properties['PricingComplete'] -or -not [bool]$Evidence.PricingComplete -or
                 (-not $evidenceQuotaComplete -and -not ($null -ne $Evidence.PSObject.Properties['ReferencePricingApplied'] -and [bool]$Evidence.ReferencePricingApplied)) -or
@@ -2070,6 +2071,8 @@ function Get-TokenRaderQuotaEstimate {
                 $evidenceCurrentAt -ne [DateTimeOffset]$EndWindow.ObservedAt) { return $null }
             if ($null -ne $Evidence.PSObject.Properties['WindowMinutes'] -and
                 [int]$Evidence.WindowMinutes -ne [int]$EndWindow.WindowMinutes) { return $null }
+            if ($null -ne $Evidence.PSObject.Properties['LimitId'] -and $null -ne $EndWindow.PSObject.Properties['LimitId'] -and
+                -not [string]::Equals([string]$Evidence.LimitId,[string]$EndWindow.LimitId,[StringComparison]::OrdinalIgnoreCase)) { return $null }
             if ($null -ne $Evidence.PSObject.Properties['PlanType'] -and
                 -not [string]::IsNullOrWhiteSpace([string]$Evidence.PlanType) -and
                 -not [string]::Equals([string]$Evidence.PlanType, [string]$EndPlanType, [StringComparison]::OrdinalIgnoreCase)) { return $null }
@@ -2119,6 +2122,8 @@ function Get-TokenRaderQuotaEstimate {
                 WindowMinutes = [int]$EndWindow.WindowMinutes
                 ResetsAt = $EndWindow.ResetsAt
                 PlanType = $EndPlanType
+                LimitId = if ($null -ne $Evidence.PSObject.Properties['LimitId']) { [string]$Evidence.LimitId } else { '' }
+                AccountIdentity = if ($null -ne $Evidence.PSObject.Properties['AccountIdentity']) { [string]$Evidence.AccountIdentity } else { '' }
             }
         }
         if ($null -eq $StartWindow) { return $null }
@@ -3169,19 +3174,27 @@ function ConvertFrom-TokenRaderRateLimitRows {
     $weeklyObserved = [DateTimeOffset]::MinValue
     $latestMetadata = $null
     $latestMetadataObserved = [DateTimeOffset]::MinValue
+    $latestMetadataId = -1L; $fiveId = -1L; $weeklyId = -1L
     foreach ($row in @($Table.Rows)) {
         $record = ConvertFrom-TokenRaderIndexRecord -Row $row
-        if ([DateTimeOffset]$record.RateLimits.ObservedAt -ge $latestMetadataObserved) {
+        $rowId = if ($Table.Columns.Contains('id') -and $row['id'] -isnot [DBNull]) { [long]$row['id'] } else { 0L }
+        if ([DateTimeOffset]$record.RateLimits.ObservedAt -gt $latestMetadataObserved -or
+            ([DateTimeOffset]$record.RateLimits.ObservedAt -eq $latestMetadataObserved -and $rowId -gt $latestMetadataId)) {
             $latestMetadata = $record.RateLimits
             $latestMetadataObserved = [DateTimeOffset]$record.RateLimits.ObservedAt
+            $latestMetadataId = $rowId
         }
-        if ($null -ne $record.RateLimits.FiveHour -and [DateTimeOffset]$record.RateLimits.FiveHour.ObservedAt -ge $fiveObserved) {
+        if ($null -ne $record.RateLimits.FiveHour -and ([DateTimeOffset]$record.RateLimits.FiveHour.ObservedAt -gt $fiveObserved -or
+            ([DateTimeOffset]$record.RateLimits.FiveHour.ObservedAt -eq $fiveObserved -and $rowId -gt $fiveId))) {
             $fiveHour = $record.RateLimits.FiveHour
             $fiveObserved = [DateTimeOffset]$fiveHour.ObservedAt
+            $fiveId = $rowId
         }
-        if ($null -ne $record.RateLimits.Weekly -and [DateTimeOffset]$record.RateLimits.Weekly.ObservedAt -ge $weeklyObserved) {
+        if ($null -ne $record.RateLimits.Weekly -and ([DateTimeOffset]$record.RateLimits.Weekly.ObservedAt -gt $weeklyObserved -or
+            ([DateTimeOffset]$record.RateLimits.Weekly.ObservedAt -eq $weeklyObserved -and $rowId -gt $weeklyId))) {
             $weekly = $record.RateLimits.Weekly
             $weeklyObserved = [DateTimeOffset]$weekly.ObservedAt
+            $weeklyId = $rowId
         }
     }
     if ($null -eq $fiveHour -and $null -eq $weekly) { return $null }
@@ -3576,6 +3589,12 @@ function ConvertFrom-TokenRaderPricedAggregate {
     }
 }
 
+function Set-TokenRaderQuotaDiagnostic {
+    param([hashtable]$State, [string]$ReasonCode, [string]$Message, [string]$Status = 'unavailable')
+    if ($null -eq $State) { return }
+    $State.Status=$Status; $State.ReasonCode=$ReasonCode; $State.Message=$Message; $State.Retained=$false
+}
+
 function Get-TokenRaderQuotaWindowEvidence {
     param(
         $StartWindow,
@@ -3589,36 +3608,38 @@ function Get-TokenRaderQuotaWindowEvidence {
         [Parameter(Mandatory = $true)]$PricingDocument,
         [Parameter(Mandatory = $true)][Threading.CancellationToken]$CancellationToken,
         [hashtable]$ProgressState,
-        [hashtable]$Cache
+        [hashtable]$Cache,
+        [hashtable]$DiagnosticState,
+        [string]$AccountIdentity = '',
+        $QuotaNotBefore = $null
     )
     # Dollar capacity is calibrated from the API-equivalent cost that occurred
     # between two quota snapshots and the *actual percentage increase* between
     # those same snapshots. It must never divide a partial interval cost by the
     # account's cumulative current percentage.
-    if ($null -eq $EndWindow -or $null -eq $EndWindow.PSObject.Properties['ObservedAt'] -or
-        $null -eq $EndWindow.ResetsAt -or [int]$EndWindow.WindowMinutes -le 0 -or
+    Set-TokenRaderQuotaDiagnostic $DiagnosticState 'missing_window' '没有当前额度窗口'
+    if ($null -eq $EndWindow) { return $null }
+    Set-TokenRaderQuotaDiagnostic $DiagnosticState 'missing_metadata' '额度快照缺少观察时间、计划或重置标识'
+    if ($null -eq $EndWindow.PSObject.Properties['ObservedAt'] -or $null -eq $EndWindow.ObservedAt -or
+        $null -eq $EndWindow.PSObject.Properties['ResetsAt'] -or $null -eq $EndWindow.ResetsAt -or
+        $null -eq $EndWindow.PSObject.Properties['WindowMinutes'] -or [int]$EndWindow.WindowMinutes -le 0 -or
+        $null -eq $EndWindow.PSObject.Properties['UsedPercent'] -or $null -eq $EndWindow.UsedPercent -or
+        $null -eq $EndWindow.PSObject.Properties['PlanType'] -or
         [string]::IsNullOrWhiteSpace([string]$EndWindow.PlanType)) { return $null }
     [DateTimeOffset]$currentObservedAt = [DateTimeOffset]$EndWindow.ObservedAt
     [double]$currentUsedPercent = [double]$EndWindow.UsedPercent
+    if ([DateTimeOffset]$EndWindow.ResetsAt -le $currentObservedAt) {
+        Set-TokenRaderQuotaDiagnostic $DiagnosticState 'expired_window' '额度窗口在观察时已过期'
+        return $null
+    }
     $endReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$EndWindow.WindowMinutes) -ResetsAt $EndWindow.ResetsAt
     if ([string]::IsNullOrWhiteSpace($endReset)) { return $null }
 
     $calibrationStart = $null
     $calibrationEnd = $null
     $historyLookbackApplied = $false
-    if ($null -ne $StartWindow) {
-        if ($null -eq $StartWindow.PSObject.Properties['ObservedAt'] -or $null -eq $StartWindow.ResetsAt -or
-            [int]$StartWindow.WindowMinutes -ne [int]$EndWindow.WindowMinutes -or
-            -not [string]::Equals([string]$StartWindow.PlanType, [string]$EndWindow.PlanType, [StringComparison]::OrdinalIgnoreCase)) { return $null }
-        $startReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$StartWindow.WindowMinutes) -ResetsAt $StartWindow.ResetsAt
-        if ([string]::IsNullOrWhiteSpace($startReset) -or $startReset -ne $endReset) { return $null }
-        if ($null -ne $StartWindow.PSObject.Properties['LimitId'] -and $null -ne $EndWindow.PSObject.Properties['LimitId'] -and
-            -not [string]::IsNullOrWhiteSpace([string]$StartWindow.LimitId) -and
-            -not [string]::IsNullOrWhiteSpace([string]$EndWindow.LimitId) -and
-            -not [string]::Equals([string]$StartWindow.LimitId, [string]$EndWindow.LimitId, [StringComparison]::OrdinalIgnoreCase)) { return $null }
-        [double]$directDelta = [double]$EndWindow.UsedPercent - [double]$StartWindow.UsedPercent
-        if ($directDelta -lt -0.000000001) { return $null }
-    }
+    # Main measurement and current quota cycle have independent boundaries.
+    # The selector validates the current cycle's monotonic envelope itself.
 
     # Always recover the latest completed percentage step from this exact
     # account / plan / reset cycle.  The compiled selector chooses the
@@ -3630,12 +3651,25 @@ function Get-TokenRaderQuotaWindowEvidence {
     # explicitly empty id; only legacy window objects fall back to the
     # top-level value supplied by the caller.
     $effectiveLimitId = if ($null -ne $EndWindow.PSObject.Properties['LimitId']) { [string]$EndWindow.LimitId } else { $RateLimitId }
-    $historyRows = [TokenRaderIndexer]::QueryQuotaCalibrationPairByOffsets(
+    if ($null -ne $DiagnosticState) {
+        $DiagnosticState.AccountIdentity=$AccountIdentity; $DiagnosticState.PlanType=[string]$EndWindow.PlanType
+        $DiagnosticState.WindowMinutes=[int]$EndWindow.WindowMinutes; $DiagnosticState.ResetIdentity=$endReset
+        $DiagnosticState.LimitId=$effectiveLimitId
+        $DiagnosticState.CurrentUsedPercent=$currentUsedPercent; $DiagnosticState.CurrentObservedAt=$currentObservedAt
+        $DiagnosticState.ResetsAt=$EndWindow.ResetsAt
+    }
+    $selection = [TokenRaderIndexer]::QueryQuotaCalibrationPairWithDiagnostics(
         $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
         ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
         [string]$EndWindow.PlanType, [string]$effectiveLimitId, $currentUsedPercent,
         $currentObservedAt, $CancellationToken)
-    if ($null -eq $historyRows -or $historyRows.Rows.Count -ne 2) { return $null }
+    $historyRows = $selection.Rows
+    if ($null -eq $historyRows -or $historyRows.Rows.Count -ne 2) {
+        $code=[string]$selection.ReasonCode
+        $message=if ($code -eq 'stale_snapshot') { '当前快照百分比低于本周期已观察值，等待有效快照' } else { '当前周期缺少两个可用快照组成的完整百分比步长' }
+        Set-TokenRaderQuotaDiagnostic $DiagnosticState $code $message
+        return $null
+    }
     $historyStartRecord = ConvertFrom-TokenRaderIndexRecord -Row $historyRows.Rows[0]
     $historyEndRecord = ConvertFrom-TokenRaderIndexRecord -Row $historyRows.Rows[1]
     if ($WindowKind -eq 'FiveHour') {
@@ -3645,12 +3679,18 @@ function Get-TokenRaderQuotaWindowEvidence {
         $calibrationStart = $historyStartRecord.RateLimits.Weekly
         $calibrationEnd = $historyEndRecord.RateLimits.Weekly
     }
-    if ($null -eq $calibrationStart -or $null -eq $calibrationEnd) { return $null }
+    if ($null -eq $calibrationStart -or $null -eq $calibrationEnd) {
+        Set-TokenRaderQuotaDiagnostic $DiagnosticState 'missing_metadata' '校准窗口元数据不完整'; return $null
+    }
     $historyLookbackApplied = $null -eq $StartWindow -or
-        [DateTimeOffset]$calibrationStart.ObservedAt -lt [DateTimeOffset]$StartWindow.ObservedAt
+        ($null -ne $StartWindow.PSObject.Properties['ObservedAt'] -and [DateTimeOffset]$calibrationStart.ObservedAt -lt [DateTimeOffset]$StartWindow.ObservedAt)
 
     [DateTimeOffset]$startObservedAt = [DateTimeOffset]$calibrationStart.ObservedAt
     [DateTimeOffset]$endObservedAt = [DateTimeOffset]$calibrationEnd.ObservedAt
+    if ($null -ne $QuotaNotBefore -and $startObservedAt -lt [DateTimeOffset]$QuotaNotBefore) {
+        Set-TokenRaderQuotaDiagnostic $DiagnosticState 'account_boundary' '账号标签切换后尚未形成完整校准步长'
+        return $null
+    }
     [double]$deltaPercent = [double]$calibrationEnd.UsedPercent - [double]$calibrationStart.UsedPercent
     $sameWindow = [int]$calibrationStart.WindowMinutes -eq [int]$calibrationEnd.WindowMinutes -and
         [int]$calibrationEnd.WindowMinutes -eq [int]$EndWindow.WindowMinutes
@@ -3660,21 +3700,36 @@ function Get-TokenRaderQuotaWindowEvidence {
     $calibrationEndReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$calibrationEnd.WindowMinutes) -ResetsAt $calibrationEnd.ResetsAt
     $boundaryValid = $sameWindow -and $samePlan -and $calibrationStartReset -eq $endReset -and
         $calibrationEndReset -eq $endReset -and $endObservedAt -gt $startObservedAt -and $deltaPercent -gt 0.000000001
-    if (-not $boundaryValid) { return $null }
+    if (-not $boundaryValid) { Set-TokenRaderQuotaDiagnostic $DiagnosticState 'invalid_boundary' '校准快照时间或周期边界不一致'; return $null }
     $coverageComplete = $currentObservedAt -ge $endObservedAt -and ($null -eq $MainLastCountedAt -or
         $currentObservedAt -ge [DateTimeOffset]$MainLastCountedAt)
 
-    $cacheKey = '{0}|{1}' -f $startObservedAt.UtcDateTime.Ticks, $endObservedAt.UtcDateTime.Ticks
+    $cacheKey = '{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f $startObservedAt.UtcDateTime.Ticks, $endObservedAt.UtcDateTime.Ticks,$WindowKind,$EndWindow.WindowMinutes,$endReset,$EndWindow.PlanType,$effectiveLimitId
     $aggregate = if ($null -ne $Cache -and $Cache.ContainsKey($cacheKey)) {
         $Cache[$cacheKey]
     } else {
-        $value = [TokenRaderIndexer]::AggregateTimeRangeRecordsAtOffsets(
+        $value = [TokenRaderIndexer]::AggregateQuotaTimeRangeRecordsAtOffsets(
             $Connection, $EndOffsets, $startObservedAt, $endObservedAt,
-            $Thresholds, $CancellationToken, $ProgressState)
+            $Thresholds, $CancellationToken, $ProgressState, $WindowKind, [int]$EndWindow.WindowMinutes,
+            ([DateTimeOffset]$EndWindow.ResetsAt).ToUnixTimeSeconds(), [string]$EndWindow.PlanType, $effectiveLimitId)
         if ($null -ne $Cache) { $Cache[$cacheKey] = $value }
         $value
     }
     $priced = ConvertFrom-TokenRaderPricedAggregate -Aggregate $aggregate -PricingDocument $PricingDocument
+    if ($null -ne $DiagnosticState) {
+        $DiagnosticState.StartObservedAt=$startObservedAt; $DiagnosticState.EndObservedAt=$endObservedAt
+        $DiagnosticState.StartUsedPercent=[double]$calibrationStart.UsedPercent; $DiagnosticState.EndUsedPercent=[double]$calibrationEnd.UsedPercent
+        $DiagnosticState.TotalCost=[double]$priced.TotalCost; $DiagnosticState.PricingComplete=[bool]$priced.PricingComplete
+        $DiagnosticState.AttributionComplete=[bool]$aggregate.AttributionComplete
+        $DiagnosticState.UnattributedEvents=[long]$aggregate.UnattributedEvents
+    }
+    if (-not [bool]$aggregate.AttributionComplete) {
+        Set-TokenRaderQuotaDiagnostic $DiagnosticState 'unknown_attribution' '校准区间存在无法确认额度周期归属的调用'
+        return $null
+    }
+    if (-not [bool]$priced.PricingComplete) { Set-TokenRaderQuotaDiagnostic $DiagnosticState 'pricing_incomplete' '校准区间价格不完整' }
+    elseif ([double]$priced.TotalCost -le 0) { Set-TokenRaderQuotaDiagnostic $DiagnosticState 'zero_cost' '完整步长内没有可计价调用' }
+    else { Set-TokenRaderQuotaDiagnostic $DiagnosticState 'ok' '本次更新' 'updated' }
     # PricingComplete intentionally retains its historical meaning: an
     # unobserved tier can still be shown at the Standard reference rate.  A
     # confirmed quota calibration requires known tiers. Unknown modes may
@@ -3740,6 +3795,9 @@ function Get-TokenRaderQuotaWindowEvidence {
         ResetsAt = $EndWindow.ResetsAt
         ResetIdentity = $endReset
         PlanType = [string]$EndWindow.PlanType
+        LimitId = $effectiveLimitId
+        AccountIdentity = $AccountIdentity
+        AttributionComplete = [bool]$aggregate.AttributionComplete
         Usage = $priced.Usage
         InputCost = [double]$priced.InputCost
         CachedCost = [double]$priced.CachedCost
@@ -3796,7 +3854,9 @@ function Get-TokenRaderIndexedIntervalResult {
         [bool]$ScanRateLimits = $true,
         [string]$SessionsRoot = '',
         [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None,
-        [hashtable]$ProgressState = $null
+        [hashtable]$ProgressState = $null,
+        [string]$AccountIdentity = '',
+        $QuotaNotBefore = $null
     )
     if ([string]::IsNullOrWhiteSpace($SessionsRoot)) { $SessionsRoot = [string]$Baseline.SessionsRoot }
     $ending = $null
@@ -3833,6 +3893,8 @@ function Get-TokenRaderIndexedIntervalResult {
                        elseif ($null -ne $Baseline.PSObject.Properties['RateLimits']) { $Baseline.RateLimits }
                        else { $null }
     $quotaEvidence = $null
+    $quotaDiagnosticMaps = @{FiveHour=@{};Weekly=@{}}
+    foreach ($kind in @('FiveHour','Weekly')) { Set-TokenRaderQuotaDiagnostic $quotaDiagnosticMaps[$kind] 'missing_window' '没有当前额度窗口' }
     if ($ScanRateLimits -and $null -ne $endRateLimits) {
         $quotaAggregateCache = @{}
         $quotaEvidence = [pscustomobject]@{
@@ -3848,7 +3910,7 @@ function Get-TokenRaderIndexedIntervalResult {
                 -PricingDocument $PricingDocument `
                 -CancellationToken $CancellationToken `
                 -ProgressState $ProgressState `
-                -Cache $quotaAggregateCache
+                -Cache $quotaAggregateCache -DiagnosticState $quotaDiagnosticMaps.FiveHour -AccountIdentity $AccountIdentity -QuotaNotBefore $QuotaNotBefore
             Weekly = Get-TokenRaderQuotaWindowEvidence `
                 -StartWindow $(if ($null -ne $startRateLimits) { $startRateLimits.Weekly } else { $null }) `
                 -EndWindow $endRateLimits.Weekly `
@@ -3861,7 +3923,7 @@ function Get-TokenRaderIndexedIntervalResult {
                 -PricingDocument $PricingDocument `
                 -CancellationToken $CancellationToken `
                 -ProgressState $ProgressState `
-                -Cache $quotaAggregateCache
+                -Cache $quotaAggregateCache -DiagnosticState $quotaDiagnosticMaps.Weekly -AccountIdentity $AccountIdentity -QuotaNotBefore $QuotaNotBefore
         }
     }
     $modelList = @($priced.Models)
@@ -3890,6 +3952,8 @@ function Get-TokenRaderIndexedIntervalResult {
         EndRateLimits = $endRateLimits
         RateLimits = $endRateLimits
         QuotaEvidence = $quotaEvidence
+        QuotaDiagnostics = [pscustomobject]@{FiveHour=[pscustomobject]$quotaDiagnosticMaps.FiveHour;Weekly=[pscustomobject]$quotaDiagnosticMaps.Weekly}
+        AccountIdentity = $AccountIdentity
         RawEvents = [Int64]$aggregate.RawEvents
         CountedEvents = [Int64]$aggregate.CountedEvents
         DuplicateEventsDropped = [Int64]$aggregate.DuplicateEventsDropped

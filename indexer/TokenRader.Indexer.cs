@@ -165,12 +165,39 @@ public sealed class TokenRaderIntervalAggregateResult
     public int ChangedSessions { get; set; }
     public string[] Models { get; set; }
     public TokenRaderIntervalAggregateBucket[] Buckets { get; set; }
+    /// <summary>
+    /// True when a quota-scoped aggregate could attribute every canonical
+    /// event to the requested reset cycle.  Non quota-scoped aggregates leave
+    /// this true for backwards compatibility.
+    /// </summary>
+    public bool AttributionComplete { get; set; }
+    /// <summary>Canonical events whose quota cycle could not be determined.</summary>
+    public long UnattributedEvents { get; set; }
+    /// <summary>Canonical events known to belong to another reset cycle.</summary>
+    public long ExcludedCycleEvents { get; set; }
 
     public TokenRaderIntervalAggregateResult()
     {
         Models = new string[0];
         Buckets = new TokenRaderIntervalAggregateBucket[0];
         IdentitySources = new string[0];
+        AttributionComplete = true;
+    }
+}
+
+/// <summary>
+/// Diagnostics returned by the quota calibration selector.  Rows retains the
+/// historical two-row DataTable shape so existing callers can migrate without
+/// materializing a second query.
+/// </summary>
+public sealed class TokenRaderQuotaCalibrationPairDiagnostics
+{
+    public DataTable Rows { get; set; }
+    public string ReasonCode { get; set; }
+
+    public TokenRaderQuotaCalibrationPairDiagnostics()
+    {
+        ReasonCode = "no_pair";
     }
 }
 
@@ -325,8 +352,253 @@ public sealed class TokenRaderModelBackfillResult
 /// </summary>
 public static class TokenRaderIndexer
 {
+    private enum QuotaCycleAttribution
+    {
+        Unattributed = 0,
+        Target = 1,
+        Foreign = 2
+    }
+
+    private sealed class QuotaCycleScope
+    {
+        public string WindowKind = "";
+        public int WindowMinutes;
+        public long ResetUnixSeconds;
+        public long ResetMinute;
+        public string PlanType = "";
+        public string RateLimitId = "";
+    }
+
+    /// <summary>
+    /// Finds the latest complete quota step and reports why no pair was
+    /// available without a second scan.  New callers use exact plan and
+    /// limit-id matching, including an explicit empty legacy bucket.
+    /// </summary>
+    public static TokenRaderQuotaCalibrationPairDiagnostics QueryQuotaCalibrationPairWithDiagnostics(
+        SQLiteConnection db,
+        IDictionary endOffsets,
+        string windowKind,
+        int windowMinutes,
+        long resetUnixSeconds,
+        string planType,
+        string rateLimitId,
+        double currentUsedPercent,
+        DateTimeOffset currentObservedAt,
+        CancellationToken cancellationToken)
+    {
+        return QueryQuotaCalibrationPairWithDiagnosticsInternal(db, endOffsets,
+            windowKind, windowMinutes, resetUnixSeconds, planType, rateLimitId,
+            currentUsedPercent, currentObservedAt, cancellationToken, true);
+    }
+
+    /// <summary>
+    /// Only quota-window metadata is retained here.  No prompt, response, or
+    /// other private log content is read by the cycle attribution index.
+    /// </summary>
+    private sealed class QuotaCycleMetadata
+    {
+        public bool HasAny;
+        public bool HasTargetWindowMetadata;
+        public bool HasKnownCycle;
+        public int WindowMinutes;
+        public long ResetUnixSeconds;
+        public string PlanType = "";
+        public string RateLimitId = "";
+    }
+
+    private sealed class QuotaCycleMetadataRecord
+    {
+        public long Id;
+        public string SessionId = "";
+        public string SourcePath = "";
+        public long SourceOffsetEnd;
+        public DateTimeOffset ObservedAt;
+        public QuotaCycleMetadata Metadata;
+    }
+
+    private sealed class QuotaCycleMetadataIndex
+    {
+        private Func<QuotaCycleMetadataIndex> _loader;
+        private QuotaCycleMetadataIndex _loaded;
+        private sealed class MetadataPrefix
+        {
+            public string Path;
+            public QuotaCycleMetadata[] States;
+            public bool[] Blocked;
+        }
+        private readonly Dictionary<string, MetadataPrefix> _prefixes =
+            new Dictionary<string, MetadataPrefix>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<long> _metadataIds = new HashSet<long>();
+        public QuotaCycleMetadataIndex() { }
+        public QuotaCycleMetadataIndex(Func<QuotaCycleMetadataIndex> loader) { _loader = loader; }
+        private readonly Dictionary<string, List<QuotaCycleMetadataRecord>> _bySession =
+            new Dictionary<string, List<QuotaCycleMetadataRecord>>(StringComparer.OrdinalIgnoreCase);
+
+        public void Add(QuotaCycleMetadataRecord record)
+        {
+            if (record == null || string.IsNullOrWhiteSpace(record.SessionId) ||
+                record.Metadata == null || !record.Metadata.HasAny) return;
+            if (record.Id > 0L && !_metadataIds.Add(record.Id)) return;
+            List<QuotaCycleMetadataRecord> records;
+            if (!_bySession.TryGetValue(record.SessionId, out records))
+            {
+                records = new List<QuotaCycleMetadataRecord>();
+                _bySession.Add(record.SessionId, records);
+            }
+            records.Add(record);
+        }
+
+        public void Sort()
+        {
+            foreach (List<QuotaCycleMetadataRecord> records in _bySession.Values)
+            {
+                records.Sort(delegate(QuotaCycleMetadataRecord left, QuotaCycleMetadataRecord right) {
+                    int comparison = DateTimeOffset.Compare(
+                        left.ObservedAt.ToUniversalTime(), right.ObservedAt.ToUniversalTime());
+                    if (comparison != 0) return comparison;
+                    comparison = StringComparer.OrdinalIgnoreCase.Compare(
+                        left.SourcePath ?? "", right.SourcePath ?? "");
+                    if (comparison != 0) return comparison;
+                    comparison = left.SourceOffsetEnd.CompareTo(right.SourceOffsetEnd);
+                    return comparison != 0 ? comparison : left.Id.CompareTo(right.Id);
+                });
+            }
+        }
+
+        public QuotaCycleMetadata FindPreceding(string sessionId, string sourcePath,
+            long sourceOffsetEnd, long id, DateTimeOffset observedAt,
+            QuotaCycleScope scope, out bool blocked)
+        {
+            if (_loader != null)
+            {
+                _loaded = _loader();
+                _loader = null;
+            }
+            if (_loaded != null)
+                return _loaded.FindPreceding(sessionId, sourcePath, sourceOffsetEnd, id, observedAt, scope, out blocked);
+            blocked = false;
+            List<QuotaCycleMetadataRecord> records;
+            if (string.IsNullOrWhiteSpace(sessionId) ||
+                !_bySession.TryGetValue(sessionId, out records) || records.Count == 0) return null;
+
+            // Ordinary append-only sessions have monotonic time and offsets.
+            // Cache their state prefixes once, then binary-search each call;
+            // replaying every earlier split-window row would be quadratic.
+            MetadataPrefix prefix;
+            if (!_prefixes.TryGetValue(sessionId, out prefix))
+            {
+                bool monotonic = true;
+                for (int i = 1; i < records.Count; i++)
+                    if (!string.Equals(records[0].SourcePath, records[i].SourcePath, StringComparison.OrdinalIgnoreCase) ||
+                        records[i].SourceOffsetEnd <= records[i - 1].SourceOffsetEnd ||
+                        records[i].ObservedAt < records[i - 1].ObservedAt) { monotonic = false; break; }
+                if (monotonic)
+                {
+                    prefix = new MetadataPrefix { Path = records[0].SourcePath,
+                        States = new QuotaCycleMetadata[records.Count], Blocked = new bool[records.Count] };
+                    QuotaCycleMetadata state = null; bool stateBlocked = false;
+                    for (int i = 0; i < records.Count; i++)
+                    {
+                        ApplyMetadataState(records[i].Metadata, scope, ref state, ref stateBlocked);
+                        prefix.States[i] = state; prefix.Blocked[i] = stateBlocked;
+                    }
+                }
+                _prefixes[sessionId] = prefix;
+            }
+            if (prefix != null && string.Equals(prefix.Path, sourcePath, StringComparison.OrdinalIgnoreCase))
+            {
+                int low = 0, high = records.Count;
+                while (low < high)
+                {
+                    int middle = low + (high - low) / 2;
+                    if (IsPreceding(records[middle], sourcePath, sourceOffsetEnd, id, observedAt)) low = middle + 1;
+                    else high = middle;
+                }
+                if (low == 0) return null;
+                blocked = prefix.Blocked[low - 1];
+                return prefix.States[low - 1];
+            }
+
+            // The index is sorted by the same timestamp/path/offset/id order
+            // used by the C# readers.  Keep the latest eligible row without a
+            // SQLite query per token event.  For one source file, byte offset
+            // is authoritative in addition to timestamp: a delayed older
+            // record appended at a later offset must not retroactively alter
+            // the cycle of an earlier call.
+            QuotaCycleMetadata active = null;
+            for (int i = 0; i < records.Count; i++)
+            {
+                QuotaCycleMetadataRecord candidate = records[i];
+                if (!IsPreceding(candidate, sourcePath, sourceOffsetEnd, id, observedAt)) continue;
+                ApplyMetadataState(candidate.Metadata, scope, ref active, ref blocked);
+            }
+            return active;
+        }
+
+        private static void ApplyMetadataState(QuotaCycleMetadata metadata,
+            QuotaCycleScope scope, ref QuotaCycleMetadata active, ref bool blocked)
+        {
+            if (metadata == null || !metadata.HasAny) return;
+            if (metadata.HasTargetWindowMetadata)
+            {
+                if (metadata.HasKnownCycle)
+                {
+                    active = metadata;
+                    blocked = false;
+                }
+                else
+                {
+                    active = null;
+                    blocked = true;
+                }
+                return;
+            }
+            if (active != null &&
+                ((metadata.PlanType.Length > 0 && !string.Equals(metadata.PlanType,
+                    active.PlanType ?? "", StringComparison.OrdinalIgnoreCase)) ||
+                 (metadata.RateLimitId.Length > 0 && !string.Equals(metadata.RateLimitId,
+                    active.RateLimitId ?? "", StringComparison.OrdinalIgnoreCase))))
+            {
+                // A discriminator change without a target-window payload is
+                // still an explicit switch; the earlier cycle cannot be
+                // silently carried through it.
+                active = null;
+                blocked = true;
+            }
+        }
+
+        private static bool IsPreceding(QuotaCycleMetadataRecord record,
+            string sourcePath, long sourceOffsetEnd, long id, DateTimeOffset observedAt)
+        {
+            if (string.Equals(record.SourcePath ?? "", sourcePath ?? "",
+                StringComparison.OrdinalIgnoreCase))
+            {
+                return record.SourceOffsetEnd < sourceOffsetEnd && record.ObservedAt <= observedAt;
+            }
+            // Offsets from different files are not comparable.  Require a
+            // strictly earlier timestamp and use deterministic ordering only
+            // when selecting among otherwise eligible records.
+            return record.ObservedAt < observedAt;
+        }
+
+        private static int CompareMetadataRecords(QuotaCycleMetadataRecord left,
+            QuotaCycleMetadataRecord right)
+        {
+            int comparison = DateTimeOffset.Compare(left.ObservedAt.ToUniversalTime(),
+                right.ObservedAt.ToUniversalTime());
+            if (comparison != 0) return comparison;
+            comparison = StringComparer.OrdinalIgnoreCase.Compare(left.SourcePath ?? "",
+                right.SourcePath ?? "");
+            if (comparison != 0) return comparison;
+            comparison = left.SourceOffsetEnd.CompareTo(right.SourceOffsetEnd);
+            return comparison != 0 ? comparison : left.Id.CompareTo(right.Id);
+        }
+    }
+
     private sealed class AggregateEventCandidate
     {
+        public long Id;
+        public long SourceOffsetEnd;
         public string SessionId = "";
         public string RootSessionId = "";
         public string SourcePath = "";
@@ -351,6 +623,8 @@ public static class TokenRaderIndexer
         public long CallOutput;
         public long CallReasoning;
         public bool IncludeInResult = true;
+        public QuotaCycleMetadata QuotaMetadata;
+        public QuotaCycleAttribution QuotaAttribution = QuotaCycleAttribution.Target;
     }
 
     // Cumulative snapshots are deduplicated for billing, but a later status
@@ -2942,6 +3216,43 @@ public static class TokenRaderIndexer
             cancellationToken, progressState, null);
     }
 
+    /// <summary>
+    /// Aggregates quota evidence in the exact timestamp interval while
+    /// retaining only calls attributable to the requested plan/reset cycle.
+    /// Parent/child lineage is canonicalized by the normal time-range
+    /// aggregator before cycle filtering is applied.
+    /// </summary>
+    public static TokenRaderIntervalAggregateResult AggregateQuotaTimeRangeRecordsAtOffsets(
+        SQLiteConnection db,
+        IDictionary endOffsets,
+        DateTimeOffset startedExclusive,
+        DateTimeOffset endedInclusive,
+        IDictionary longContextThresholds,
+        CancellationToken cancellationToken,
+        IDictionary progressState,
+        string windowKind,
+        int windowMinutes,
+        long resetUnixSeconds,
+        string planType,
+        string rateLimitId)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        if (endedInclusive <= startedExclusive)
+            throw new ArgumentException("endedInclusive must be later than startedExclusive");
+
+        QuotaCycleScope scope;
+        if (!TryCreateQuotaCycleScope(windowKind, windowMinutes, resetUnixSeconds,
+            planType, rateLimitId, out scope))
+        {
+            var invalid = new TokenRaderIntervalAggregateResult();
+            invalid.AttributionComplete = false;
+            return invalid;
+        }
+        return AggregateScopedTimeRangeRecordsAtOffsetsInternal(db, endOffsets,
+            startedExclusive, endedInclusive, longContextThresholds,
+            cancellationToken, progressState, null, scope);
+    }
+
     // Explorer filters ownership only AFTER lineage canonicalization. Ancestor
     // records may be provided as evidence without charging them to a child.
     public static TokenRaderIntervalAggregateResult AggregateScopedTimeRangeRecordsAtOffsets(
@@ -2949,6 +3260,18 @@ public static class TokenRaderIndexer
         DateTimeOffset startedExclusive, DateTimeOffset endedInclusive,
         IDictionary longContextThresholds, CancellationToken cancellationToken,
         IDictionary progressState, string[] countedSessionIds)
+    {
+        return AggregateScopedTimeRangeRecordsAtOffsetsInternal(db, endOffsets,
+            startedExclusive, endedInclusive, longContextThresholds,
+            cancellationToken, progressState, countedSessionIds, null);
+    }
+
+    private static TokenRaderIntervalAggregateResult AggregateScopedTimeRangeRecordsAtOffsetsInternal(
+        SQLiteConnection db, IDictionary endOffsets,
+        DateTimeOffset startedExclusive, DateTimeOffset endedInclusive,
+        IDictionary longContextThresholds, CancellationToken cancellationToken,
+        IDictionary progressState, string[] countedSessionIds,
+        QuotaCycleScope quotaScope)
     {
         if (db == null) throw new ArgumentNullException("db");
         if (endedInclusive <= startedExclusive)
@@ -2967,6 +3290,13 @@ public static class TokenRaderIndexer
             .ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
         var relevantPaths = new HashSet<string>(
             ReadTimeRangeSourcePaths(db, broadStart, broadEnd), StringComparer.OrdinalIgnoreCase);
+        // Complete per-call metadata needs no historical lookup. Defer the
+        // supplemental index until a canonical candidate needs inheritance.
+        QuotaCycleMetadataIndex quotaMetadataIndex = quotaScope == null ? null :
+            new QuotaCycleMetadataIndex(delegate {
+                return ReadQuotaCycleMetadataIndex(db, ranges, relevantPaths, quotaScope,
+                    startedExclusive, endedInclusive, broadStart, broadEnd, cancellationToken);
+            });
 
         SetAggregateProgress(progressState, 0L, "聚合区间记录");
         for (int rangeIndex = 0; rangeIndex < ranges.Count; rangeIndex++)
@@ -2976,13 +3306,10 @@ public static class TokenRaderIndexer
             if (!relevantPaths.Contains(range.Path)) continue;
             SeedTimeRangeCumulativeSnapshotAtOffset(db, range, startedExclusive,
                 seenCumulativeSnapshots, lineageGroups, parentBySession, result,
-                cancellationToken);
+                cancellationToken, quotaScope, quotaMetadataIndex);
             using (var cmd = db.CreateCommand())
             {
-                cmd.CommandText =
-                    "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
-                    "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                    "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source " +
+                cmd.CommandText = BuildAggregateRecordSelect(quotaScope != null) +
                     "FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<=@end " +
                     "AND timestamp>=@broad_start AND timestamp<@broad_end ORDER BY source_offset_end ASC";
                 cmd.Parameters.AddWithValue("@path", range.Path);
@@ -3029,6 +3356,9 @@ public static class TokenRaderIndexer
                         bool cacheWriteObservable = ReadReaderInt64(reader, 24) != 0L;
                         string serviceTier = NormalizeServiceTier(ReadReaderString(reader, 25));
                         string serviceTierSource = NormalizeServiceTierSource(ReadReaderString(reader, 26), serviceTier);
+                        long rowId = quotaScope == null ? 0L : ReadReaderInt64(reader, 27);
+                        QuotaCycleMetadata quotaMetadata = quotaScope == null ? null :
+                            ReadQuotaCycleMetadata(reader, quotaScope);
                         if (callInput <= 0L && callOutput <= 0L) continue;
 
                         string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
@@ -3045,6 +3375,8 @@ public static class TokenRaderIndexer
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
                         var candidate = new AggregateEventCandidate {
+                                Id = rowId,
+                                SourceOffsetEnd = ReadReaderInt64(reader, 13),
                                 SessionId = sessionId,
                                 RootSessionId = rootSessionId,
                                 SourcePath = sourcePath,
@@ -3067,8 +3399,12 @@ public static class TokenRaderIndexer
                                 CallInput = callInput,
                                 CallCached = callCached,
                                 CallOutput = callOutput,
-                                CallReasoning = callReasoning
+                                CallReasoning = callReasoning,
+                                QuotaMetadata = quotaMetadata
                             };
+                        if (quotaScope != null)
+                            candidate.QuotaAttribution = ResolveQuotaCycleAttribution(
+                                candidate, quotaScope, quotaMetadataIndex);
                         AddAggregateLineageCandidate(lineageGroups, eventKey,
                             candidate, parentBySession, result);
                         seenCumulativeSnapshots.Register(cumulativeKey, candidate);
@@ -3079,7 +3415,8 @@ public static class TokenRaderIndexer
 
         cancellationToken.ThrowIfCancellationRequested();
         FinalizeAggregateLineageCandidates(lineageGroups, thresholds, result,
-            countedSessionIds == null ? null : new HashSet<string>(countedSessionIds, StringComparer.OrdinalIgnoreCase));
+            countedSessionIds == null ? null : new HashSet<string>(countedSessionIds, StringComparer.OrdinalIgnoreCase),
+            quotaScope);
         result.ProcessingMilliseconds = stopwatch.ElapsedMilliseconds;
         SetAggregateProgress(progressState, result.ProcessedRows, "区间聚合完成");
         return result;
@@ -3153,15 +3490,14 @@ public static class TokenRaderIndexer
         Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
         Dictionary<string, string> parentBySession,
         TokenRaderIntervalAggregateResult result,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        QuotaCycleScope quotaScope = null,
+        QuotaCycleMetadataIndex quotaMetadataIndex = null)
     {
         if (db == null || range == null || seenCumulativeSnapshots == null) return;
         using (var cmd = db.CreateCommand())
         {
-            cmd.CommandText =
-                "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
-                "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source " +
+            cmd.CommandText = BuildAggregateRecordSelect(quotaScope != null) +
                 "FROM token_records WHERE source_path=@path AND source_offset_end>0 AND source_offset_end<=@end " +
                 "ORDER BY source_offset_end DESC";
             cmd.Parameters.AddWithValue("@path", range.Path);
@@ -3176,7 +3512,8 @@ public static class TokenRaderIndexer
                     if (!TryParseTimestamp(ReadReaderString(reader, 1), out eventAt) ||
                         eventAt > startedExclusive) continue;
                     SeedAggregateLineageFromReader(reader, seenCumulativeSnapshots,
-                        lineageGroups, parentBySession, result);
+                        lineageGroups, parentBySession, result, db,
+                        quotaScope, quotaMetadataIndex);
                     break;
                 }
             }
@@ -3359,7 +3696,8 @@ public static class TokenRaderIndexer
         Dictionary<string, List<AggregateEventCandidate>> groups,
         Dictionary<string, long> thresholds,
         TokenRaderIntervalAggregateResult result,
-        HashSet<string> countedSessionIds = null)
+        HashSet<string> countedSessionIds = null,
+        QuotaCycleScope quotaScope = null)
     {
         var activeFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var models = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -3383,6 +3721,8 @@ public static class TokenRaderIndexer
                 AggregateEventCandidate candidate = representatives[i];
                 if (!candidate.IncludeInResult ||
                     (countedSessionIds != null && !countedSessionIds.Contains(candidate.SessionId))) continue;
+                if (quotaScope != null && candidate.QuotaAttribution != QuotaCycleAttribution.Target)
+                    continue;
                 string stableId = !string.IsNullOrWhiteSpace(candidate.RequestId)
                     ? "request:" + candidate.RequestId
                     : (!string.IsNullOrWhiteSpace(candidate.ResponseId) ? "response:" + candidate.ResponseId : "");
@@ -3402,6 +3742,20 @@ public static class TokenRaderIndexer
                 AggregateEventCandidate candidate = representatives[i];
                 if (!candidate.IncludeInResult ||
                     (countedSessionIds != null && !countedSessionIds.Contains(candidate.SessionId))) continue;
+                if (quotaScope != null)
+                {
+                    if (candidate.QuotaAttribution == QuotaCycleAttribution.Foreign)
+                    {
+                        result.ExcludedCycleEvents++;
+                        continue;
+                    }
+                    if (candidate.QuotaAttribution != QuotaCycleAttribution.Target)
+                    {
+                        result.UnattributedEvents++;
+                        result.AttributionComplete = false;
+                        continue;
+                    }
+                }
                 string stableId = !string.IsNullOrWhiteSpace(candidate.RequestId)
                     ? "request:" + candidate.RequestId
                     : (!string.IsNullOrWhiteSpace(candidate.ResponseId) ? "response:" + candidate.ResponseId : "");
@@ -3669,6 +4023,279 @@ public static class TokenRaderIndexer
         return result;
     }
 
+    private static string BuildAggregateRecordSelect(bool includeQuotaMetadata)
+    {
+        string select =
+            "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
+            "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
+            "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source";
+        if (includeQuotaMetadata)
+        {
+            select += ",id,five_hour_used,five_hour_window,five_hour_resets," +
+                "weekly_used,weekly_window,weekly_resets,plan_type,rate_limit_id";
+        }
+        return select + " ";
+    }
+
+    private static bool TryCreateQuotaCycleScope(
+        string windowKind,
+        int windowMinutes,
+        long resetUnixSeconds,
+        string planType,
+        string rateLimitId,
+        out QuotaCycleScope scope)
+    {
+        scope = null;
+        if (windowMinutes <= 0 || resetUnixSeconds <= 0L) return false;
+        if (!string.Equals(windowKind, "FiveHour", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(windowKind, "Weekly", StringComparison.OrdinalIgnoreCase)) return false;
+        long resetMinute;
+        try { resetMinute = resetUnixSeconds / 60L; }
+        catch (OverflowException) { return false; }
+        scope = new QuotaCycleScope {
+            WindowKind = string.Equals(windowKind, "Weekly", StringComparison.OrdinalIgnoreCase)
+                ? "Weekly" : "FiveHour",
+            WindowMinutes = windowMinutes,
+            ResetUnixSeconds = resetUnixSeconds,
+            ResetMinute = resetMinute,
+            PlanType = planType ?? "",
+            RateLimitId = rateLimitId ?? ""
+        };
+        return true;
+    }
+
+    private static QuotaCycleMetadata ReadQuotaCycleMetadata(
+        SQLiteDataReader reader, QuotaCycleScope scope)
+    {
+        if (reader == null || scope == null) return null;
+        // These ordinals are appended by BuildAggregateRecordSelect and are
+        // deliberately kept separate from the long-standing aggregate row
+        // ordinals above.
+        int usedOrdinal = string.Equals(scope.WindowKind, "Weekly", StringComparison.OrdinalIgnoreCase)
+            ? 31 : 28;
+        int windowOrdinal = string.Equals(scope.WindowKind, "Weekly", StringComparison.OrdinalIgnoreCase)
+            ? 32 : 29;
+        int resetOrdinal = string.Equals(scope.WindowKind, "Weekly", StringComparison.OrdinalIgnoreCase)
+            ? 33 : 30;
+        bool hasUsed = !reader.IsDBNull(usedOrdinal);
+        bool hasWindow = !reader.IsDBNull(windowOrdinal);
+        bool hasReset = !reader.IsDBNull(resetOrdinal);
+        string plan = ReadReaderString(reader, 34);
+        string limit = ReadReaderString(reader, 35);
+        var metadata = new QuotaCycleMetadata {
+            HasAny = hasUsed || hasWindow || hasReset ||
+                !string.IsNullOrWhiteSpace(plan) || !string.IsNullOrWhiteSpace(limit),
+            HasTargetWindowMetadata = hasUsed || hasWindow || hasReset,
+            PlanType = plan,
+            RateLimitId = limit
+        };
+        if (hasWindow && hasReset)
+        {
+            int window;
+            long reset;
+            if (TryConvertInt32(reader.GetValue(windowOrdinal), out window) &&
+                TryConvertInt64(reader.GetValue(resetOrdinal), out reset) &&
+                window > 0 && reset > 0L)
+            {
+                metadata.HasKnownCycle = true;
+                metadata.WindowMinutes = window;
+                metadata.ResetUnixSeconds = reset;
+            }
+        }
+        return metadata.HasAny ? metadata : null;
+    }
+
+    private static bool QuotaMetadataMatchesScope(
+        QuotaCycleMetadata metadata, QuotaCycleScope scope)
+    {
+        if (metadata == null || scope == null || !metadata.HasKnownCycle) return false;
+        if (metadata.WindowMinutes != scope.WindowMinutes) return false;
+        if (metadata.ResetUnixSeconds / 60L != scope.ResetMinute) return false;
+        // Empty plan/limit values are an explicit legacy bucket.  They are
+        // not wildcards here: a named pool must never be mixed with rows that
+        // omitted the pool identifier.
+        return string.Equals(metadata.PlanType ?? "", scope.PlanType ?? "",
+                StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(metadata.RateLimitId ?? "", scope.RateLimitId ?? "",
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool QuotaMetadataIsAmbiguous(
+        QuotaCycleMetadata metadata, QuotaCycleScope scope)
+    {
+        if (metadata == null || scope == null || !metadata.HasKnownCycle) return true;
+        if (metadata.WindowMinutes != scope.WindowMinutes ||
+            metadata.ResetUnixSeconds / 60L != scope.ResetMinute) return false;
+        // A named target cannot safely adopt a legacy row that omitted the
+        // corresponding discriminator.  The reverse direction is explicit
+        // evidence for the legacy empty bucket and is therefore foreign.
+        if (!string.IsNullOrWhiteSpace(scope.PlanType) &&
+            string.IsNullOrWhiteSpace(metadata.PlanType)) return true;
+        if (!string.IsNullOrWhiteSpace(scope.RateLimitId) &&
+            string.IsNullOrWhiteSpace(metadata.RateLimitId)) return true;
+        return false;
+    }
+
+    private static QuotaCycleAttribution ResolveQuotaCycleAttribution(
+        AggregateEventCandidate candidate,
+        QuotaCycleScope scope,
+        QuotaCycleMetadataIndex metadataIndex)
+    {
+        if (candidate == null || scope == null) return QuotaCycleAttribution.Unattributed;
+        QuotaCycleMetadata metadata = candidate.QuotaMetadata;
+        if (metadata == null || !metadata.HasAny || !metadata.HasTargetWindowMetadata)
+        {
+            bool blocked = false;
+            QuotaCycleMetadata preceding = metadataIndex == null ? null : metadataIndex.FindPreceding(
+                candidate.SessionId, candidate.SourcePath, candidate.SourceOffsetEnd,
+                candidate.Id, candidate.EventAt, scope, out blocked);
+            if (metadata != null && metadata.HasAny && preceding != null &&
+                ((metadata.PlanType.Length > 0 && !string.Equals(metadata.PlanType,
+                    preceding.PlanType ?? "", StringComparison.OrdinalIgnoreCase)) ||
+                 (metadata.RateLimitId.Length > 0 && !string.Equals(metadata.RateLimitId,
+                    preceding.RateLimitId ?? "", StringComparison.OrdinalIgnoreCase))))
+                return QuotaCycleAttribution.Unattributed;
+            if (blocked || preceding == null) return QuotaCycleAttribution.Unattributed;
+            metadata = preceding;
+        }
+        if (metadata == null || !metadata.HasAny) return QuotaCycleAttribution.Unattributed;
+        if (!metadata.HasKnownCycle) return QuotaCycleAttribution.Unattributed;
+        if (QuotaMetadataIsAmbiguous(metadata, scope)) return QuotaCycleAttribution.Unattributed;
+        return QuotaMetadataMatchesScope(metadata, scope)
+            ? QuotaCycleAttribution.Target : QuotaCycleAttribution.Foreign;
+    }
+
+    private static QuotaCycleMetadataIndex ReadQuotaCycleMetadataIndex(
+        SQLiteConnection db,
+        List<OffsetRange> ranges,
+        HashSet<string> relevantPaths,
+        QuotaCycleScope scope,
+        DateTimeOffset startedExclusive,
+        DateTimeOffset endedInclusive,
+        string broadStart,
+        string broadEnd,
+        CancellationToken cancellationToken)
+    {
+        var index = new QuotaCycleMetadataIndex();
+        if (db == null || ranges == null || ranges.Count == 0 || scope == null) return index;
+
+        // Only rows in the frozen offsets are considered.  For each path keep
+        // the latest pre-interval metadata row (bounded by the interval start)
+        // plus all rows in the interval.  This avoids scanning the entire
+        // historical index while still allowing a candidate to inherit a
+        // same-session cycle at the exact frozen boundary.
+        for (int rangeIndex = 0; rangeIndex < ranges.Count; rangeIndex++)
+        {
+            if ((rangeIndex & 31) == 0) cancellationToken.ThrowIfCancellationRequested();
+            OffsetRange range = ranges[rangeIndex];
+            if (relevantPaths != null && !relevantPaths.Contains(range.Path)) continue;
+            using (var current = db.CreateCommand())
+            {
+                current.CommandText =
+                    "SELECT id,session_id,timestamp,source_path,source_offset_end," +
+                    "five_hour_used,five_hour_window,five_hour_resets,weekly_used,weekly_window,weekly_resets,plan_type,rate_limit_id " +
+                    "FROM token_records WHERE source_path=@path AND source_offset_end>0 " +
+                    "AND source_offset_end<=@end AND timestamp>=@broad_start AND timestamp<@broad_end " +
+                    "ORDER BY source_offset_end ASC,id ASC";
+                current.Parameters.AddWithValue("@path", range.Path);
+                current.Parameters.AddWithValue("@end", range.End);
+                current.Parameters.AddWithValue("@broad_start", broadStart);
+                current.Parameters.AddWithValue("@broad_end", broadEnd);
+                using (var reader = current.ExecuteReader())
+                {
+                    int inspected = 0;
+                    while (reader.Read())
+                    {
+                        if ((inspected++ & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
+                        AddQuotaCycleMetadataRecord(index, reader, scope);
+                    }
+                }
+            }
+            using (var baseline = db.CreateCommand())
+            {
+                baseline.CommandText =
+                    "SELECT id,session_id,timestamp,source_path,source_offset_end," +
+                    "five_hour_used,five_hour_window,five_hour_resets,weekly_used,weekly_window,weekly_resets,plan_type,rate_limit_id " +
+                    "FROM token_records WHERE source_path=@path AND source_offset_end>0 " +
+                    "AND source_offset_end<=@end AND timestamp<=@at " +
+                    "AND (five_hour_used IS NOT NULL OR five_hour_window IS NOT NULL OR five_hour_resets IS NOT NULL " +
+                    "OR weekly_used IS NOT NULL OR weekly_window IS NOT NULL OR weekly_resets IS NOT NULL " +
+                    "OR COALESCE(plan_type,'')<>'' OR COALESCE(rate_limit_id,'')<>'') " +
+                    "ORDER BY source_offset_end DESC,id DESC LIMIT 1";
+                baseline.Parameters.AddWithValue("@path", range.Path);
+                baseline.Parameters.AddWithValue("@end", range.End);
+                baseline.Parameters.AddWithValue("@at", startedExclusive.UtcDateTime.ToString(
+                    "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture));
+                using (var reader = baseline.ExecuteReader())
+                {
+                    if (reader.Read()) AddQuotaCycleMetadataRecord(index, reader, scope);
+                }
+            }
+        }
+        index.Sort();
+        return index;
+    }
+
+    private static void AddQuotaCycleMetadataRecord(
+        QuotaCycleMetadataIndex index,
+        SQLiteDataReader reader,
+        QuotaCycleScope scope)
+    {
+        if (index == null || reader == null || scope == null) return;
+        DateTimeOffset observedAt;
+        if (!TryParseTimestamp(ReadReaderString(reader, 2), out observedAt)) return;
+        QuotaCycleMetadata metadata = ReadQuotaCycleMetadataFromIndexRow(reader, scope);
+        if (metadata == null || !metadata.HasAny) return;
+        index.Add(new QuotaCycleMetadataRecord {
+            Id = ReadReaderInt64(reader, 0),
+            SessionId = ReadReaderString(reader, 1),
+            ObservedAt = observedAt,
+            SourcePath = ReadReaderString(reader, 3),
+            SourceOffsetEnd = ReadReaderInt64(reader, 4),
+            Metadata = metadata
+        });
+    }
+
+    private static QuotaCycleMetadata ReadQuotaCycleMetadataFromIndexRow(
+        SQLiteDataReader reader, QuotaCycleScope scope)
+    {
+        if (reader == null || scope == null) return null;
+        // Index-row ordinals: id,session,timestamp,path,offset then the six
+        // per-window fields followed by plan_type/rate_limit_id.
+        int usedOrdinal = string.Equals(scope.WindowKind, "Weekly", StringComparison.OrdinalIgnoreCase)
+            ? 8 : 5;
+        int windowOrdinal = string.Equals(scope.WindowKind, "Weekly", StringComparison.OrdinalIgnoreCase)
+            ? 9 : 6;
+        int resetOrdinal = string.Equals(scope.WindowKind, "Weekly", StringComparison.OrdinalIgnoreCase)
+            ? 10 : 7;
+        bool hasUsed = !reader.IsDBNull(usedOrdinal);
+        bool hasWindow = !reader.IsDBNull(windowOrdinal);
+        bool hasReset = !reader.IsDBNull(resetOrdinal);
+        string plan = ReadReaderString(reader, 11);
+        string limit = ReadReaderString(reader, 12);
+        var metadata = new QuotaCycleMetadata {
+            HasAny = hasUsed || hasWindow || hasReset ||
+                !string.IsNullOrWhiteSpace(plan) || !string.IsNullOrWhiteSpace(limit),
+            HasTargetWindowMetadata = hasUsed || hasWindow || hasReset,
+            PlanType = plan,
+            RateLimitId = limit
+        };
+        if (hasWindow && hasReset)
+        {
+            int window;
+            long reset;
+            if (TryConvertInt32(reader.GetValue(windowOrdinal), out window) &&
+                TryConvertInt64(reader.GetValue(resetOrdinal), out reset) &&
+                window > 0 && reset > 0L)
+            {
+                metadata.HasKnownCycle = true;
+                metadata.WindowMinutes = window;
+                metadata.ResetUnixSeconds = reset;
+            }
+        }
+        return metadata.HasAny ? metadata : null;
+    }
+
     private static long ResolveAggregateLongContextThreshold(string model, Dictionary<string, long> thresholds)
     {
         if (string.IsNullOrWhiteSpace(model) || thresholds == null) return 0L;
@@ -3696,15 +4323,14 @@ public static class TokenRaderIndexer
         AggregateCumulativeSnapshotIndex seenCumulativeSnapshots,
         Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
         Dictionary<string, string> parentBySession,
-        TokenRaderIntervalAggregateResult result)
+        TokenRaderIntervalAggregateResult result,
+        QuotaCycleScope quotaScope = null,
+        QuotaCycleMetadataIndex quotaMetadataIndex = null)
     {
         if (db == null || range == null || range.Start <= 0L || seenCumulativeSnapshots == null) return;
         using (var cmd = db.CreateCommand())
         {
-            cmd.CommandText =
-                "SELECT session_id,timestamp,model,total_input,total_cached,total_output,total_reasoning," +
-                "call_input,call_cached,call_output,call_reasoning,fingerprint,source_path,source_offset_end,root_session_id," +
-                "turn_id,request_id,response_id,identity_source,model_context_window,long_context_threshold,long_context_applied,long_context_source,cache_creation_tokens,cache_write_observable,service_tier,service_tier_source " +
+            cmd.CommandText = BuildAggregateRecordSelect(quotaScope != null) +
                 "FROM token_records WHERE source_path=@path AND source_offset_end<=@start " +
                 "ORDER BY source_offset_end DESC LIMIT 1";
             cmd.Parameters.AddWithValue("@path", range.Path);
@@ -3713,7 +4339,8 @@ public static class TokenRaderIndexer
             {
                 if (!reader.Read()) return;
                 SeedAggregateLineageFromReader(reader, seenCumulativeSnapshots,
-                    lineageGroups, parentBySession, result);
+                    lineageGroups, parentBySession, result, db,
+                    quotaScope, quotaMetadataIndex);
             }
         }
     }
@@ -3723,7 +4350,10 @@ public static class TokenRaderIndexer
         AggregateCumulativeSnapshotIndex seenCumulativeSnapshots,
         Dictionary<string, List<AggregateEventCandidate>> lineageGroups,
         Dictionary<string, string> parentBySession,
-        TokenRaderIntervalAggregateResult result)
+        TokenRaderIntervalAggregateResult result,
+        SQLiteConnection db = null,
+        QuotaCycleScope quotaScope = null,
+        QuotaCycleMetadataIndex quotaMetadataIndex = null)
     {
         if (reader == null) return;
         string sessionId = ReadReaderString(reader, 0);
@@ -3738,6 +4368,7 @@ public static class TokenRaderIndexer
         long callReasoning = ReadReaderInt64(reader, 10);
         string requestId = ReadReaderString(reader, 16);
         string responseId = ReadReaderString(reader, 17);
+        long rowId = quotaScope == null ? 0L : ReadReaderInt64(reader, 27);
         string serviceTier = NormalizeServiceTier(ReadReaderString(reader, 25));
         string serviceTierSource = NormalizeServiceTierSource(ReadReaderString(reader, 26), serviceTier);
         if (seenCumulativeSnapshots != null)
@@ -3757,6 +4388,8 @@ public static class TokenRaderIndexer
             totalInput, totalCached, totalOutput, totalReasoning,
             callInput, callCached, callOutput, callReasoning, fingerprint);
         var candidate = new AggregateEventCandidate {
+                Id = rowId,
+                SourceOffsetEnd = ReadReaderInt64(reader, 13),
                 SessionId = sessionId,
                 RootSessionId = rootSessionId,
                 SourcePath = ReadReaderString(reader, 12),
@@ -3780,8 +4413,12 @@ public static class TokenRaderIndexer
                 CallCached = callCached,
                 CallOutput = callOutput,
                 CallReasoning = callReasoning,
-                IncludeInResult = false
+                IncludeInResult = false,
+                QuotaMetadata = quotaScope == null ? null : ReadQuotaCycleMetadata(reader, quotaScope)
             };
+        if (quotaScope != null)
+            candidate.QuotaAttribution = ResolveQuotaCycleAttribution(
+                candidate, quotaScope, quotaMetadataIndex);
         AddAggregateLineageCandidate(lineageGroups, eventKey,
             candidate, parentBySession, result);
         seenCumulativeSnapshots.Register(BuildAggregateCumulativeKey(sessionId,
@@ -3905,7 +4542,7 @@ public static class TokenRaderIndexer
     /// above that value. Callers can then aggregate token calls over the exact
     /// (start, end] snapshot interval. No token rows are materialized here.
     /// </summary>
-    public static DataTable QueryQuotaCalibrationPairByOffsets(
+    private static TokenRaderQuotaCalibrationPairDiagnostics QueryQuotaCalibrationPairWithDiagnosticsInternal(
         SQLiteConnection db,
         IDictionary endOffsets,
         string windowKind,
@@ -3915,13 +4552,15 @@ public static class TokenRaderIndexer
         string rateLimitId,
         double currentUsedPercent,
         DateTimeOffset currentObservedAt,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool strictScope)
     {
         if (db == null) throw new ArgumentNullException("db");
         DataTable empty = CreateEmptyTokenRecordsTable(db);
+        var diagnostics = new TokenRaderQuotaCalibrationPairDiagnostics { Rows = empty };
         if (endOffsets == null || windowMinutes <= 0 || resetUnixSeconds <= 0L ||
             currentUsedPercent <= 0.0 || double.IsNaN(currentUsedPercent) ||
-            double.IsInfinity(currentUsedPercent)) return empty;
+            double.IsInfinity(currentUsedPercent)) return diagnostics;
 
         string usedColumn;
         string windowColumn;
@@ -3938,11 +4577,20 @@ public static class TokenRaderIndexer
             windowColumn = "weekly_window";
             resetColumn = "weekly_resets";
         }
-        else return empty;
+        else
+        {
+            diagnostics.ReasonCode = "invalid_scope";
+            return diagnostics;
+        }
 
         List<OffsetRange> ranges = ReadAggregateOffsetRanges(null, endOffsets);
-        if (ranges.Count == 0) return empty;
+        if (ranges.Count == 0)
+        {
+            diagnostics.ReasonCode = "missing_metadata";
+            return diagnostics;
+        }
         var candidates = new List<QuotaSnapshotCandidate>();
+        bool sawMetadataRows = false;
         const int chunkSize = 100;
         const double epsilon = 0.000000001;
         for (int offset = 0; offset < ranges.Count; offset += chunkSize)
@@ -3968,20 +4616,25 @@ public static class TokenRaderIndexer
                     "SELECT id,timestamp," + usedColumn + " FROM token_records WHERE (" + predicates + ") " +
                     "AND " + usedColumn + " IS NOT NULL AND " + windowColumn + "=@window " +
                     "AND " + resetColumn + ">=@reset_min AND " + resetColumn + "<=@reset_max " +
-                    "AND (@plan='' OR plan_type=@plan COLLATE NOCASE) " +
-                    "AND (@limit_id='' OR rate_limit_id=@limit_id COLLATE NOCASE)";
+                    "AND (@plan_wildcard=1 OR plan_type=@plan COLLATE NOCASE) " +
+                    "AND (@limit_wildcard=1 OR rate_limit_id=@limit_id COLLATE NOCASE)";
                 cmd.Parameters.AddWithValue("@window", windowMinutes);
                 long resetMinute = (long)Math.Floor(resetUnixSeconds / 60.0);
                 cmd.Parameters.AddWithValue("@reset_min", resetMinute * 60L);
                 cmd.Parameters.AddWithValue("@reset_max", resetMinute * 60L + 59L);
                 cmd.Parameters.AddWithValue("@plan", planType ?? "");
                 cmd.Parameters.AddWithValue("@limit_id", rateLimitId ?? "");
+                cmd.Parameters.AddWithValue("@plan_wildcard", strictScope ? 0 :
+                    (string.IsNullOrWhiteSpace(planType) ? 1 : 0));
+                cmd.Parameters.AddWithValue("@limit_wildcard", strictScope ? 0 :
+                    (string.IsNullOrWhiteSpace(rateLimitId) ? 1 : 0));
                 using (var reader = cmd.ExecuteReader())
                 {
                     int inspected = 0;
                     while (reader.Read())
                     {
                         if ((inspected++ & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
+                        sawMetadataRows = true;
                         DateTimeOffset observedAt;
                         double usedPercent;
                         if (!TryParseTimestamp(ReadReaderString(reader, 1), out observedAt) ||
@@ -3997,7 +4650,11 @@ public static class TokenRaderIndexer
                 }
             }
         }
-        if (candidates.Count < 2) return empty;
+        if (candidates.Count < 2)
+        {
+            diagnostics.ReasonCode = sawMetadataRows ? "no_pair" : "missing_metadata";
+            return diagnostics;
+        }
         candidates.Sort(delegate(QuotaSnapshotCandidate left, QuotaSnapshotCandidate right) {
             int comparison = DateTimeOffset.Compare(left.ObservedAt.ToUniversalTime(), right.ObservedAt.ToUniversalTime());
             return comparison != 0 ? comparison : left.Id.CompareTo(right.Id);
@@ -4016,7 +4673,11 @@ public static class TokenRaderIndexer
             if (used > runningMaximum) runningMaximum = used;
             monotonicCandidates.Add(candidates[i]);
         }
-        if (runningMaximum > currentUsedPercent + epsilon) return empty;
+        if (runningMaximum > currentUsedPercent + epsilon)
+        {
+            diagnostics.ReasonCode = "stale_snapshot";
+            return diagnostics;
+        }
         candidates = monotonicCandidates;
 
         double previousUsed = -1.0;
@@ -4025,7 +4686,11 @@ public static class TokenRaderIndexer
             double used = candidates[i].UsedPercent;
             if (used < currentUsedPercent - epsilon && used > previousUsed) previousUsed = used;
         }
-        if (previousUsed < -epsilon) return empty;
+        if (previousUsed < -epsilon)
+        {
+            diagnostics.ReasonCode = "no_pair";
+            return diagnostics;
+        }
 
         QuotaSnapshotCandidate start = null;
         QuotaSnapshotCandidate end = null;
@@ -4045,7 +4710,11 @@ public static class TokenRaderIndexer
                 break;
             }
         }
-        if (start == null || end == null || end.UsedPercent <= start.UsedPercent + epsilon) return empty;
+        if (start == null || end == null || end.UsedPercent <= start.UsedPercent + epsilon)
+        {
+            diagnostics.ReasonCode = "no_pair";
+            return diagnostics;
+        }
 
         using (var cmd = db.CreateCommand())
         {
@@ -4054,8 +4723,39 @@ public static class TokenRaderIndexer
             cmd.Parameters.AddWithValue("@end_id", end.Id);
             var result = new DataTable();
             using (var adapter = new SQLiteDataAdapter(cmd)) { adapter.Fill(result); }
-            return result.Rows.Count == 2 ? result : empty;
+            if (result.Rows.Count == 2)
+            {
+                diagnostics.Rows = result;
+                diagnostics.ReasonCode = "ok";
+            }
+            else diagnostics.ReasonCode = "no_pair";
+            return diagnostics;
         }
+    }
+
+    /// <summary>
+    /// Backwards-compatible selector returning only the historical DataTable.
+    /// Diagnostics are intentionally discarded for callers compiled against
+    /// the original API.
+    /// </summary>
+    public static DataTable QueryQuotaCalibrationPairByOffsets(
+        SQLiteConnection db,
+        IDictionary endOffsets,
+        string windowKind,
+        int windowMinutes,
+        long resetUnixSeconds,
+        string planType,
+        string rateLimitId,
+        double currentUsedPercent,
+        DateTimeOffset currentObservedAt,
+        CancellationToken cancellationToken)
+    {
+        TokenRaderQuotaCalibrationPairDiagnostics diagnostics =
+            QueryQuotaCalibrationPairWithDiagnosticsInternal(db, endOffsets, windowKind,
+                windowMinutes, resetUnixSeconds, planType, rateLimitId,
+                currentUsedPercent, currentObservedAt, cancellationToken, false);
+        return diagnostics == null || diagnostics.Rows == null
+            ? CreateEmptyTokenRecordsTable(db) : diagnostics.Rows;
     }
 
     /// <summary>
@@ -5075,6 +5775,16 @@ public static class TokenRaderIndexer
             return false;
         }
         return false;
+    }
+
+    private static bool TryConvertInt32(object raw, out int value)
+    {
+        value = 0;
+        long converted;
+        if (!TryConvertInt64(raw, out converted) || converted < int.MinValue ||
+            converted > int.MaxValue) return false;
+        value = (int)converted;
+        return true;
     }
 
     private static bool TryConvertDouble(object raw, out double value)
