@@ -1322,6 +1322,374 @@ function ConvertFrom-TokenRaderRateLimitCandidates {
     }
 }
 
+# Return a property from either the compact ScopeCandidates summary or the
+# raw candidate shape used by the indexer ({ Window = <rate window> }).  The
+# selector deliberately consumes only data already present on RateLimits; it
+# never re-reads a log or asks the indexer for another row.
+function Get-TokenRaderQuotaPlanCandidateProperty {
+    param(
+        $Candidate,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if ($null -eq $Candidate) { return $null }
+    $direct = $Candidate.PSObject.Properties[$Name]
+    if ($null -ne $direct) { return $direct.Value }
+    if ($null -ne $Candidate.PSObject.Properties['Window'] -and $null -ne $Candidate.Window) {
+        $windowProperty = $Candidate.Window.PSObject.Properties[$Name]
+        if ($null -ne $windowProperty) { return $windowProperty.Value }
+    }
+    if ($null -ne $Candidate.PSObject.Properties['Metadata'] -and $null -ne $Candidate.Metadata) {
+        $metadataProperty = $Candidate.Metadata.PSObject.Properties[$Name]
+        if ($null -ne $metadataProperty) { return $metadataProperty.Value }
+    }
+    return $null
+}
+
+function Get-TokenRaderQuotaPlanCandidateWindow {
+    param($Candidate)
+    if ($null -eq $Candidate) { return $null }
+    if ($null -ne $Candidate.PSObject.Properties['Window'] -and $null -ne $Candidate.Window) {
+        return $Candidate.Window
+    }
+    return $Candidate
+}
+
+function Get-TokenRaderQuotaPlanResetIdentity {
+    param($WindowOrCandidate)
+    $resetIdentity = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $WindowOrCandidate -Name 'ResetIdentity'
+    if (-not [string]::IsNullOrWhiteSpace([string]$resetIdentity)) { return [string]$resetIdentity }
+    $windowMinutes = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $WindowOrCandidate -Name 'WindowMinutes'
+    $resetsAt = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $WindowOrCandidate -Name 'ResetsAt'
+    if ($null -eq $windowMinutes -or $null -eq $resetsAt) { return '' }
+    try {
+        return Get-TokenRaderResetIdentity -WindowMinutes ([int]$windowMinutes) -ResetsAt ([DateTimeOffset]$resetsAt)
+    } catch {
+        return ''
+    }
+}
+
+function Copy-TokenRaderQuotaPlanObject {
+    param($Object)
+    if ($null -eq $Object) { return $null }
+    $copy = [ordered]@{}
+    foreach ($property in @($Object.PSObject.Properties)) {
+        # PSObject.Properties can expose adapted members on DataRow-like
+        # objects.  Selection only needs readable values; an inaccessible
+        # member must not make an otherwise valid snapshot unusable.
+        try { $copy[[string]$property.Name] = $property.Value } catch { }
+    }
+    return [pscustomobject]$copy
+}
+
+function Restore-TokenRaderQuotaPlanSelection {
+    param($RateLimits)
+    $copy = Copy-TokenRaderQuotaPlanObject -Object $RateLimits
+    $windowNames = @('FiveHour', 'Weekly')
+    $restoredWindows = @{}
+    $anyConflict = $false
+    $latestPlan = ''
+    [DateTimeOffset]$latestPlanAt = [DateTimeOffset]::MinValue
+    foreach ($windowKind in $windowNames) {
+        $property = $RateLimits.PSObject.Properties[$windowKind]
+        if ($null -eq $property -or $null -eq $property.Value) { $restoredWindows[$windowKind] = $null; continue }
+        $window = $property.Value
+        $candidateProperty = $window.PSObject.Properties['ScopeCandidates']
+        $scopeCandidates = if ($null -ne $candidateProperty) { @($candidateProperty.Value) } else { @() }
+        if ($scopeCandidates.Count -eq 0) { $restoredWindows[$windowKind] = $window; continue }
+        $baseMinutes = 0
+        try { $baseMinutes = [int]$window.WindowMinutes } catch { }
+        $baseReset = Get-TokenRaderQuotaPlanResetIdentity -WindowOrCandidate $window
+        $baseLimit = if ($null -ne $window.PSObject.Properties['LimitId']) { [string]$window.LimitId } else { '' }
+        $sameCycle = @(
+            foreach ($candidate in $scopeCandidates) {
+                if ($null -eq $candidate) { continue }
+                $kind = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'WindowKind'
+                if (-not [string]::IsNullOrWhiteSpace([string]$kind) -and -not [string]::Equals([string]$kind, $windowKind, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                $minutes = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'WindowMinutes'
+                if ($null -ne $minutes -and $baseMinutes -gt 0 -and [int]$minutes -ne $baseMinutes) { continue }
+                $reset = Get-TokenRaderQuotaPlanResetIdentity -WindowOrCandidate $candidate
+                if (-not [string]::IsNullOrWhiteSpace($baseReset) -and -not [string]::IsNullOrWhiteSpace($reset) -and
+                    -not [string]::Equals($baseReset, $reset, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                $limit = [string](Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'LimitId')
+                if (-not [string]::IsNullOrWhiteSpace($baseLimit) -and -not [string]::IsNullOrWhiteSpace($limit) -and
+                    -not [string]::Equals($baseLimit, $limit, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                $candidate
+            }
+        )
+        if ($sameCycle.Count -eq 0) { $restoredWindows[$windowKind] = $window; continue }
+        $plans = @($sameCycle | ForEach-Object { [string](Get-TokenRaderQuotaPlanCandidateProperty -Candidate $_ -Name 'PlanType') } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        $latest = $null
+        [DateTimeOffset]$latestAt = [DateTimeOffset]::MinValue
+        [Int64]$latestId = [Int64]::MinValue
+        foreach ($candidate in $sameCycle) {
+            [DateTimeOffset]$at = [DateTimeOffset]::MinValue
+            $value = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'ObservedAt'
+            if ($null -ne $value) { try { $at = [DateTimeOffset]$value } catch { } }
+            [Int64]$id = 0L
+            $value = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'RecordId'
+            if ($null -ne $value) { try { $id = [Int64]$value } catch { } }
+            if ($null -eq $latest -or $at -gt $latestAt -or ($at -eq $latestAt -and $id -gt $latestId)) {
+                $latest = $candidate; $latestAt = $at; $latestId = $id
+            }
+        }
+        $windowCopy = Copy-TokenRaderQuotaPlanObject -Object $window
+        foreach ($name in @('PlanType', 'UsedPercent', 'RemainingPercent', 'ObservedAt', 'LimitId', 'WindowMinutes', 'ResetsAt', 'ResetIdentity')) {
+            $value = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $latest -Name $name
+            if ($null -eq $value) { continue }
+            try { $windowCopy.$name = $value } catch { Add-Member -InputObject $windowCopy -NotePropertyName $name -NotePropertyValue $value -Force }
+        }
+        if ($null -ne $windowCopy.PSObject.Properties['UsedPercent']) {
+            Add-Member -InputObject $windowCopy -NotePropertyName RemainingPercent -NotePropertyValue (100.0 - [double]$windowCopy.UsedPercent) -Force
+        }
+        $conflict = $plans.Count -gt 1
+        $anyConflict = $anyConflict -or $conflict
+        if ($conflict) {
+            $details = New-Object System.Collections.ArrayList
+            foreach ($planName in @($plans)) {
+                $planCandidate = $null
+                foreach ($candidate in @($sameCycle)) {
+                    if ([string]::Equals([string](Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'PlanType'), [string]$planName, [StringComparison]::OrdinalIgnoreCase)) {
+                        $planCandidate = $candidate
+                        break
+                    }
+                }
+                if ($null -ne $planCandidate) {
+                    [void]$details.Add(('{0}={1:0.####}%' -f $planName, [double](Get-TokenRaderQuotaPlanCandidateProperty -Candidate $planCandidate -Name 'UsedPercent')))
+                }
+            }
+            $description = '额度周期存在冲突计划：' + (@($details) -join '; ')
+        } else { $description = '' }
+        Add-Member -InputObject $windowCopy -NotePropertyName ScopeConflict -NotePropertyValue ([bool]$conflict) -Force
+        Add-Member -InputObject $windowCopy -NotePropertyName ConflictPlans -NotePropertyValue @($plans) -Force
+        Add-Member -InputObject $windowCopy -NotePropertyName ConflictDescription -NotePropertyValue $description -Force
+        Add-Member -InputObject $windowCopy -NotePropertyName PlanSelectionApplied -NotePropertyValue $false -Force
+        Add-Member -InputObject $windowCopy -NotePropertyName ScopeConflictReason -NotePropertyValue '' -Force
+        $restoredWindows[$windowKind] = $windowCopy
+        $plan = [string](Get-TokenRaderQuotaPlanCandidateProperty -Candidate $latest -Name 'PlanType')
+        if ($latestAt -ge $latestPlanAt -and -not [string]::IsNullOrWhiteSpace($plan)) { $latestPlan = $plan; $latestPlanAt = $latestAt }
+    }
+    foreach ($windowKind in $windowNames) {
+        if ($null -ne $copy.PSObject.Properties[$windowKind]) { $copy.$windowKind = $restoredWindows[$windowKind] }
+    }
+    Add-Member -InputObject $copy -NotePropertyName ScopeConflict -NotePropertyValue ([bool]$anyConflict) -Force
+    Add-Member -InputObject $copy -NotePropertyName ScopeConflictReason -NotePropertyValue '' -Force
+    Add-Member -InputObject $copy -NotePropertyName PlanSelectionApplied -NotePropertyValue $false -Force
+    if (-not [string]::IsNullOrWhiteSpace($latestPlan)) { Add-Member -InputObject $copy -NotePropertyName PlanType -NotePropertyValue $latestPlan -Force }
+    return $copy
+}
+
+function Select-TokenRaderQuotaPlan {
+    <#
+    .SYNOPSIS
+        Select an explicitly confirmed plan from an already captured quota
+        snapshot without touching files, auth data, or the SQLite index.
+
+    .DESCRIPTION
+        ScopeCandidates are compact summaries of all plans in the selected
+        reset cycle.  A selected plan is valid only when a matching summary is
+        present in that same cycle.  The current/latest window is never used as
+        a fallback: doing so would turn a plan conflict into a guess.
+    #>
+    param(
+        $RateLimits,
+        [AllowEmptyString()][string]$PlanType = ''
+    )
+
+    if ($null -eq $RateLimits) { return $null }
+    $originalProperty = $RateLimits.PSObject.Properties['QuotaPlanOriginal']
+    $selectionSource = if ($null -ne $originalProperty -and $null -ne $originalProperty.Value) {
+        $originalProperty.Value
+    } else { $RateLimits }
+    $preferredPlan = $PlanType.Trim()
+    # An empty selection means automatic mode.  If this object came from a
+    # prior explicit selection, restore its immutable pre-selection snapshot so
+    # the UI can switch back to the original conflict view.
+    if ([string]::IsNullOrWhiteSpace($preferredPlan)) {
+        if ($null -ne $originalProperty -and $null -ne $originalProperty.Value) {
+            return Copy-TokenRaderQuotaPlanObject -Object $selectionSource
+        }
+        $hasCandidates = @('FiveHour', 'Weekly' | ForEach-Object {
+            $property = $RateLimits.PSObject.Properties[$_]
+            if ($null -ne $property -and $null -ne $property.Value -and $null -ne $property.Value.PSObject.Properties['ScopeCandidates']) { @($property.Value.ScopeCandidates).Count -gt 0 }
+        }) -contains $true
+        if ($hasCandidates) { return Restore-TokenRaderQuotaPlanSelection -RateLimits $RateLimits }
+        return $RateLimits
+    }
+
+    $rateLimitsCopy = Copy-TokenRaderQuotaPlanObject -Object $selectionSource
+    $selectedWindows = @{}
+    $windowSelectionApplied = @{}
+    $windowSelectionMissing = @{}
+    $windowNames = @('FiveHour', 'Weekly')
+    foreach ($windowKind in $windowNames) {
+        $windowProperty = $selectionSource.PSObject.Properties[$windowKind]
+        if ($null -eq $windowProperty -or $null -eq $windowProperty.Value) {
+            $selectedWindows[$windowKind] = $null
+            continue
+        }
+        $originalWindow = $windowProperty.Value
+        $windowCopy = Copy-TokenRaderQuotaPlanObject -Object $originalWindow
+        $candidateProperty = $originalWindow.PSObject.Properties['ScopeCandidates']
+        $scopeCandidates = if ($null -ne $candidateProperty) { @($candidateProperty.Value) } else { @() }
+
+        # Use only candidates in the same window/reset cycle and limit pool.
+        # ScopeCandidates already contains the winning current cycle in normal
+        # production results, but the explicit checks protect retries and
+        # synthetic/serialized results that also carry older candidates.
+        $baseMinutes = 0
+        try { $baseMinutes = [int]$originalWindow.WindowMinutes } catch { }
+        $baseResetIdentity = Get-TokenRaderQuotaPlanResetIdentity -WindowOrCandidate $originalWindow
+        $baseLimitId = if ($null -ne $originalWindow.PSObject.Properties['LimitId']) { [string]$originalWindow.LimitId } else { '' }
+        $matchingCandidates = @(foreach ($candidate in $scopeCandidates) {
+            if ($null -eq $candidate) { continue }
+            $candidateKind = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'WindowKind'
+            if (-not [string]::IsNullOrWhiteSpace([string]$candidateKind) -and
+                -not [string]::Equals([string]$candidateKind, $windowKind, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $candidatePlan = [string](Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'PlanType')
+            if (-not [string]::Equals($candidatePlan.Trim(), $preferredPlan, [StringComparison]::OrdinalIgnoreCase)) { continue }
+
+            $candidateMinutesValue = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'WindowMinutes'
+            if ($null -ne $candidateMinutesValue) {
+                try {
+                    if ($baseMinutes -gt 0 -and [int]$candidateMinutesValue -ne $baseMinutes) { continue }
+                } catch { continue }
+            }
+            $candidateResetIdentity = Get-TokenRaderQuotaPlanResetIdentity -WindowOrCandidate $candidate
+            if (-not [string]::IsNullOrWhiteSpace($baseResetIdentity) -and
+                -not [string]::IsNullOrWhiteSpace($candidateResetIdentity) -and
+                -not [string]::Equals($candidateResetIdentity, $baseResetIdentity, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $candidateLimitIdValue = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'LimitId'
+            $candidateLimitId = [string]$candidateLimitIdValue
+            if (-not [string]::IsNullOrWhiteSpace($baseLimitId) -and
+                -not [string]::IsNullOrWhiteSpace($candidateLimitId) -and
+                -not [string]::Equals($candidateLimitId, $baseLimitId, [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $candidate
+        })
+
+        $latestCandidate = $null
+        [DateTimeOffset]$latestObservedAt = [DateTimeOffset]::MinValue
+        [Int64]$latestRecordId = [Int64]::MinValue
+        foreach ($candidate in @($matchingCandidates)) {
+            [DateTimeOffset]$candidateObservedAt = [DateTimeOffset]::MinValue
+            $observedValue = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'ObservedAt'
+            if ($null -ne $observedValue) { try { $candidateObservedAt = [DateTimeOffset]$observedValue } catch { } }
+            [Int64]$candidateRecordId = 0L
+            $recordValue = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $candidate -Name 'RecordId'
+            if ($null -ne $recordValue) { try { $candidateRecordId = [Int64]$recordValue } catch { } }
+            if ($null -eq $latestCandidate -or $candidateObservedAt -gt $latestObservedAt -or
+                ($candidateObservedAt -eq $latestObservedAt -and $candidateRecordId -gt $latestRecordId)) {
+                $latestCandidate = $candidate
+                $latestObservedAt = $candidateObservedAt
+                $latestRecordId = $candidateRecordId
+            }
+        }
+
+        # Older, non-conflicting snapshots may not carry ScopeCandidates.  An
+        # explicit choice equal to that snapshot's own plan is safe when the
+        # snapshot has complete window metadata; a conflicting window without
+        # candidates must remain unavailable rather than guessing.
+        if ($null -eq $latestCandidate -and @($scopeCandidates).Count -eq 0 -and
+            ($null -eq $originalWindow.PSObject.Properties['ScopeConflict'] -or -not [bool]$originalWindow.ScopeConflict) -and
+            $null -ne $originalWindow.PSObject.Properties['PlanType'] -and
+            [string]::Equals(([string]$originalWindow.PlanType).Trim(), $preferredPlan, [StringComparison]::OrdinalIgnoreCase) -and
+            $null -ne $originalWindow.PSObject.Properties['UsedPercent'] -and
+            $null -ne $originalWindow.PSObject.Properties['ObservedAt'] -and
+            $null -ne $originalWindow.PSObject.Properties['WindowMinutes'] -and [int]$originalWindow.WindowMinutes -gt 0 -and
+            $null -ne $originalWindow.PSObject.Properties['ResetsAt'] -and $null -ne $originalWindow.ResetsAt) {
+            $latestCandidate = [pscustomobject]@{ Window = $originalWindow; WindowKind = $windowKind; RecordId = 0L }
+        }
+
+        if ($null -eq $latestCandidate) {
+            $windowSelectionMissing[$windowKind] = $true
+            $selectedWindows[$windowKind] = $windowCopy
+            continue
+        }
+
+        $candidateWindow = Get-TokenRaderQuotaPlanCandidateWindow -Candidate $latestCandidate
+        foreach ($name in @('PlanType', 'UsedPercent', 'RemainingPercent', 'ObservedAt', 'LimitId', 'WindowMinutes', 'ResetsAt', 'ResetIdentity')) {
+            $value = Get-TokenRaderQuotaPlanCandidateProperty -Candidate $latestCandidate -Name $name
+            if ($null -eq $value) { continue }
+            try { $windowCopy.$name = $value } catch { Add-Member -InputObject $windowCopy -NotePropertyName $name -NotePropertyValue $value -Force }
+        }
+        if ($null -ne $windowCopy.PSObject.Properties['UsedPercent']) {
+            # Remaining is derived from the selected endpoint, never retained
+            # from the previously displayed plan's percentage.
+            Add-Member -InputObject $windowCopy -NotePropertyName RemainingPercent -NotePropertyValue (100.0 - [double]$windowCopy.UsedPercent) -Force
+        }
+        if ($null -ne $windowCopy.PSObject.Properties['ResetsAt'] -and
+            ($null -eq $windowCopy.PSObject.Properties['ResetIdentity'] -or [string]::IsNullOrWhiteSpace([string]$windowCopy.ResetIdentity))) {
+            $minutes = if ($null -ne $windowCopy.PSObject.Properties['WindowMinutes']) { [int]$windowCopy.WindowMinutes } else { 0 }
+            Add-Member -InputObject $windowCopy -NotePropertyName ResetIdentity -NotePropertyValue (Get-TokenRaderResetIdentity -WindowMinutes $minutes -ResetsAt $windowCopy.ResetsAt) -Force
+        }
+        $windowSelectionApplied[$windowKind] = $true
+        $selectedWindows[$windowKind] = $windowCopy
+    }
+
+    foreach ($windowKind in $windowNames) {
+        $property = $rateLimitsCopy.PSObject.Properties[$windowKind]
+        if ($null -eq $property) {
+            Add-Member -InputObject $rateLimitsCopy -NotePropertyName $windowKind -NotePropertyValue $selectedWindows[$windowKind] -Force
+        } else {
+            $rateLimitsCopy.$windowKind = $selectedWindows[$windowKind]
+        }
+    }
+
+    $missingKinds = @($windowSelectionMissing.Keys)
+    $appliedKinds = @($windowSelectionApplied.Keys)
+    $hasMissing = $missingKinds.Count -gt 0
+    $hasSelectedWindow = $appliedKinds.Count -gt 0
+    if ($null -eq $rateLimitsCopy.PSObject.Properties['ScopeConflict']) {
+        Add-Member -InputObject $rateLimitsCopy -NotePropertyName ScopeConflict -NotePropertyValue ([bool]$hasMissing) -Force
+    }
+    else { $rateLimitsCopy.ScopeConflict = [bool]$hasMissing }
+    $selectionReason = if ($hasMissing) { 'selected_plan_missing' } else { '' }
+    if ($null -eq $rateLimitsCopy.PSObject.Properties['ScopeConflictReason']) {
+        Add-Member -InputObject $rateLimitsCopy -NotePropertyName ScopeConflictReason -NotePropertyValue $selectionReason -Force
+    } else { $rateLimitsCopy.ScopeConflictReason = $selectionReason }
+    if ($null -eq $rateLimitsCopy.PSObject.Properties['PlanSelectionApplied']) {
+        Add-Member -InputObject $rateLimitsCopy -NotePropertyName PlanSelectionApplied -NotePropertyValue ([bool]$hasSelectedWindow -and -not $hasMissing) -Force
+    } else { $rateLimitsCopy.PlanSelectionApplied = [bool]$hasSelectedWindow -and -not $hasMissing }
+    if ($hasSelectedWindow) {
+        if ($null -eq $rateLimitsCopy.PSObject.Properties['PlanType']) {
+            Add-Member -InputObject $rateLimitsCopy -NotePropertyName PlanType -NotePropertyValue $preferredPlan -Force
+        } else { $rateLimitsCopy.PlanType = $preferredPlan }
+    }
+    if ($hasMissing) {
+        if ($null -eq $rateLimitsCopy.PSObject.Properties['ConflictDescription']) {
+            Add-Member -InputObject $rateLimitsCopy -NotePropertyName ConflictDescription -NotePropertyValue ('已选择套餐“{0}”，但当前额度周期没有该套餐快照' -f $preferredPlan) -Force
+        } else { $rateLimitsCopy.ConflictDescription = '已选择套餐“{0}”，但当前额度周期没有该套餐快照' -f $preferredPlan }
+    }
+
+    foreach ($windowKind in $windowNames) {
+        $window = $selectedWindows[$windowKind]
+        if ($null -eq $window) { continue }
+        $windowMissing = $windowSelectionMissing.ContainsKey($windowKind)
+        $windowApplied = $windowSelectionApplied.ContainsKey($windowKind)
+        $windowConflict = [bool]$windowMissing
+        $windowReason = if ($windowMissing) { 'selected_plan_missing' } else { '' }
+        if ($null -eq $window.PSObject.Properties['ScopeConflict']) {
+            Add-Member -InputObject $window -NotePropertyName ScopeConflict -NotePropertyValue $windowConflict -Force
+        } else { $window.ScopeConflict = $windowConflict }
+        if ($null -eq $window.PSObject.Properties['ScopeConflictReason']) {
+            Add-Member -InputObject $window -NotePropertyName ScopeConflictReason -NotePropertyValue $windowReason -Force
+        } else { $window.ScopeConflictReason = $windowReason }
+        if ($null -eq $window.PSObject.Properties['PlanSelectionApplied']) {
+            Add-Member -InputObject $window -NotePropertyName PlanSelectionApplied -NotePropertyValue ([bool]$windowApplied -and -not $windowMissing) -Force
+        } else { $window.PlanSelectionApplied = [bool]$windowApplied -and -not $windowMissing }
+        if ($windowMissing) {
+            $message = '已选择套餐“{0}”，但当前{1}额度周期没有该套餐快照' -f $preferredPlan, $windowKind
+            if ($null -eq $window.PSObject.Properties['ConflictDescription']) { Add-Member -InputObject $window -NotePropertyName ConflictDescription -NotePropertyValue $message -Force } else { $window.ConflictDescription = $message }
+        } elseif ($windowApplied) {
+            if ($null -eq $window.PSObject.Properties['ConflictDescription']) { Add-Member -InputObject $window -NotePropertyName ConflictDescription -NotePropertyValue '' -Force } else { $window.ConflictDescription = '' }
+        }
+    }
+    if ($null -eq $rateLimitsCopy.PSObject.Properties['QuotaPlanOriginal']) {
+        Add-Member -InputObject $rateLimitsCopy -NotePropertyName QuotaPlanOriginal -NotePropertyValue (Copy-TokenRaderQuotaPlanObject -Object $selectionSource) -Force
+    }
+    return $rateLimitsCopy
+}
+
 function Get-TokenRaderUsageSnapshot {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -4567,18 +4935,31 @@ function Get-TokenRaderIndexedIntervalResult {
     $startRateLimits = if ($null -ne $Baseline.PSObject.Properties['StartRateLimits']) { $Baseline.StartRateLimits }
                        elseif ($null -ne $Baseline.PSObject.Properties['RateLimits']) { $Baseline.RateLimits }
                        else { $null }
+    # Plan selection is an explicit, in-memory quota overlay.  Apply it to
+    # both frozen endpoints before constructing quota evidence; the aggregate
+    # usage/cost above remains untouched.  Re-running with the same EndOffsets
+    # therefore reuses the same frozen candidate set deterministically.
+    $quotaStartRateLimits = $startRateLimits
+    $quotaEndRateLimits = $endRateLimits
+    $quotaPlanSelection = if ($null -ne $PricingDocument.PSObject.Properties['QuotaPlanSelection']) {
+        [string]$PricingDocument.QuotaPlanSelection
+    } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($quotaPlanSelection)) {
+        $quotaStartRateLimits = Select-TokenRaderQuotaPlan -RateLimits $startRateLimits -PlanType $quotaPlanSelection
+        $quotaEndRateLimits = Select-TokenRaderQuotaPlan -RateLimits $endRateLimits -PlanType $quotaPlanSelection
+    }
     $quotaEvidence = $null
     $quotaDiagnosticMaps = @{FiveHour=@{};Weekly=@{}}
     foreach ($kind in @('FiveHour','Weekly')) { Set-TokenRaderQuotaDiagnostic $quotaDiagnosticMaps[$kind] 'missing_window' '没有当前额度窗口' }
-    if ($ScanRateLimits -and $null -ne $endRateLimits) {
+    if ($ScanRateLimits -and $null -ne $quotaEndRateLimits) {
         $quotaAggregateCache = @{}
         $quotaEvidence = [pscustomobject]@{
             FiveHour = Get-TokenRaderQuotaWindowEvidence `
-                -StartWindow $(if ($null -ne $startRateLimits) { $startRateLimits.FiveHour } else { $null }) `
-                -EndWindow $endRateLimits.FiveHour `
+                -StartWindow $(if ($null -ne $quotaStartRateLimits) { $quotaStartRateLimits.FiveHour } else { $null }) `
+                -EndWindow $quotaEndRateLimits.FiveHour `
                 -MainLastCountedAt $aggregate.LastCountedAt `
                 -WindowKind 'FiveHour' `
-                -RateLimitId $(if ($null -ne $endRateLimits.PSObject.Properties['LimitId']) { [string]$endRateLimits.LimitId } else { '' }) `
+                -RateLimitId $(if ($null -ne $quotaEndRateLimits.PSObject.Properties['LimitId']) { [string]$quotaEndRateLimits.LimitId } else { '' }) `
                 -Connection $index.Connection `
                 -EndOffsets $ends `
                 -Thresholds $thresholds `
@@ -4587,11 +4968,11 @@ function Get-TokenRaderIndexedIntervalResult {
                 -ProgressState $ProgressState `
                 -Cache $quotaAggregateCache -DiagnosticState $quotaDiagnosticMaps.FiveHour -AccountIdentity $AccountIdentity -QuotaNotBefore $QuotaNotBefore
             Weekly = Get-TokenRaderQuotaWindowEvidence `
-                -StartWindow $(if ($null -ne $startRateLimits) { $startRateLimits.Weekly } else { $null }) `
-                -EndWindow $endRateLimits.Weekly `
+                -StartWindow $(if ($null -ne $quotaStartRateLimits) { $quotaStartRateLimits.Weekly } else { $null }) `
+                -EndWindow $quotaEndRateLimits.Weekly `
                 -MainLastCountedAt $aggregate.LastCountedAt `
                 -WindowKind 'Weekly' `
-                -RateLimitId $(if ($null -ne $endRateLimits.PSObject.Properties['LimitId']) { [string]$endRateLimits.LimitId } else { '' }) `
+                -RateLimitId $(if ($null -ne $quotaEndRateLimits.PSObject.Properties['LimitId']) { [string]$quotaEndRateLimits.LimitId } else { '' }) `
                 -Connection $index.Connection `
                 -EndOffsets $ends `
                 -Thresholds $thresholds `
@@ -4623,9 +5004,9 @@ function Get-TokenRaderIndexedIntervalResult {
         ManualServiceTierApplied = [bool]$priced.ManualServiceTierApplied
         QuotaEvidenceComplete = [bool]$priced.QuotaEvidenceComplete
         UnknownModels = @($priced.UnknownModels)
-        StartRateLimits = $startRateLimits
-        EndRateLimits = $endRateLimits
-        RateLimits = $endRateLimits
+        StartRateLimits = $quotaStartRateLimits
+        EndRateLimits = $quotaEndRateLimits
+        RateLimits = $quotaEndRateLimits
         QuotaEvidence = $quotaEvidence
         QuotaDiagnostics = [pscustomobject]@{FiveHour=[pscustomobject]$quotaDiagnosticMaps.FiveHour;Weekly=[pscustomobject]$quotaDiagnosticMaps.Weekly}
         AccountIdentity = $AccountIdentity
@@ -5105,4 +5486,4 @@ function Remove-TokenRaderUsageHistory {
 }
 
 Export-ModuleMember -Function ConvertTo-TokenRaderServiceTier, Resolve-TokenRaderServiceTierPrice
-Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderResetIdentity, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision, Get-TokenRaderUsageHistoryWindow, Remove-TokenRaderUsageHistory, Get-TokenRaderToolBackfillStatus, Invoke-TokenRaderToolBackfill
+Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderResetIdentity, Select-TokenRaderQuotaPlan, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision, Get-TokenRaderUsageHistoryWindow, Remove-TokenRaderUsageHistory, Get-TokenRaderToolBackfillStatus, Invoke-TokenRaderToolBackfill

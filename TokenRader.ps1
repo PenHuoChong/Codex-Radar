@@ -69,6 +69,7 @@ $script:State = @{
     Projects = @()
     ProjectCache = @{}
     ManualServiceTiers = @{}
+    QuotaPlanSelection = ''
 }
 
 $script:WindowClosing = $false
@@ -93,13 +94,15 @@ $script:IntervalComputeScript = {
         [hashtable]$ProgressState,
         [hashtable]$ManualServiceTiers = @{},
         [string]$AccountIdentity = '',
-        $QuotaNotBefore = $null
+        $QuotaNotBefore = $null,
+        [string]$QuotaPlanSelection = ''
     )
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
     $prices = Get-TokenRaderPrices -PricingPath $PricingPath
     $prices | Add-Member -NotePropertyName ManualServiceTiers -NotePropertyValue $ManualServiceTiers -Force
+    $prices | Add-Member -NotePropertyName QuotaPlanSelection -NotePropertyValue $QuotaPlanSelection -Force
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '同步增量日志'
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
@@ -279,7 +282,7 @@ $controlNames = @(
     'TotalMetricText', 'HitRateMetricText', 'HitRateProgress', 'UsdCostText', 'CostBreakdownText',
     'LongContextText', 'PricingVerifiedText', 'OpenPricingButton', 'InputPriceText', 'CachedPriceText',
     'OutputPriceText', 'FormulaText', 'PricingDataGrid', 'CaveatText', 'StatusText'
-    'IntervalStatusText', 'IntervalTimeText', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'MeasurementPricingButton', 'ExplorerButton'
+    'IntervalStatusText', 'IntervalTimeText', 'StartMeasureButton', 'StopMeasureButton', 'ViewIntervalButton', 'MeasurementPricingButton', 'ExplorerButton', 'QuotaPlanButton'
     'FiveHourUsageText', 'FiveHourProgress', 'FiveHourDollarText', 'FiveHourResetText',
     'WeeklyUsageText', 'WeeklyProgress', 'WeeklyDollarText', 'WeeklyResetText', 'QuotaEstimateHintText',
     'UsageHistoryRangeComboBox', 'UsageHistoryTokenText', 'UsageHistoryUsdText', 'UsageHistoryWindowText',
@@ -1334,6 +1337,9 @@ function Format-IntervalDuration {
 function Merge-LatestRateLimits {
     param($Candidate)
     if ($null -eq $Candidate) { return }
+    if ($script:State.ContainsKey('QuotaPlanSelection') -and -not [string]::IsNullOrWhiteSpace([string]$script:State.QuotaPlanSelection)) {
+        $Candidate = Select-TokenRaderQuotaPlan -RateLimits $Candidate -PlanType ([string]$script:State.QuotaPlanSelection)
+    }
     $current = $script:State.RateLimits
     if ($null -eq $current) {
         $script:State.RateLimits = $Candidate
@@ -1386,6 +1392,9 @@ function Merge-LatestRateLimits {
         PlanType = $planType
         FiveHour = $fiveHour
         Weekly = $weekly
+    }
+    if ($null -ne $Candidate.PSObject.Properties['QuotaPlanOriginal']) {
+        $script:State.RateLimits | Add-Member -NotePropertyName QuotaPlanOriginal -NotePropertyValue $Candidate.QuotaPlanOriginal -Force
     }
 }
 
@@ -1530,6 +1539,9 @@ function Set-QuotaWindowCard {
         if ($usingPreviousSnapshot) { $DollarText.Text += ' · 沿用最近有效快照，正在更新' }
         if ($null -ne $Estimate.PSObject.Properties['CalibrationEndObservedAt'] -and $null -ne $Estimate.CalibrationEndObservedAt) {
             $DollarText.Text += ' · 校准截至 {0:MM-dd HH:mm:ss}' -f ([DateTimeOffset]$Estimate.CalibrationEndObservedAt).ToLocalTime()
+        }
+        if ($null -ne $Window.PSObject.Properties['PlanSelectionApplied'] -and [bool]$Window.PlanSelectionApplied) {
+            $DollarText.Text += ' · 已确认套餐：' + [string]$Window.PlanType
         }
     } else {
         $DollarText.Text = '美金额度：不可估 · ' + (Get-TokenRaderQuotaDiagnosticMessage -Diagnostic $Diagnostic -Fallback '尚无有效估算结果')
@@ -2175,6 +2187,7 @@ function Start-TokenRaderIntervalComputeAsync {
             CancellationToken = $cancellationSource.Token
             ProgressState = $progressState
             ManualServiceTiers = (@{} + $script:State.ManualServiceTiers)
+            QuotaPlanSelection = if ($script:State.ContainsKey('QuotaPlanSelection')) { [string]$script:State.QuotaPlanSelection } else { '' }
             AccountIdentity = if ([string]::IsNullOrWhiteSpace($AccountIdentity)) { [string]$script:State.AccountIdentity } else { $AccountIdentity }
             QuotaNotBefore = if ($null -ne $QuotaNotBefore) { $QuotaNotBefore } else {
                 if ($script:State.ContainsKey('QuotaAccountEpochAt')) { $script:State.QuotaAccountEpochAt } else { $null }
@@ -2551,6 +2564,50 @@ function Stop-IntervalMeasurement {
         -Baseline $script:State.IntervalBaseline `
         -Generation $generation `
         -RequestId $requestId
+}
+
+function Set-TokenRaderQuotaPlanSelection {
+    param([AllowEmptyString()][string]$PlanType = '')
+    if ($script:State.IntervalComputing -or $script:State.UiState -in @('Starting','Stopping','ComputingFinal')) { return $false }
+    $plan=$PlanType.Trim().ToLowerInvariant()
+    $script:State.QuotaPlanSelection=$plan
+    $script:State.QuotaEstimates=$null
+    $script:State.QuotaEstimateAccountIdentity=''
+    $script:State.QuotaDiagnostics=$null
+    $script:State.IntervalCache=$null
+    $script:State.RateLimits=Select-TokenRaderQuotaPlan -RateLimits $script:State.RateLimits -PlanType $plan
+    $script:QuotaPlanButton.Content=if ($plan) { '当前套餐：'+$plan+'（已确认）…' } else { '当前套餐：自动识别…' }
+    $script:State.QuotaCalibrationMessage=if ($plan) { '按已确认套餐 '+$plan+' 更新额度；主测量累计保持不变。' } else { '已恢复自动识别额度来源。' }
+    Update-QuotaCards
+    if ($null -ne $script:State.IntervalBaseline) { Update-IntervalView -Manual }
+    return $true
+}
+
+function Show-TokenRaderQuotaPlanDialog {
+    if ($script:State.IntervalComputing -or $script:State.UiState -in @('Starting','Stopping','ComputingFinal')) {
+        $script:StatusText.Text='请等待本次结果计算完成后再确认套餐。'
+        return
+    }
+    $dialog=New-Object Windows.Window
+    $dialog.Title='确认当前套餐（升级后）';$dialog.Owner=$script:Window
+    $dialog.Width=460;$dialog.SizeToContent='Height';$dialog.WindowStartupLocation='CenterOwner';$dialog.ResizeMode='NoResize'
+    $panel=New-Object Windows.Controls.StackPanel;$panel.Margin='20';$dialog.Content=$panel
+    $help=New-Object Windows.Controls.TextBlock;$help.TextWrapping='Wrap';$help.Text='请选择你当前实际使用的套餐日志标识。升级后旧进程可能继续写旧套餐快照；本选择只筛选额度来源，不改主测量消耗，也不证明账号身份。选择仅在本次程序运行中保留，账号标签变化时清除。';$help.Margin='0,0,0,12';[void]$panel.Children.Add($help)
+    $combo=New-Object Windows.Controls.ComboBox;$combo.MinWidth=300;$combo.Margin='0,0,0,12'
+    $auto=New-Object Windows.Controls.ComboBoxItem;$auto.Content='自动识别（冲突时不猜测）';$auto.Tag='';[void]$combo.Items.Add($auto);$combo.SelectedItem=$auto
+    $plans=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach($kind in @('FiveHour','Weekly')) {
+        if($null-eq$script:State.RateLimits){continue};$window=$script:State.RateLimits.$kind
+        if($null-eq$window){continue}
+        if($window.PlanType){[void]$plans.Add([string]$window.PlanType)}
+        if($null-ne$window.PSObject.Properties['ScopeCandidates']) {foreach($candidate in @($window.ScopeCandidates)){if($candidate.PlanType){[void]$plans.Add([string]$candidate.PlanType)}}}
+    }
+    if($script:State.QuotaPlanSelection){[void]$plans.Add([string]$script:State.QuotaPlanSelection)}
+    foreach($plan in @($plans|Sort-Object)) {$item=New-Object Windows.Controls.ComboBoxItem;$item.Content=$plan;$item.Tag=$plan;[void]$combo.Items.Add($item);if($plan-eq$script:State.QuotaPlanSelection){$combo.SelectedItem=$item}}
+    [void]$panel.Children.Add($combo)
+    $ok=New-Object Windows.Controls.Button;$ok.Content='确认并更新额度';$ok.Padding='12,7';$ok.IsDefault=$true
+    $ok.Add_Click({$dialog.DialogResult=$true});[void]$panel.Children.Add($ok)
+    if($dialog.ShowDialog()-eq$true){[void](Set-TokenRaderQuotaPlanSelection -PlanType ([string]$combo.SelectedItem.Tag))}
 }
 
 function Reset-MeasurementPricingConfirmation {
@@ -2933,13 +2990,16 @@ function Refresh-Application {
         $account = Get-TokenRaderAccount -CodexRoot $script:Paths.CodexRoot
         $previousAccountIdentity = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
         $newAccountIdentity = [string]$account.AccountId
-        if ((-not [string]::IsNullOrWhiteSpace($previousAccountIdentity) -or $null -ne $script:State.QuotaEstimates) -and
+        if ((-not [string]::IsNullOrWhiteSpace($previousAccountIdentity) -or $null -ne $script:State.QuotaEstimates -or
+                ($script:State.ContainsKey('QuotaPlanSelection') -and -not [string]::IsNullOrWhiteSpace([string]$script:State.QuotaPlanSelection))) -and
             -not [string]::Equals($previousAccountIdentity, $newAccountIdentity, [StringComparison]::Ordinal)) {
             # The account label is already available from this normal refresh.
             # Mark the switch as a quota attribution boundary and discard only
             # old-account quota state; the measurement/token view itself may
             # continue while a worker gathers post-switch evidence.
             $script:State.QuotaAccountEpochAt = [DateTimeOffset]::Now
+            $script:State.QuotaPlanSelection = ''
+            $script:QuotaPlanButton.Content = '当前套餐：自动识别…'
             $script:State.RateLimits = $null
             $script:State.QuotaEstimates = $null
             $script:State.QuotaEstimateAccountIdentity = ''
@@ -3092,6 +3152,7 @@ $script:ScopeComboBox.Add_SelectionChanged({
 })
 $script:StartMeasureButton.Add_Click({ Start-IntervalMeasurement })
 $script:MeasurementPricingButton.Add_Click({ Show-MeasurementPricingDialog })
+$script:QuotaPlanButton.Add_Click({ Show-TokenRaderQuotaPlanDialog })
 $script:ExplorerButton.Add_Click({ Show-TokenRaderExplorer })
 $script:StopMeasureButton.Add_Click({ Stop-IntervalMeasurement })
 $script:ViewIntervalButton.Add_Click({

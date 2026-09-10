@@ -241,6 +241,8 @@
                         <Button x:Name="MeasurementPricingButton" Content="本次计价模式…" IsEnabled="False" Margin="0,7,0,0" Padding="7,5" FontSize="11"
                                 ToolTip="仅为本次测量中日志未明确记录的模式提供人工确认；不会修改日志或周期历史。"/>
                         <Button x:Name="ExplorerButton" Content="项目 / 对话用量…" Margin="0,7,0,0" Padding="7,5" FontSize="11"/>
+                        <Button x:Name="QuotaPlanButton" Content="当前套餐：自动识别…" Margin="0,7,0,0" Padding="7,5" FontSize="11"
+                                ToolTip="升级套餐后，确认当前日志计划；只影响额度快照和校准，不改变主测量Token与美元。"/>
                     </StackPanel>
                 </Border>
 
