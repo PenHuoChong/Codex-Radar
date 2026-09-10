@@ -47,7 +47,7 @@ Token Rader 在本机解析这些日志，不要求 API Key，也不会上传提
 | 图形框架 | WPF（`PresentationFramework`、`PresentationCore`、`WindowsBase`） |
 | 构建启动器 | Windows 自带的 .NET Framework C# 编译器；只有重新构建 EXE 时需要 |
 | Git | 仅克隆仓库时需要 |
-| Python/Node.js | 不需要 |
+| Python/Node.js | 运行程序不需要；开发者完整回归中的跨项目对照测试需要 Node.js 22+ |
 | OpenAI API Key | 不需要 |
 
 启动器优先使用 PATH 中的 `powershell.exe`，不可用时尝试 `pwsh.exe`。Codex 数据目录优先读取环境变量 `CODEX_HOME`，否则使用当前用户的 `~/.codex`。
@@ -243,6 +243,8 @@ SQLite 保存轻量文件游标；只把变化文件的新增完整 JSONL 行写
 ## 如何复现实验结果
 
 ### 1. 运行确定性回归测试
+
+完整回归包含 `tests/Run-UsageCompatibilityTests.ps1`，使用同一组合成记录对照 TokenTracker 的离线用量解析辅助函数。需预先安装 Node.js 22+；CI 自动配置。测试不安装或启动 TokenTracker，不联网查询额度，也不读取认证文件或真实日志。该对照只验证所选解析算法，不代表两套应用所有统计路径都已通过端到端验证。
 
 在已经克隆的项目目录中运行：
 
@@ -471,6 +473,16 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 
 金额是按日志服务模式折算的 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单，也不能用来推断一个官方固定的 Pro 周美元池。Pro 5x 的百分比不需要再乘 5。对价格表中明确配置长上下文规则的模型，单次 `input_tokens > 272,000` 时整次请求按输入 2×、输出 1.5×计价；`contextWindow` 保存各模型官方最大上下文窗口（当前为 400,000 或 1,050,000），不会让所有请求自动套用长上下文价格。当前实现将 JSONL 中可观察到的缓存写入 token 按未缓存输入价格的 1.25 倍计价（GPT-5.6 官方规则采用该倍率）；若 JSONL 提供 `cache_creation_tokens`/`cache_write_tokens`，程序会从普通未缓存输入中扣出并单独计入该项，否则将结果标记为仅可观察 Token，绝不猜测缓存写入量。估算仍不包含工具调用费、图片生成、其他共享客户端消耗、区域处理加价和 Batch/Flex 等未收录服务价格，这些不可观测消耗会使本地结果低于实际账单。
 
+### 日志用量字段兼容与交叉验证
+
+- 缓存写入兼容 `cache_creation_tokens`、`cache_write_tokens`、`cache_creation_input_tokens`、`cache_write_input_tokens`。按此顺序选择第一个有效字段，零值有效；别名不相加。沿用本项目输入包含缓存写入的口径，将该部分从普通未缓存输入中扣出后单独计价。
+- 缺少累计用量但有单次用量时，保留可观察的单次调用；不能仅凭相同Token数量把不同调用合并。
+- 缺少单次用量时，需要此前累计基线才能恢复差额。首次只有累计值的记录仅建立基线，不把整段历史归到该时刻的一次请求。
+- 累计值下降或中途出现缺累计的单次记录时，重新建立可信基线；不跨不确定间隙相减。因此该间隙仍可能存在无法恢复的用量，不应将回退结果理解为完整账单。重复补充记录有相同请求标识时只保留一次。
+- 累计差额不是已验证的单次请求输入；差额超过模型长上下文阈值时，保留Token但不猜测该部分价格，以不完整计价处理。不会将多条短请求的累计差额直接套用长上下文倍率。
+- 交叉测试使用合成数据与 TokenTracker 的用量辅助算法对照。原项目对首次累计值和缓存写入口径的行为可能不同；测试明确区分预期差异与兼容性错误，不以强制美元数值相同作为准确性的证明。
+- 本轮不会自动重新读取旧日志、清理或重建现有索引；此前已跳过的历史记录不会仅因更新程序就自动补回。
+
 ### 快速模式与普通模式
 
 日志中的 `service_tier=fast` / `priority` 统一识别为快速模式，`default` / `standard` 识别为普通模式。调用记录提供的实际 response 模式优先于请求设置，其次使用该调用所属 `turn_context` 的模式。新 turn 未提供模式或显式写入 `null` 时清空旧模式；单次调用的覆盖值不会改变后续调用的 turn 设置。
@@ -505,6 +517,8 @@ Codex-Limit-USD-Radar/
 │  ├─ Run-Tests.ps1                 # 回归测试与可选 Live 检查
 │  ├─ Run-AggregatePerformanceTests.ps1 # 编译态聚合语义与大批量性能测试
 │  ├─ Run-ServiceTierTests.ps1       # Fast/普通模式计价与模式边界回归
+│  ├─ Run-UsageCompatibilityTests.ps1 # 缺字段、缓存别名与跨项目合成对照
+│  ├─ fixtures/                    # 离线 TokenTracker 测试辅助代码及 MIT 许可证
 │  ├─ Run-UiCallbackTests.ps1        # 后台回调、超时与取消测试
 │  └─ Render-Preview.ps1             # 合成预览图生成
 ├─ Build.ps1                         # 构建 TokenRader.exe

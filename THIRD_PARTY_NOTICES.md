@@ -1,5 +1,14 @@
 # Third-party notices
 
+## xiufengsun/TokenTracker
+
+- Project: https://github.com/xiufengsun/TokenTracker
+- Vendored test helper: `tests/fixtures/TokenTracker-codex-token-usage.js`
+- License: MIT, copyright (c) 2026 xiufengsun
+- Full license: `tests/fixtures/TokenTracker-LICENSE.txt`
+
+The helper is pinned to the upstream revision identified in its file header and used only for offline synthetic compatibility tests. It is not loaded by the desktop application. TokenTracker's authentication, networking, installation hooks, and full application are not included or executed.
+
 ## LH-03/codex-token-hud
 
 - Project: https://github.com/LH-03/codex-token-hud

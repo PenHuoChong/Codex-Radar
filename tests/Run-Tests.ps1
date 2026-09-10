@@ -1917,6 +1917,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-ModelBackfillTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ServiceTierTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IndexEvidenceTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-UsageCompatibilityTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaEvidenceFixTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaCycleTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-MeasurementPricingUiTests.ps1')

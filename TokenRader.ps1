@@ -2832,12 +2832,16 @@ function Update-UsageView {
     }
 
     $cost = Get-TokenRaderCost -Usage $usage -Model ([string]$snapshot.Model) -PricingDocument $script:Prices -Scope $scope `
+        -RequestInputObservable $(if ($null -ne $snapshot.PSObject.Properties['CallDerived']) { -not [bool]$snapshot.CallDerived } else { $true }) `
         -ModelContextWindow ([Int64]$(if ($null -ne $snapshot.PSObject.Properties['ModelContextWindow']) { $snapshot.ModelContextWindow } else { 0 })) `
         -CacheCreationTokens ([Int64]$(if ($null -ne $snapshot.PSObject.Properties['CacheCreationTokens']) { $snapshot.CacheCreationTokens } else { 0 })) `
         -CacheWriteObservable $(if ($null -ne $snapshot.PSObject.Properties['CacheWriteObservable']) { [bool]$snapshot.CacheWriteObservable } else { $false }) -ServiceTier ([string]$snapshot.ServiceTier)
     if (-not $cost.Known) {
         $script:UsdCostText.Text = '无法估算'
         $script:CostBreakdownText.Text = '该模型或服务模式没有匹配到公开 API 价格'
+        if ($cost.PricingReason -eq 'missing_request_input') {
+            $script:CostBreakdownText.Text = '缺少单次输入证据，无法确定长上下文价格'
+        }
         $script:LongContextText.Text = '价格未知，不按 $0 处理'
         $script:InputPriceText.Text = '未公布'
         $script:CachedPriceText.Text = '未公布'

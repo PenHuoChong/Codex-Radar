@@ -23,7 +23,9 @@ internal sealed class TokenRaderJsonUsage
     [DataMember(Name = "cache_read_tokens", EmitDefaultValue = false)] public object CacheReadTokens { get; set; }
     [DataMember(Name = "cached_tokens", EmitDefaultValue = false)] public object CachedTokens { get; set; }
     [DataMember(Name = "cache_creation_tokens", EmitDefaultValue = false)] public object CacheCreationTokens { get; set; }
+    [DataMember(Name = "cache_creation_input_tokens", EmitDefaultValue = false)] public object CacheCreationInputTokens { get; set; }
     [DataMember(Name = "cache_write_tokens", EmitDefaultValue = false)] public object CacheWriteTokens { get; set; }
+    [DataMember(Name = "cache_write_input_tokens", EmitDefaultValue = false)] public object CacheWriteInputTokens { get; set; }
 }
 
 [DataContract]
@@ -121,6 +123,13 @@ public sealed class TokenRaderIntervalAggregateBucket
     public long ModelContextWindow { get; set; }
     public long LongContextThreshold { get; set; }
     public string LongContextSource { get; set; }
+    /// <summary>
+    /// True when the bucket's input amount is tied to an observed request
+    /// boundary. A total-only delta can span multiple calls, so it remains
+    /// billable token evidence but is marked false for long-context pricing.
+    /// </summary>
+    public bool RequestInputObservable { get; set; }
+    public bool LongContextPricingUncertain { get; set; }
     public bool CacheWriteObservable { get; set; }
 
     public TokenRaderIntervalAggregateBucket()
@@ -129,6 +138,7 @@ public sealed class TokenRaderIntervalAggregateBucket
         ServiceTier = "";
         ServiceTierSource = "";
         LongContextSource = "";
+        RequestInputObservable = true;
     }
 }
 
@@ -1740,6 +1750,56 @@ public static class TokenRaderIndexer
         return ImportFile(db, filePath, startOffset, endOffset, rootSessionId, parentSessionId, (long?)indexRevision);
     }
 
+    /// <summary>
+    /// Returns the latest trustworthy cumulative usage for an incremental
+    /// session import. If the latest row has no total usage, its stored zero
+    /// totals are only a placeholder for independently observable last-call
+    /// usage; the baseline is invalidated until a new total is observed.
+    /// </summary>
+    private static bool TryGetLatestSessionCumulativeBaseline(
+        SQLiteConnection db,
+        string sessionId,
+        string sourcePath,
+        long sourceOffsetEnd,
+        out long totalInput,
+        out long totalCached,
+        out long totalOutput,
+        out long totalReasoning)
+    {
+        totalInput = 0L;
+        totalCached = 0L;
+        totalOutput = 0L;
+        totalReasoning = 0L;
+        if (db == null || string.IsNullOrWhiteSpace(sessionId) ||
+            string.IsNullOrWhiteSpace(sourcePath) || sourceOffsetEnd <= 0L) return false;
+
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText =
+                "SELECT total_input,total_cached,total_output,total_reasoning,identity_source " +
+                "FROM token_records WHERE session_id=@session AND source_path=@path " +
+                "AND source_offset_end>0 AND source_offset_end<=@offset " +
+                "ORDER BY source_offset_end DESC,id DESC LIMIT 1";
+            cmd.Parameters.AddWithValue("@session", sessionId);
+            cmd.Parameters.AddWithValue("@path", sourcePath);
+            cmd.Parameters.AddWithValue("@offset", sourceOffsetEnd);
+            using (var reader = cmd.ExecuteReader())
+            {
+                if (!reader.Read()) return false;
+                // A last-only row is billable on its own but does not prove
+                // where the cumulative stream ended. Do not let a later
+                // total-only delta charge that same call a second time.
+                if (IsMissingTotalIdentitySource(ReadReaderString(reader, 4)))
+                    return false;
+                totalInput = ReadReaderInt64(reader, 0);
+                totalCached = ReadReaderInt64(reader, 1);
+                totalOutput = ReadReaderInt64(reader, 2);
+                totalReasoning = ReadReaderInt64(reader, 3);
+                return true;
+            }
+        }
+    }
+
     private static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset,
         string rootSessionId, string parentSessionId, long? explicitIndexRevision)
     {
@@ -1828,6 +1888,14 @@ public static class TokenRaderIndexer
             inheritedTurnId = "";
             inheritedReasoningEffort = "";
         }
+        long previousTotalInput = 0L;
+        long previousTotalCached = 0L;
+        long previousTotalOutput = 0L;
+        long previousTotalReasoning = 0L;
+        bool hasPreviousTotal = startOffset > 0L &&
+            TryGetLatestSessionCumulativeBaseline(db, sessionId, sourcePath, startOffset,
+                out previousTotalInput, out previousTotalCached,
+                out previousTotalOutput, out previousTotalReasoning);
         bool insertedUnresolvedModel = false;
 
         using (var tx = db.BeginTransaction())
@@ -1859,6 +1927,11 @@ public static class TokenRaderIndexer
                 string currentServiceTier = inheritedServiceTier;
                 string currentServiceTierSource = inheritedServiceTierSource;
                 string currentReasoningEffort = inheritedReasoningEffort;
+                long currentPreviousTotalInput = previousTotalInput;
+                long currentPreviousTotalCached = previousTotalCached;
+                long currentPreviousTotalOutput = previousTotalOutput;
+                long currentPreviousTotalReasoning = previousTotalReasoning;
+                bool currentHasPreviousTotal = hasPreviousTotal;
 
                 bool skipPartialLine = false;
                 if (safeStart > 0L)
@@ -2003,20 +2076,59 @@ public static class TokenRaderIndexer
                             if (info == null) continue;
                             var total = info.TotalTokenUsage;
                             var last = info.LastTokenUsage;
-                            if (total == null || last == null) continue;
+                            bool hasTotalUsage = HasAnyUsageValue(total);
+                            bool hasLastUsage = HasAnyUsageValue(last);
+                            if (!hasTotalUsage && !hasLastUsage) continue;
 
-                            long totalInput = GetInt64Value(total.InputTokens);
-                            long totalCached = GetCachedTokenValue(total);
-                            long totalOutput = GetInt64Value(total.OutputTokens);
-                            long totalReasoning = GetInt64Value(total.ReasoningOutputTokens);
-                            long callInput = GetInt64Value(last.InputTokens);
-                            long callCached = GetCachedTokenValue(last);
-                            long callOutput = GetInt64Value(last.OutputTokens);
-                            long callReasoning = GetInt64Value(last.ReasoningOutputTokens);
+                            // A missing total is represented by zero in the
+                            // legacy schema, but its provenance is retained in
+                            // identity_source below.  Never turn a last-only
+                            // event into a made-up cumulative total: the last
+                            // call is independently observable, while its
+                            // parent/child identity must remain incomplete.
+                            long totalInput = hasTotalUsage ? GetInt64Value(total.InputTokens) : 0L;
+                            long totalCached = hasTotalUsage ? GetCachedTokenValue(total) : 0L;
+                            long totalOutput = hasTotalUsage ? GetInt64Value(total.OutputTokens) : 0L;
+                            long totalReasoning = hasTotalUsage ? GetInt64Value(total.ReasoningOutputTokens) : 0L;
+                            long callInput = hasLastUsage ? GetInt64Value(last.InputTokens) : 0L;
+                            long callCached = hasLastUsage ? GetCachedTokenValue(last) : 0L;
+                            long callOutput = hasLastUsage ? GetInt64Value(last.OutputTokens) : 0L;
+                            long callReasoning = hasLastUsage ? GetInt64Value(last.ReasoningOutputTokens) : 0L;
+                            bool callDerivedFromTotal = false;
+                            bool resetDetected = false;
+                            if (hasTotalUsage && !hasLastUsage && currentHasPreviousTotal)
+                            {
+                                resetDetected = totalInput < currentPreviousTotalInput ||
+                                    totalCached < currentPreviousTotalCached ||
+                                    totalOutput < currentPreviousTotalOutput ||
+                                    totalReasoning < currentPreviousTotalReasoning;
+                                if (!resetDetected)
+                                {
+                                    callInput = totalInput - currentPreviousTotalInput;
+                                    callCached = totalCached - currentPreviousTotalCached;
+                                    callOutput = totalOutput - currentPreviousTotalOutput;
+                                    callReasoning = totalReasoning - currentPreviousTotalReasoning;
+                                    callDerivedFromTotal = callInput > 0L || callOutput > 0L ||
+                                        callReasoning > 0L;
+                                }
+                                else
+                                {
+                                    // A reset starts a new cumulative stream,
+                                    // but the first post-reset total can still
+                                    // include history from that stream. Keep it
+                                    // as a baseline-only row until a later
+                                    // total supplies an attributable delta.
+                                    callInput = 0L;
+                                    callCached = 0L;
+                                    callOutput = 0L;
+                                    callReasoning = 0L;
+                                }
+                            }
                             long modelContextWindow = GetInt64Value(info.ModelContextWindow);
-                            long cacheCreationTokens = GetInt64Value(last.CacheCreationTokens);
-                            if (cacheCreationTokens <= 0L) cacheCreationTokens = GetInt64Value(last.CacheWriteTokens);
-                            bool cacheWriteObservable = last.CacheCreationTokens != null || last.CacheWriteTokens != null;
+                            long cacheCreationTokens;
+                            bool cacheWriteObservable;
+                            GetCacheCreationTokenValue(last, out cacheCreationTokens,
+                                out cacheWriteObservable);
                             if (totalCached > totalInput) totalCached = totalInput;
                             if (callCached > callInput) callCached = callInput;
 
@@ -2030,6 +2142,13 @@ public static class TokenRaderIndexer
                             string fingerprint = string.Format("{0}:{1}:{2}:{3}:{4}:{5}:{6}:{7}",
                                 totalInput, totalCached, totalOutput, totalReasoning,
                                 callInput, callCached, callOutput, callReasoning);
+                            if (!hasTotalUsage)
+                            {
+                                // Keep the persisted diagnostic fingerprint
+                                // visibly non-cumulative; aggregate lineage
+                                // uses the explicit fallback identity below.
+                                fingerprint = "missing_total|" + fingerprint;
+                            }
 
                             double? fiveHourUsed = null; int? fiveHourWindow = null; long? fiveHourResets = null;
                             double? weeklyUsed = null; int? weeklyWindow = null; long? weeklyResets = null;
@@ -2055,6 +2174,11 @@ public static class TokenRaderIndexer
                             else if (callInput <= 0L) longContextSource = "missing_input";
                             else if (string.IsNullOrWhiteSpace(currentModel)) longContextSource = "unknown_model";
                             else longContextSource = "no_threshold";
+                            if (callDerivedFromTotal)
+                            {
+                                longContextSource = "missing_input";
+                                longContextApplied = false;
+                            }
                             var rateLimits = payload.RateLimits;
                             if (rateLimits != null)
                             {
@@ -2116,6 +2240,30 @@ public static class TokenRaderIndexer
                             string identitySource = !string.IsNullOrWhiteSpace(requestId) ? "request_id" :
                                 (!string.IsNullOrWhiteSpace(responseId) ? "response_id" :
                                 (!string.IsNullOrWhiteSpace(currentTurnId) ? "turn_id" : "unresolved"));
+                            if (!hasTotalUsage)
+                            {
+                                // Preserve the normal request/response fields
+                                // for lineage matching, but make the fallback
+                                // provenance explicit. Without a strong id,
+                                // the source offset keeps two genuinely
+                                // identical last-only calls in one session
+                                // distinct; it is never presented as a real
+                                // request id.
+                                identitySource = "missing_total";
+                                if (string.IsNullOrWhiteSpace(requestId) &&
+                                    string.IsNullOrWhiteSpace(responseId))
+                                    identitySource += ":" + lineEndOffset.ToString(
+                                        CultureInfo.InvariantCulture);
+                            }
+                            else if (callDerivedFromTotal)
+                            {
+                                // The delta is useful token evidence, but it
+                                // may combine several calls. Keep request and
+                                // response fields intact while exposing that
+                                // the per-call boundary (and therefore any
+                                // long-context classification) is unknown.
+                                identitySource = "missing_last";
+                            }
 
                             p[0].Value = sessionId; p[1].Value = Convert.ToString(record.Timestamp, CultureInfo.InvariantCulture) ?? ""; p[2].Value = currentModel;
                             p[3].Value = totalInput; p[4].Value = totalCached; p[5].Value = totalOutput; p[6].Value = totalReasoning;
@@ -2160,6 +2308,26 @@ public static class TokenRaderIndexer
                             p[50].Value = cacheCreationTokens;
                             p[51].Value = cacheWriteObservable ? 1 : 0;
                             cmd.ExecuteNonQuery();
+                            if (hasTotalUsage)
+                            {
+                                // Only a real cumulative snapshot advances
+                                // the persisted delta baseline. Last-only rows
+                                // remain independently billable but cannot be
+                                // used to manufacture a cumulative identity.
+                                currentPreviousTotalInput = totalInput;
+                                currentPreviousTotalCached = totalCached;
+                                currentPreviousTotalOutput = totalOutput;
+                                currentPreviousTotalReasoning = totalReasoning;
+                                currentHasPreviousTotal = true;
+                            }
+                            else if (hasLastUsage)
+                            {
+                                // The next trusted cumulative snapshot must be
+                                // treated as a new baseline. Carrying the old
+                                // total across this row would include the
+                                // already-counted last-only call in its delta.
+                                currentHasPreviousTotal = false;
+                            }
                             if (string.IsNullOrWhiteSpace(currentModel)) insertedUnresolvedModel = true;
                             count++;
                         }
@@ -2997,7 +3165,7 @@ public static class TokenRaderIndexer
 
                         string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
                             totalInput, totalCached, totalOutput, totalReasoning,
-                            requestId, responseId);
+                            requestId, responseId, identitySource);
                         if (!seenCumulativeSnapshots.Observe(cumulativeKey, sessionId,
                             serviceTier, serviceTierSource))
                         {
@@ -3023,6 +3191,7 @@ public static class TokenRaderIndexer
                             totalInput, totalCached, totalOutput, totalReasoning,
                             callInput, callCached, callOutput, callReasoning, fingerprint);
                         var candidate = new AggregateEventCandidate {
+                                SourceOffsetEnd = ReadReaderInt64(reader, 13),
                                 SessionId = sessionId,
                                 RootSessionId = rootSessionId,
                                 SourcePath = sourcePath,
@@ -3158,7 +3327,7 @@ public static class TokenRaderIndexer
 
                     string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
                         totalInput, totalCached, totalOutput, totalReasoning,
-                        requestId, responseId);
+                        requestId, responseId, identitySource);
                     if (!seenCumulativeSnapshots.Observe(cumulativeKey, sessionId,
                         serviceTier, serviceTierSource))
                     {
@@ -3171,6 +3340,7 @@ public static class TokenRaderIndexer
                         totalInput, totalCached, totalOutput, totalReasoning,
                         callInput, callCached, callOutput, callReasoning, fingerprint);
                     var candidate = new AggregateEventCandidate {
+                            SourceOffsetEnd = ReadReaderInt64(reader, 13),
                             SessionId = sessionId,
                             RootSessionId = rootSessionId,
                             SourcePath = sourcePath,
@@ -3376,7 +3546,7 @@ public static class TokenRaderIndexer
 
                         string cumulativeKey = BuildAggregateCumulativeKey(sessionId,
                             totalInput, totalCached, totalOutput, totalReasoning,
-                            requestId, responseId);
+                            requestId, responseId, identitySource);
                         if (!seenCumulativeSnapshots.Observe(cumulativeKey, sessionId,
                             serviceTier, serviceTierSource))
                         {
@@ -3642,6 +3812,25 @@ public static class TokenRaderIndexer
             // the explicit same-session/ancestor relationship check.
             bool sameSession = string.Equals(candidate.SessionId, existing.SessionId,
                 StringComparison.OrdinalIgnoreCase);
+            bool candidateMissingTotal = IsMissingTotalIdentitySource(candidate.IdentitySource);
+            bool existingMissingTotal = IsMissingTotalIdentitySource(existing.IdentitySource);
+            if (candidateMissingTotal || existingMissingTotal)
+            {
+                // A zero-total fallback has no safe token-only lineage key.
+                // Reconcile it only when both rows carry the same explicit
+                // request/response identity; otherwise two identical calls
+                // (including a parent/child copy with rewritten ids) must stay
+                // separate rather than being silently merged.
+                bool sameRequest = !string.IsNullOrWhiteSpace(candidate.RequestId) &&
+                    !string.IsNullOrWhiteSpace(existing.RequestId) &&
+                    string.Equals(candidate.RequestId, existing.RequestId,
+                        StringComparison.OrdinalIgnoreCase);
+                bool sameResponse = !string.IsNullOrWhiteSpace(candidate.ResponseId) &&
+                    !string.IsNullOrWhiteSpace(existing.ResponseId) &&
+                    string.Equals(candidate.ResponseId, existing.ResponseId,
+                        StringComparison.OrdinalIgnoreCase);
+                if (!sameRequest && !sameResponse) continue;
+            }
             // Within one session, distinct strong identifiers may represent
             // two real calls with an identical cumulative/token fingerprint.
             // Across an ancestor/descendant boundary, however, identifiers and
@@ -3742,8 +3931,14 @@ public static class TokenRaderIndexer
                 if (stableId.Length == 0) continue;
                 string stableKey = candidate.SessionId.ToLowerInvariant() + "|" + stableId;
                 AggregateEventCandidate current;
-                if (!latestByStableIdentity.TryGetValue(stableKey, out current) ||
-                    (candidate.HasTimestamp && (!current.HasTimestamp || candidate.EventAt >= current.EventAt)))
+                bool hasCurrent = latestByStableIdentity.TryGetValue(stableKey, out current);
+                bool candidateIsFallback = IsMissingTotalIdentitySource(candidate.IdentitySource);
+                bool currentIsFallback = hasCurrent && current != null &&
+                    IsMissingTotalIdentitySource(current.IdentitySource);
+                if (!hasCurrent ||
+                    (currentIsFallback && !candidateIsFallback) ||
+                    (candidateIsFallback == currentIsFallback && candidate.HasTimestamp &&
+                     (!current.HasTimestamp || candidate.EventAt >= current.EventAt)))
                     latestByStableIdentity[stableKey] = candidate;
             }
         }
@@ -3816,7 +4011,10 @@ public static class TokenRaderIndexer
                     threshold = ResolveAggregateLongContextThreshold(candidate.Model, thresholds);
                     resolvedThresholds[candidate.Model] = threshold;
                 }
-                bool longContext = threshold > 0L && candidate.CallInput > threshold;
+                bool longContextEvidenceComplete = !IsMissingLastIdentitySource(
+                    candidate.IdentitySource);
+                bool longContext = longContextEvidenceComplete &&
+                    threshold > 0L && candidate.CallInput > threshold;
                 if (longContext) {
                     result.LongContextEvents++;
                     result.LongContextInput += candidate.CallInput;
@@ -3826,14 +4024,21 @@ public static class TokenRaderIndexer
                     result.StandardContextInput += candidate.CallInput;
                 }
                 if (!candidate.CacheWriteObservable) result.CacheWriteObservable = false;
-                string normalizedLongContextSource = NormalizeLongContextSource(
-                    candidate.LongContextSource, candidate.Model, candidate.CallInput, threshold);
+                string normalizedLongContextSource = IsMissingLastIdentitySource(candidate.IdentitySource)
+                    ? "missing_input" : NormalizeLongContextSource(
+                        candidate.LongContextSource, candidate.Model, candidate.CallInput, threshold);
                 string normalizedTier = NormalizeServiceTier(candidate.ServiceTier);
                 string tierEvidenceClass = IsReliableServiceTierSource(
                     candidate.ServiceTierSource) ? "trusted" : "untrusted";
+                bool requestInputObservable = !IsMissingLastIdentitySource(
+                    candidate.IdentitySource);
+                bool longContextPricingUncertain = !requestInputObservable &&
+                    threshold > 0L && candidate.CallInput > threshold;
                 string bucketKey = candidate.Model.ToLowerInvariant() + "|" +
                     normalizedTier + "|" + (longContext ? "long" : "standard") +
-                    "|" + tierEvidenceClass;
+                    "|" + tierEvidenceClass + "|" +
+                    (requestInputObservable ? "observed" : "derived") +
+                    (longContextPricingUncertain ? "|uncertain" : "|bounded");
                 TokenRaderIntervalAggregateBucket bucket;
                 if (!buckets.TryGetValue(bucketKey, out bucket))
                 {
@@ -3849,6 +4054,8 @@ public static class TokenRaderIndexer
                         ModelContextWindow = candidate.ModelContextWindow,
                         LongContextThreshold = threshold,
                         LongContextSource = normalizedLongContextSource,
+                        RequestInputObservable = requestInputObservable,
+                        LongContextPricingUncertain = longContextPricingUncertain,
                         CacheWriteObservable = candidate.CacheWriteObservable
                     };
                     buckets.Add(bucketKey, bucket);
@@ -3867,6 +4074,8 @@ public static class TokenRaderIndexer
                     NormalizeServiceTierSource(candidate.ServiceTierSource, normalizedTier));
                 bucket.ServiceTierEvidenceComplete = bucket.ServiceTierEvidenceComplete &&
                     IsReliableServiceTierSource(candidate.ServiceTierSource);
+                bucket.RequestInputObservable = bucket.RequestInputObservable &&
+                    requestInputObservable;
             }
         }
 
@@ -3890,6 +4099,8 @@ public static class TokenRaderIndexer
             if (comparison != 0) return comparison;
             if (left.ServiceTierEvidenceComplete != right.ServiceTierEvidenceComplete)
                 return left.ServiceTierEvidenceComplete ? -1 : 1;
+            if (left.RequestInputObservable != right.RequestInputObservable)
+                return left.RequestInputObservable ? -1 : 1;
             return StringComparer.OrdinalIgnoreCase.Compare(left.ServiceTierSource, right.ServiceTierSource);
         });
         result.Buckets = sortedBuckets.ToArray();
@@ -4381,13 +4592,14 @@ public static class TokenRaderIndexer
         long callReasoning = ReadReaderInt64(reader, 10);
         string requestId = ReadReaderString(reader, 16);
         string responseId = ReadReaderString(reader, 17);
+        string identitySource = ReadReaderString(reader, 18);
         long rowId = quotaScope == null ? 0L : ReadReaderInt64(reader, 27);
         string serviceTier = NormalizeServiceTier(ReadReaderString(reader, 25));
         string serviceTierSource = NormalizeServiceTierSource(ReadReaderString(reader, 26), serviceTier);
         if (seenCumulativeSnapshots != null)
             seenCumulativeSnapshots.Observe(BuildAggregateCumulativeKey(sessionId,
                 totalInput, totalCached, totalOutput, totalReasoning,
-                requestId, responseId), sessionId,
+                requestId, responseId, identitySource), sessionId,
                 serviceTier, serviceTierSource);
         if ((callInput <= 0L && callOutput <= 0L) || lineageGroups == null || result == null) return;
 
@@ -4415,7 +4627,7 @@ public static class TokenRaderIndexer
                 TurnId = ReadReaderString(reader, 15),
                 RequestId = requestId,
                 ResponseId = responseId,
-                IdentitySource = ReadReaderString(reader, 18),
+                IdentitySource = identitySource,
                 ModelContextWindow = ReadReaderInt64(reader, 19),
                 LongContextThreshold = ReadReaderInt64(reader, 20),
                 LongContextApplied = ReadReaderInt64(reader, 21) != 0L,
@@ -4436,7 +4648,7 @@ public static class TokenRaderIndexer
             candidate, parentBySession, result);
         seenCumulativeSnapshots.Register(BuildAggregateCumulativeKey(sessionId,
             totalInput, totalCached, totalOutput, totalReasoning,
-            requestId, responseId), candidate);
+            requestId, responseId, identitySource), candidate);
     }
 
     private static string BuildAggregateCumulativeKey(
@@ -4446,7 +4658,8 @@ public static class TokenRaderIndexer
         long totalOutput,
         long totalReasoning,
         string requestId = "",
-        string responseId = "")
+        string responseId = "",
+        string identitySource = "")
     {
         // Cumulative totals identify ordinary status refreshes only while no
         // stronger lifecycle identity is available. Distinct request/response
@@ -4456,9 +4669,23 @@ public static class TokenRaderIndexer
             : (!string.IsNullOrWhiteSpace(responseId)
                 ? "|response:" + responseId.ToLowerInvariant()
                 : "");
-        return (sessionId ?? "").ToLowerInvariant() + strongIdentity + "|" +
+        string fallbackIdentity = IsMissingTotalIdentitySource(identitySource)
+            ? "|fallback:" + (identitySource ?? "") : "";
+        return (sessionId ?? "").ToLowerInvariant() + strongIdentity + fallbackIdentity + "|" +
             string.Format(CultureInfo.InvariantCulture, "{0}:{1}:{2}:{3}",
                 totalInput, totalCached, totalOutput, totalReasoning);
+    }
+
+    private static bool IsMissingTotalIdentitySource(string identitySource)
+    {
+        return !string.IsNullOrWhiteSpace(identitySource) &&
+            identitySource.StartsWith("missing_total", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsMissingLastIdentitySource(string identitySource)
+    {
+        return string.Equals(identitySource ?? "", "missing_last",
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private static string BuildAggregateEventKey(
@@ -6701,6 +6928,52 @@ public static class TokenRaderIndexer
         if (raw == null) raw = usage.CacheReadTokens;
         if (raw == null) raw = usage.CachedTokens;
         return GetInt64Value(raw);
+    }
+
+    private static bool HasAnyUsageValue(TokenRaderJsonUsage usage)
+    {
+        if (usage == null) return false;
+        return usage.InputTokens != null ||
+            usage.CachedInputTokens != null ||
+            usage.OutputTokens != null ||
+            usage.ReasoningOutputTokens != null ||
+            usage.CacheReadTokens != null ||
+            usage.CachedTokens != null ||
+            usage.CacheCreationTokens != null ||
+            usage.CacheCreationInputTokens != null ||
+            usage.CacheWriteTokens != null ||
+            usage.CacheWriteInputTokens != null;
+    }
+
+    /// <summary>
+    /// Cache-write fields are aliases emitted by different log versions.
+    /// Presence, rather than a positive numeric value, determines precedence:
+    /// an explicit zero must win over a later alias with a non-zero value.
+    /// </summary>
+    private static void GetCacheCreationTokenValue(
+        TokenRaderJsonUsage usage,
+        out long value,
+        out bool observable)
+    {
+        value = 0L;
+        observable = false;
+        if (usage == null) return;
+
+        object[] aliases = new[] {
+            usage.CacheCreationTokens,
+            usage.CacheWriteTokens,
+            usage.CacheCreationInputTokens,
+            usage.CacheWriteInputTokens
+        };
+        for (int i = 0; i < aliases.Length; i++)
+        {
+            if (aliases[i] == null) continue;
+            long parsed;
+            if (!TryConvertInt64(aliases[i], out parsed)) continue;
+            value = parsed < 0L ? 0L : parsed;
+            observable = true;
+            return;
+        }
     }
 
     private static bool IsKnownLongContextModel(string model)

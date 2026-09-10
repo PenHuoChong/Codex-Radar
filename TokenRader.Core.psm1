@@ -124,10 +124,82 @@ function New-TokenRaderUsage {
     }
 }
 
+function Get-TokenRaderPropertyValue {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Get-TokenRaderFirstPresentInt64 {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+
+    foreach ($name in @($Names)) {
+        if ($null -eq $Object) { break }
+        $property = $Object.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value) { continue }
+        $value = $property.Value
+        try {
+            if ($value -is [string]) {
+                $text = $value.Trim()
+                if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                [Int64]$parsed = 0
+                if ([Int64]::TryParse($text, [Globalization.NumberStyles]::Integer,
+                        [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+                    if ($parsed -ge 0) { return [pscustomobject]@{ Found = $true; Value = $parsed } }
+                }
+                continue
+            }
+            [Int64]$converted = [Convert]::ToInt64($value, [Globalization.CultureInfo]::InvariantCulture)
+            if ($converted -lt 0) { continue }
+            return [pscustomobject]@{
+                Found = $true
+                Value = $converted
+            }
+        } catch {
+            # An invalid earlier alias must not hide a later valid alias.
+        }
+    }
+    return [pscustomobject]@{ Found = $false; Value = 0L }
+}
+
+function Get-TokenRaderFirstFastInt64 {
+    param(
+        [Parameter(Mandatory = $true)][string]$InnerText,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+
+    foreach ($name in @($Names)) {
+        $escapedName = [regex]::Escape($name)
+        # Keep the alias order explicit instead of letting JSON property order
+        # decide which cache-write spelling wins.  null/invalid values are
+        # skipped, while a valid numeric zero remains a real observation.
+        $match = [regex]::Match($InnerText, '"' + $escapedName + '"\s*:\s*(?:(?:"([^"]*)")|(-?\d+)|null)')
+        if (-not $match.Success -or
+            (-not $match.Groups[1].Success -and -not $match.Groups[2].Success)) { continue }
+        $text = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+        [Int64]$parsed = 0
+        if ([Int64]::TryParse($text.Trim(), [Globalization.NumberStyles]::Integer,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+            if ($parsed -ge 0) { return [pscustomobject]@{ Found = $true; Value = $parsed } }
+        }
+    }
+    return [pscustomobject]@{ Found = $false; Value = 0L }
+}
+
 function ConvertTo-TokenRaderUsage {
     param([Parameter(Mandatory = $true)]$RawUsage)
 
-    $reasoning = if ($null -ne $RawUsage.PSObject.Properties['reasoning_output_tokens']) { ConvertTo-TokenRaderSafeInt64 $RawUsage.reasoning_output_tokens } else { 0L }
+    $reasoningRaw = Get-TokenRaderPropertyValue -Object $RawUsage -Name 'reasoning_output_tokens'
+    $reasoning = if ($null -ne $reasoningRaw) { ConvertTo-TokenRaderSafeInt64 $reasoningRaw } else { 0L }
     # Codex has used several names for the cache-read portion over time.  The
     # canonical cached_input_tokens field wins, then the equivalent
     # cache_read_tokens/cached_tokens aliases.  Missing cache fields mean zero,
@@ -140,9 +212,9 @@ function ConvertTo-TokenRaderUsage {
         }
     }
     New-TokenRaderUsage `
-        -InputTokens (ConvertTo-TokenRaderSafeInt64 $RawUsage.input_tokens) `
+        -InputTokens (ConvertTo-TokenRaderSafeInt64 (Get-TokenRaderPropertyValue -Object $RawUsage -Name 'input_tokens')) `
         -CachedTokens $(if ($null -eq $cachedRaw) { 0L } else { ConvertTo-TokenRaderSafeInt64 $cachedRaw }) `
-        -OutputTokens (ConvertTo-TokenRaderSafeInt64 $RawUsage.output_tokens) `
+        -OutputTokens (ConvertTo-TokenRaderSafeInt64 (Get-TokenRaderPropertyValue -Object $RawUsage -Name 'output_tokens')) `
         -ReasoningOutputTokens $reasoning
 }
 
@@ -402,36 +474,80 @@ function New-TokenRaderEventFingerprint {
     param(
         [Parameter(Mandatory = $true)][DateTimeOffset]$Timestamp,
         [string]$Model,
-        [Parameter(Mandatory = $true)]$TotalUsage,
-        [Parameter(Mandatory = $true)]$CallUsage
+        $TotalUsage,
+        $CallUsage,
+        [bool]$TotalAvailable = $true,
+        [bool]$CallAvailable = $true
     )
 
-    @(
+    $totalParts = if ($TotalAvailable -and $null -ne $TotalUsage) {
+        @($TotalUsage.Input, $TotalUsage.Cached, $TotalUsage.Output, $TotalUsage.ReasoningOutput)
+    } else { @('missing-total') }
+    $callParts = if ($CallAvailable -and $null -ne $CallUsage) {
+        @($CallUsage.Input, $CallUsage.Cached, $CallUsage.Output, $CallUsage.ReasoningOutput)
+    } else { @('missing-call') }
+    $values = @(
         $Timestamp.ToUniversalTime().Ticks,
-        ([string]$Model).ToLowerInvariant(),
-        $TotalUsage.Input, $TotalUsage.Cached, $TotalUsage.Output, $TotalUsage.ReasoningOutput,
-        $CallUsage.Input, $CallUsage.Cached, $CallUsage.Output, $CallUsage.ReasoningOutput
-    ) -join ':'
+        ([string]$Model).ToLowerInvariant()
+    )
+    $values += $totalParts
+    $values += $callParts
+    $values -join ':'
 }
 
 function New-TokenRaderUsageFingerprint {
     param(
-        [Parameter(Mandatory = $true)]$TotalUsage,
-        [Parameter(Mandatory = $true)]$CallUsage
+        $TotalUsage,
+        $CallUsage,
+        [bool]$TotalAvailable = $true,
+        [bool]$CallAvailable = $true
     )
 
-    @(
-        $TotalUsage.Input, $TotalUsage.Cached, $TotalUsage.Output, $TotalUsage.ReasoningOutput,
-        $CallUsage.Input, $CallUsage.Cached, $CallUsage.Output, $CallUsage.ReasoningOutput
-    ) -join ':'
+    $totalParts = if ($TotalAvailable -and $null -ne $TotalUsage) {
+        @($TotalUsage.Input, $TotalUsage.Cached, $TotalUsage.Output, $TotalUsage.ReasoningOutput)
+    } else { @('missing-total') }
+    $callParts = if ($CallAvailable -and $null -ne $CallUsage) {
+        @($CallUsage.Input, $CallUsage.Cached, $CallUsage.Output, $CallUsage.ReasoningOutput)
+    } else { @('missing-call') }
+    $values = @()
+    $values += $totalParts
+    $values += $callParts
+    $values -join ':'
 }
 
 function New-TokenRaderCumulativeFingerprint {
-    param([Parameter(Mandatory = $true)]$TotalUsage)
+    param(
+        $TotalUsage,
+        [bool]$Available = $true
+    )
 
+    if (-not $Available -or $null -eq $TotalUsage) { return $null }
     @(
         $TotalUsage.Input, $TotalUsage.Cached, $TotalUsage.Output, $TotalUsage.ReasoningOutput
     ) -join ':'
+}
+
+function ConvertTo-TokenRaderUsageDelta {
+    param(
+        [Parameter(Mandatory = $true)]$Previous,
+        [Parameter(Mandatory = $true)]$Current
+    )
+
+    if ($null -eq $Previous -or $null -eq $Current) { return $null }
+    $names = @('Input', 'Cached', 'Output', 'ReasoningOutput')
+    foreach ($name in $names) {
+        if ([Int64]$Current.$name -lt [Int64]$Previous.$name) { return $null }
+    }
+    $inputDelta = [Int64]$Current.Input - [Int64]$Previous.Input
+    $cachedDelta = [Int64]$Current.Cached - [Int64]$Previous.Cached
+    $outputDelta = [Int64]$Current.Output - [Int64]$Previous.Output
+    $reasoningDelta = [Int64]$Current.ReasoningOutput - [Int64]$Previous.ReasoningOutput
+    if ($cachedDelta -gt $inputDelta) { return $null }
+    if ($inputDelta -eq 0 -and $cachedDelta -eq 0 -and $outputDelta -eq 0 -and $reasoningDelta -eq 0) {
+        return $null
+    }
+    New-TokenRaderUsage -InputTokens $inputDelta -CachedTokens $cachedDelta `
+        -OutputTokens $outputDelta -ReasoningOutputTokens $reasoningDelta
 }
 
 function ConvertFrom-TokenRaderRateWindowTextFast {
@@ -504,13 +620,26 @@ function ConvertFrom-TokenRaderTokenLineFast {
 
     $totalMatch = [regex]::Match($LineText, '"total_token_usage"\s*:\s*\{([^{}]*)\}')
     $lastMatch = [regex]::Match($LineText, '"last_token_usage"\s*:\s*\{([^{}]*)\}')
-    if (-not $totalMatch.Success -or -not $lastMatch.Success) { return $null }
+    if (-not $totalMatch.Success -and -not $lastMatch.Success) { return $null }
 
-    $totalUsage = ConvertFrom-TokenRaderUsageTextFast -InnerText $totalMatch.Groups[1].Value
-    $callUsage = ConvertFrom-TokenRaderUsageTextFast -InnerText $lastMatch.Groups[1].Value
-    if ($null -eq $totalUsage -or $null -eq $callUsage) { return $null }
+    $totalUsage = if ($totalMatch.Success) {
+        ConvertFrom-TokenRaderUsageTextFast -InnerText $totalMatch.Groups[1].Value
+    } else { $null }
+    $callUsage = if ($lastMatch.Success) {
+        ConvertFrom-TokenRaderUsageTextFast -InnerText $lastMatch.Groups[1].Value
+    } else { $null }
+    if ($totalMatch.Success -and $null -eq $totalUsage) { return $null }
+    if ($lastMatch.Success -and $null -eq $callUsage) { return $null }
     $contextMatch = [regex]::Match($LineText, '"model_context_window"\s*:\s*"?(\d+)"?')
-    $cacheCreationMatch = [regex]::Match($lastMatch.Groups[1].Value, '"(?:cache_creation_tokens|cache_write_tokens)"\s*:\s*"?(\d+)"?')
+    $cacheWrite = if ($lastMatch.Success) {
+        Get-TokenRaderFirstFastInt64 -InnerText $lastMatch.Groups[1].Value `
+            -Names @('cache_creation_tokens', 'cache_write_tokens', 'cache_creation_input_tokens', 'cache_write_input_tokens')
+    } else {
+        [pscustomobject]@{ Found = $false; Value = 0L }
+    }
+    $requestMatch = [regex]::Match($LineText, '"request_id"\s*:\s*"([^"]*)"')
+    $responseMatch = [regex]::Match($LineText, '"response_id"\s*:\s*"([^"]*)"')
+    $turnMatch = [regex]::Match($LineText, '"turn_id"\s*:\s*"([^"]*)"')
 
     $timestamp = [DateTimeOffset]::Now
     try { $timestamp = [DateTimeOffset]::Parse($structure.Groups[1].Value).ToLocalTime() } catch { }
@@ -550,8 +679,10 @@ function ConvertFrom-TokenRaderTokenLineFast {
         }
     }
 
-    $fingerprint = New-TokenRaderEventFingerprint -Timestamp $timestamp -Model $Model -TotalUsage $totalUsage -CallUsage $callUsage
-    $usageFingerprint = New-TokenRaderUsageFingerprint -TotalUsage $totalUsage -CallUsage $callUsage
+    $fingerprint = New-TokenRaderEventFingerprint -Timestamp $timestamp -Model $Model `
+        -TotalUsage $totalUsage -CallUsage $callUsage -TotalAvailable $totalMatch.Success -CallAvailable $lastMatch.Success
+    $usageFingerprint = New-TokenRaderUsageFingerprint -TotalUsage $totalUsage -CallUsage $callUsage `
+        -TotalAvailable $totalMatch.Success -CallAvailable $lastMatch.Success
     return [pscustomobject]@{
         Timestamp = $timestamp
         Model = $Model
@@ -559,12 +690,19 @@ function ConvertFrom-TokenRaderTokenLineFast {
         ServiceTierSource = 'turn_context'
         Total = $totalUsage
         Call = $callUsage
+        HasTotal = [bool]$totalMatch.Success
+        HasCall = [bool]$lastMatch.Success
+        CallAvailable = [bool]$lastMatch.Success
+        CallDerived = $false
+        RequestId = if ($requestMatch.Success) { $requestMatch.Groups[1].Value } else { '' }
+        ResponseId = if ($responseMatch.Success) { $responseMatch.Groups[1].Value } else { '' }
+        TurnId = if ($turnMatch.Success) { $turnMatch.Groups[1].Value } else { '' }
         Fingerprint = $fingerprint
         UsageFingerprint = $usageFingerprint
         RateLimits = $rateLimits
         ModelContextWindow = if ($contextMatch.Success) { ConvertTo-TokenRaderSafeInt64 $contextMatch.Groups[1].Value } else { 0L }
-        CacheCreationTokens = if ($cacheCreationMatch.Success) { ConvertTo-TokenRaderSafeInt64 $cacheCreationMatch.Groups[1].Value } else { 0L }
-        CacheWriteObservable = $cacheCreationMatch.Success
+        CacheCreationTokens = [Math]::Max(0L, [Int64]$cacheWrite.Value)
+        CacheWriteObservable = [bool]$cacheWrite.Found
     }
 }
 
@@ -621,17 +759,49 @@ function Add-TokenRaderLineEvent {
     $isTokenRecord = ($record.type -eq 'event_msg' -and $record.payload.type -eq 'token_count') -or ($record.type -eq 'token_count')
     if (-not $isTokenRecord -or $null -eq $record.payload -or $null -eq $record.payload.info) { return }
     $info = $record.payload.info
-    if ($null -eq $info.total_token_usage -or $null -eq $info.last_token_usage) { return }
-    $totalUsage = ConvertTo-TokenRaderUsage $info.total_token_usage
-    $callUsage = ConvertTo-TokenRaderUsage $info.last_token_usage
+    $rawTotal = Get-TokenRaderPropertyValue -Object $info -Name 'total_token_usage'
+    $rawCall = Get-TokenRaderPropertyValue -Object $info -Name 'last_token_usage'
+    $hasTotal = $null -ne $rawTotal
+    $hasCall = $null -ne $rawCall
+    if (-not $hasTotal -and -not $hasCall) { return }
+    $totalUsage = if ($hasTotal) { ConvertTo-TokenRaderUsage $rawTotal } else { $null }
+    $callUsage = if ($hasCall) { ConvertTo-TokenRaderUsage $rawCall } else { $null }
     $timestamp = [DateTimeOffset]::Now
     try { $timestamp = [DateTimeOffset]::Parse([string]$record.timestamp).ToLocalTime() } catch { }
     $rateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $(if ($null -ne $record.payload.PSObject.Properties['rate_limits']) { $record.payload.rate_limits } else { $null }) -ObservedAt $timestamp -SourceFile ([string]$State.SourceFile)
-    $contextWindow = if ($null -ne $info.PSObject.Properties['model_context_window']) { ConvertTo-TokenRaderSafeInt64 $info.model_context_window } else { 0L }
-    $cacheCreationTokens = if ($null -ne $info.last_token_usage.PSObject.Properties['cache_creation_tokens']) { ConvertTo-TokenRaderSafeInt64 $info.last_token_usage.cache_creation_tokens } elseif ($null -ne $info.last_token_usage.PSObject.Properties['cache_write_tokens']) { ConvertTo-TokenRaderSafeInt64 $info.last_token_usage.cache_write_tokens } else { 0L }
-    $cacheWriteObservable = $null -ne $info.last_token_usage.PSObject.Properties['cache_creation_tokens'] -or $null -ne $info.last_token_usage.PSObject.Properties['cache_write_tokens']
-    $fingerprint = New-TokenRaderEventFingerprint -Timestamp $timestamp -Model ([string]$State.Model) -TotalUsage $totalUsage -CallUsage $callUsage
-    $usageFingerprint = New-TokenRaderUsageFingerprint -TotalUsage $totalUsage -CallUsage $callUsage
+    $contextRaw = Get-TokenRaderPropertyValue -Object $info -Name 'model_context_window'
+    $contextWindow = if ($null -ne $contextRaw) { ConvertTo-TokenRaderSafeInt64 $contextRaw } else { 0L }
+    $cacheWrite = if ($hasCall) {
+        Get-TokenRaderFirstPresentInt64 -Object $rawCall `
+            -Names @('cache_creation_tokens', 'cache_write_tokens', 'cache_creation_input_tokens', 'cache_write_input_tokens')
+    } else {
+        [pscustomobject]@{ Found = $false; Value = 0L }
+    }
+    $requestId = [string](Get-TokenRaderPropertyValue -Object $record.payload -Name 'request_id')
+    if ([string]::IsNullOrWhiteSpace($requestId)) {
+        $requestId = [string](Get-TokenRaderPropertyValue -Object $record -Name 'request_id')
+    }
+    if ([string]::IsNullOrWhiteSpace($requestId)) {
+        $requestId = [string](Get-TokenRaderPropertyValue -Object $info -Name 'request_id')
+    }
+    $responseId = [string](Get-TokenRaderPropertyValue -Object $record.payload -Name 'response_id')
+    if ([string]::IsNullOrWhiteSpace($responseId)) {
+        $responseId = [string](Get-TokenRaderPropertyValue -Object $record -Name 'response_id')
+    }
+    if ([string]::IsNullOrWhiteSpace($responseId)) {
+        $responseId = [string](Get-TokenRaderPropertyValue -Object $info -Name 'response_id')
+    }
+    $turnId = [string](Get-TokenRaderPropertyValue -Object $record.payload -Name 'turn_id')
+    if ([string]::IsNullOrWhiteSpace($turnId)) {
+        $turnId = [string](Get-TokenRaderPropertyValue -Object $record -Name 'turn_id')
+    }
+    if ([string]::IsNullOrWhiteSpace($turnId)) {
+        $turnId = [string](Get-TokenRaderPropertyValue -Object $info -Name 'turn_id')
+    }
+    $fingerprint = New-TokenRaderEventFingerprint -Timestamp $timestamp -Model ([string]$State.Model) `
+        -TotalUsage $totalUsage -CallUsage $callUsage -TotalAvailable $hasTotal -CallAvailable $hasCall
+    $usageFingerprint = New-TokenRaderUsageFingerprint -TotalUsage $totalUsage -CallUsage $callUsage `
+        -TotalAvailable $hasTotal -CallAvailable $hasCall
     $tierEvidence = Get-TokenRaderMetadataServiceTier -Containers @($info, $record.payload, $record) -Fallback ([string]$State.ServiceTier) -IncludeSource
     $event = [pscustomobject]@{
         Timestamp = $timestamp
@@ -640,20 +810,106 @@ function Add-TokenRaderLineEvent {
         ServiceTierSource = [string]$tierEvidence.Source
         Total = $totalUsage
         Call = $callUsage
+        HasTotal = [bool]$hasTotal
+        HasCall = [bool]$hasCall
+        CallAvailable = [bool]$hasCall
+        CallDerived = $false
+        RequestId = $requestId
+        ResponseId = $responseId
+        TurnId = $turnId
         Fingerprint = $fingerprint
         UsageFingerprint = $usageFingerprint
         RateLimits = $rateLimits
         ModelContextWindow = $contextWindow
-        CacheCreationTokens = $cacheCreationTokens
-        CacheWriteObservable = $cacheWriteObservable
+        CacheCreationTokens = [Math]::Max(0L, [Int64]$cacheWrite.Value)
+        CacheWriteObservable = [bool]$cacheWrite.Found
     }
     Add-TokenRaderUsageEventWithTier -Event $event -State $State -Events $Events
 }
 
+function Resolve-TokenRaderEventUsage {
+    param(
+        [Parameter(Mandatory = $true)]$Event,
+        [Parameter(Mandatory = $true)]$State
+    )
+
+    if ($null -eq $State.PSObject.Properties['PreviousTotalKnown']) {
+        $State | Add-Member -NotePropertyName PreviousTotalKnown -NotePropertyValue $false
+    }
+    if ($null -eq $State.PSObject.Properties['PreviousTotalUsage']) {
+        $State | Add-Member -NotePropertyName PreviousTotalUsage -NotePropertyValue $null
+    }
+
+    $hasTotal = if ($null -ne $Event.PSObject.Properties['HasTotal']) {
+        [bool]$Event.HasTotal
+    } else { $null -ne $Event.Total }
+    $hasCall = if ($null -ne $Event.PSObject.Properties['HasCall']) {
+        [bool]$Event.HasCall
+    } else { $null -ne $Event.Call }
+    if (-not $hasTotal -and -not $hasCall) { return $false }
+
+    $callAvailable = $hasCall -and $null -ne $Event.Call
+    $callDerived = $false
+    $resetDetected = $false
+    if ($hasTotal -and $null -ne $Event.Total) {
+        if (-not $hasCall) {
+            if ([bool]$State.PreviousTotalKnown) {
+                $delta = ConvertTo-TokenRaderUsageDelta -Previous $State.PreviousTotalUsage -Current $Event.Total
+                if ($null -ne $delta) {
+                    $Event.Call = $delta
+                    $callAvailable = $true
+                    $callDerived = $true
+                } else {
+                    # A lower cumulative value is a reset; an unchanged value
+                    # is a duplicate/status snapshot. Neither is a call.
+                    $Event.Call = New-TokenRaderUsage -InputTokens 0 -CachedTokens 0 -OutputTokens 0 -ReasoningOutputTokens 0
+                    $callAvailable = $false
+                    $resetDetected = $true
+                }
+            } else {
+                # Without a same-session prior cumulative value, the record is
+                # baseline-only. Never charge its historical total as one call.
+                $Event.Call = New-TokenRaderUsage -InputTokens 0 -CachedTokens 0 -OutputTokens 0 -ReasoningOutputTokens 0
+                $callAvailable = $false
+            }
+        }
+        $State.PreviousTotalUsage = $Event.Total
+        $State.PreviousTotalKnown = $true
+    } elseif (-not $hasTotal -and $hasCall) {
+        # A last-only record may already be included in the next cumulative
+        # total. Do not retain an older anchor and charge that call again when
+        # a later total-only snapshot arrives.
+        $State.PreviousTotalUsage = $null
+        $State.PreviousTotalKnown = $false
+    }
+
+    $Event.HasTotal = [bool]$hasTotal
+    $Event.HasCall = [bool]$hasCall
+    $Event.CallAvailable = [bool]$callAvailable
+    $Event.CallDerived = [bool]$callDerived
+    if ($null -eq $Event.PSObject.Properties['ResetDetected']) {
+        $Event | Add-Member -NotePropertyName ResetDetected -NotePropertyValue ([bool]$resetDetected)
+    } else { $Event.ResetDetected = [bool]$resetDetected }
+    if ($null -eq $Event.PSObject.Properties['CumulativeAvailable']) {
+        $Event | Add-Member -NotePropertyName CumulativeAvailable -NotePropertyValue ([bool]$hasTotal)
+    } else { $Event.CumulativeAvailable = [bool]$hasTotal }
+    $Event.UsageFingerprint = New-TokenRaderUsageFingerprint `
+        -TotalUsage $Event.Total -CallUsage $Event.Call `
+        -TotalAvailable $hasTotal -CallAvailable $callAvailable
+    $Event.Fingerprint = New-TokenRaderEventFingerprint `
+        -Timestamp ([DateTimeOffset]$Event.Timestamp) -Model ([string]$Event.Model) `
+        -TotalUsage $Event.Total -CallUsage $Event.Call `
+        -TotalAvailable $hasTotal -CallAvailable $callAvailable
+    return $true
+}
+
 function Add-TokenRaderUsageEventWithTier {
     param($Event, $State, $Events)
+    if (-not (Resolve-TokenRaderEventUsage -Event $Event -State $State)) { return }
     if ($null -eq $State.PSObject.Properties['TierEvents']) { $State | Add-Member -NotePropertyName TierEvents -NotePropertyValue @{} }
-    $key = [string]$Event.UsageFingerprint
+    $key = if ($null -ne $Event.PSObject.Properties['HasTotal'] -and -not [bool]$Event.HasTotal) {
+        [string]$Event.Fingerprint
+    } else { [string]$Event.UsageFingerprint }
     $previous = $State.TierEvents[$key]
     if ($null -ne $previous) {
         $rank = @{ turn_context = 0; service_tier = 1; response = 2 }
@@ -674,11 +930,22 @@ function Get-TokenRaderUsageEvents {
         [Int64]$EndOffset = 0,
         [string]$InitialModel = '',
         [Int64]$MaximumLineBytes = 4MB,
-        [string]$InitialServiceTier = ''
+        [string]$InitialServiceTier = '',
+        $InitialTotal = $null
     )
 
     $events = New-Object System.Collections.ArrayList
-    $state = [pscustomobject]@{ Model = $InitialModel; SourceFile = $FilePath; ServiceTier = $InitialServiceTier }
+    $state = [pscustomobject]@{
+        Model = $InitialModel
+        SourceFile = $FilePath
+        ServiceTier = $InitialServiceTier
+        PreviousTotalKnown = $false
+        PreviousTotalUsage = $null
+    }
+    if ($null -ne $InitialTotal) {
+        $state.PreviousTotalKnown = $true
+        $state.PreviousTotalUsage = $InitialTotal
+    }
     if (-not (Test-Path -LiteralPath $FilePath)) {
         return [pscustomobject]@{ Events = @(); LastModel = $InitialModel; BytesRead = 0 }
     }
@@ -891,6 +1158,11 @@ function Get-TokenRaderUsageSnapshot {
     $activeTierFound = $false
     $latestRateLimits = $null
     $latestRateLimitsFallback = $null
+    $selectedHasTotal = $false
+    $selectedHasCall = $false
+    $needPreviousTotal = $false
+    $previousTotalKnown = $false
+    $previousTotalUsage = $null
 
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         $line = ([string]$lines[$i]).TrimStart([char]0xFEFF)
@@ -915,32 +1187,56 @@ function Get-TokenRaderUsageSnapshot {
             }
             if ($null -ne $tokenRecord -and [string]::IsNullOrWhiteSpace($model) -and -not [string]::IsNullOrWhiteSpace($candidate)) {
                 $model = $candidate
-                if ($null -ne $latestRateLimits) { break }
+                if ($null -ne $latestRateLimits -and -not $needPreviousTotal) { break }
             }
             continue
         }
 
-        $isTokenRecord = ($record.type -eq 'event_msg' -and $record.payload.type -eq 'token_count') -or
-                         ($record.type -eq 'token_count')
-        if (-not $isTokenRecord -or $null -eq $record.payload) { continue }
+        $payload = Get-TokenRaderPropertyValue -Object $record -Name 'payload'
+        $payloadType = Get-TokenRaderPropertyValue -Object $payload -Name 'type'
+        $recordType = [string](Get-TokenRaderPropertyValue -Object $record -Name 'type')
+        $isTokenRecord = ($recordType -eq 'event_msg' -and $payloadType -eq 'token_count') -or
+                         ($recordType -eq 'token_count')
+        if (-not $isTokenRecord -or $null -eq $payload) { continue }
 
         $recordTimestamp = [DateTimeOffset]::Now
-        try { $recordTimestamp = [DateTimeOffset]::Parse([string]$record.timestamp).ToLocalTime() } catch { }
-        if ($null -eq $latestRateLimits -and $null -ne $record.payload.PSObject.Properties['rate_limits']) {
-            $candidateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $record.payload.rate_limits -ObservedAt $recordTimestamp -SourceFile $FilePath
+        try { $recordTimestamp = [DateTimeOffset]::Parse([string](Get-TokenRaderPropertyValue -Object $record -Name 'timestamp')).ToLocalTime() } catch { }
+        $rawRateLimits = Get-TokenRaderPropertyValue -Object $payload -Name 'rate_limits'
+        if ($null -eq $latestRateLimits -and $null -ne $rawRateLimits) {
+            $candidateLimits = ConvertTo-TokenRaderRateLimits -RawRateLimits $rawRateLimits -ObservedAt $recordTimestamp -SourceFile $FilePath
             if ($null -eq $latestRateLimitsFallback) { $latestRateLimitsFallback = $candidateLimits }
             if ($null -ne $candidateLimits.FiveHour -or $null -ne $candidateLimits.Weekly) {
                 $latestRateLimits = $candidateLimits
             }
         }
-        if ($null -eq $tokenRecord -and $null -ne $record.payload.info -and
-            $null -ne $record.payload.info.total_token_usage -and $null -ne $record.payload.info.last_token_usage) {
+        $candidateInfo = Get-TokenRaderPropertyValue -Object $payload -Name 'info'
+        $candidateTotal = Get-TokenRaderPropertyValue -Object $candidateInfo -Name 'total_token_usage'
+        $candidateCall = Get-TokenRaderPropertyValue -Object $candidateInfo -Name 'last_token_usage'
+        if ($null -eq $tokenRecord -and $null -ne $candidateInfo -and
+            ($null -ne $candidateTotal -or $null -ne $candidateCall)) {
             $tokenRecord = $record
             $tokenIndex = $i
+            $selectedHasTotal = $null -ne $candidateTotal
+            $selectedHasCall = $null -ne $candidateCall
+            $needPreviousTotal = $selectedHasTotal -and -not $selectedHasCall
+        } elseif ($null -ne $tokenRecord -and $needPreviousTotal -and -not $previousTotalKnown) {
+            # The reverse scan reaches the immediately preceding record after
+            # selecting the latest total-only record. A last-only record breaks
+            # the cumulative anchor because its call may already be included
+            # in the next total.
+            if ($null -ne $candidateCall -and $null -eq $candidateTotal) {
+                $needPreviousTotal = $false
+            } elseif ($null -ne $candidateTotal) {
+                $previousTotalUsage = ConvertTo-TokenRaderUsage $candidateTotal
+                $previousTotalKnown = $true
+            }
         }
-        if ($null -ne $tokenRecord -and -not [string]::IsNullOrWhiteSpace($model) -and $null -ne $latestRateLimits) {
+        if ($null -ne $tokenRecord -and -not $needPreviousTotal -and
+            -not [string]::IsNullOrWhiteSpace($model) -and $null -ne $latestRateLimits) {
             break
         }
+        if ($null -ne $tokenRecord -and $needPreviousTotal -and $previousTotalKnown -and
+            -not [string]::IsNullOrWhiteSpace($model) -and $null -ne $latestRateLimits) { break }
     }
 
     if ($null -eq $tokenRecord) { return $null }
@@ -948,7 +1244,12 @@ function Get-TokenRaderUsageSnapshot {
 
     $payload = $tokenRecord.payload
     $info = $payload.info
-    if ($null -eq $info -or $null -eq $info.total_token_usage -or $null -eq $info.last_token_usage) { return $null }
+    if ($null -eq $info) { return $null }
+    $rawTotal = Get-TokenRaderPropertyValue -Object $info -Name 'total_token_usage'
+    $rawCall = Get-TokenRaderPropertyValue -Object $info -Name 'last_token_usage'
+    $hasTotal = $null -ne $rawTotal
+    $hasCall = $null -ne $rawCall
+    if (-not $hasTotal -and -not $hasCall) { return $null }
     $contextServiceTier = $activeServiceTier
     $serviceTier = Get-TokenRaderMetadataServiceTier -Containers @($info, $payload, $tokenRecord) -Fallback $serviceTier
 
@@ -960,16 +1261,35 @@ function Get-TokenRaderUsageSnapshot {
     # window. Keep that metadata explicitly unknown instead of dereferencing
     # an uninitialised variable under StrictMode.
     [Int64]$contextWindow = 0L
-    if ($null -ne $info.PSObject.Properties['model_context_window']) {
-        $contextWindow = ConvertTo-TokenRaderSafeInt64 $info.model_context_window
+    $contextRaw = Get-TokenRaderPropertyValue -Object $info -Name 'model_context_window'
+    if ($null -ne $contextRaw) {
+        $contextWindow = ConvertTo-TokenRaderSafeInt64 $contextRaw
     }
-    $cacheCreationTokens = 0L
-    $cacheWriteObservable = $false
-    foreach ($name in @('cache_creation_tokens', 'cache_write_tokens')) {
-        if ($null -ne $info.last_token_usage.PSObject.Properties[$name]) {
-            $cacheCreationTokens = [Math]::Max(0L, (ConvertTo-TokenRaderSafeInt64 $info.last_token_usage.PSObject.Properties[$name].Value))
-            $cacheWriteObservable = $true
-            break
+    $cacheWrite = if ($hasCall) {
+        Get-TokenRaderFirstPresentInt64 -Object $rawCall `
+            -Names @('cache_creation_tokens', 'cache_write_tokens', 'cache_creation_input_tokens', 'cache_write_input_tokens')
+    } else {
+        [pscustomobject]@{ Found = $false; Value = 0L }
+    }
+
+    $task = if ($hasTotal) { ConvertTo-TokenRaderUsage $rawTotal } else { $null }
+    $call = if ($hasCall) { ConvertTo-TokenRaderUsage $rawCall } else { $null }
+    $callAvailable = $hasCall
+    $callDerived = $false
+    if ($hasTotal -and -not $hasCall) {
+        if ($previousTotalKnown) {
+            $delta = ConvertTo-TokenRaderUsageDelta -Previous $previousTotalUsage -Current $task
+            if ($null -ne $delta) {
+                $call = $delta
+                $callAvailable = $true
+                $callDerived = $true
+            } else {
+                $call = New-TokenRaderUsage -InputTokens 0 -CachedTokens 0 -OutputTokens 0 -ReasoningOutputTokens 0
+                $callAvailable = $false
+            }
+        } else {
+            $call = New-TokenRaderUsage -InputTokens 0 -CachedTokens 0 -OutputTokens 0 -ReasoningOutputTokens 0
+            $callAvailable = $false
         }
     }
 
@@ -982,12 +1302,18 @@ function Get-TokenRaderUsageSnapshot {
         ServiceTierKnown = $serviceTier -ne ''
         PlanType = $planType
         RateLimits = $snapshotRateLimits
-        Task = ConvertTo-TokenRaderUsage $info.total_token_usage
-        Call = ConvertTo-TokenRaderUsage $info.last_token_usage
+        Task = $task
+        Call = $call
+        HasTotal = [bool]$hasTotal
+        HasCall = [bool]$hasCall
+        CallAvailable = [bool]$callAvailable
+        CallDerived = [bool]$callDerived
+        RequestInputObservable = -not [bool]$callDerived
+        LongContextPricingUncertain = $false
         ContextWindow = $contextWindow
         ModelContextWindow = $contextWindow
-        CacheCreationTokens = $cacheCreationTokens
-        CacheWriteObservable = $cacheWriteObservable
+        CacheCreationTokens = [Math]::Max(0L, [Int64]$cacheWrite.Value)
+        CacheWriteObservable = [bool]$cacheWrite.Found
         TailLinesRead = $lines.Count
         TokenRecordIndex = $tokenIndex
     }
@@ -1272,6 +1598,8 @@ function Get-TokenRaderCost {
         [Nullable[bool]]$LongContextApplied = $null,
         [Int64]$CacheCreationTokens = 0,
         [Nullable[bool]]$CacheWriteObservable = $null,
+        [bool]$RequestInputObservable = $true,
+        [Nullable[bool]]$LongContextPricingUncertain = $null,
         [AllowEmptyString()][string]$ServiceTier = '',
         [AllowNull()][AllowEmptyString()][string]$ServiceTierSource = $null,
         [Nullable[bool]]$ServiceTierEvidenceComplete = $null,
@@ -1297,7 +1625,25 @@ function Get-TokenRaderCost {
         elseif ($untrustedTierSource) { if ($normalizedTierSource -ne '') { $normalizedTierSource } else { 'untrusted' } }
         else { 'log' }
     $basePrice = if ($null -ne $ResolvedPrice) { $ResolvedPrice } else { Resolve-TokenRaderPrice -Model $Model -PricingDocument $PricingDocument }
-    $price = Resolve-TokenRaderServiceTierPrice -Price $basePrice -ServiceTier $tier
+    $missingRequestInput = $false
+    $requestBoundaryUncertain = if ($null -ne $LongContextPricingUncertain) {
+        [bool]$LongContextPricingUncertain
+    } else {
+        $null -ne $basePrice -and $null -ne $basePrice.PSObject.Properties['longContextThreshold'] -and
+            [Int64]$basePrice.longContextThreshold -gt 0L -and
+            [Int64]$Usage.Input -gt [Int64]$basePrice.longContextThreshold
+    }
+    if (-not $RequestInputObservable -and $requestBoundaryUncertain -and $null -ne $basePrice -and
+        $null -ne $basePrice.PSObject.Properties['longContextThreshold'] -and
+        [Int64]$basePrice.longContextThreshold -gt 0L) {
+        # A total-only delta can combine several calls.  Preserve its token
+        # evidence, but do not guess a long-context premium from an unknown
+        # per-request boundary.
+        $missingRequestInput = $true
+    }
+    $price = if ($missingRequestInput) { $null } else {
+        Resolve-TokenRaderServiceTierPrice -Price $basePrice -ServiceTier $tier
+    }
     $unsupportedContext = $false
     if ($null -ne $price -and $null -ne $price.PSObject.Properties['maximumInputTokens']) {
         # Compact buckets carry the original per-call context classification;
@@ -1323,7 +1669,7 @@ function Get-TokenRaderCost {
             ModeAssumptionApplied = $manualModeAssumption
             ManualServiceTierApplied = $manualModeAssumption
             ServiceTierSource = $effectiveServiceTierSource
-            PricingReason = if ($unsupportedCacheWrite) { 'unsupported_service_tier_cache_write' } elseif ($unsupportedContext) { 'unsupported_service_tier_context' } elseif ($null -eq $basePrice) { 'unknown_model' } else { 'unknown_service_tier_price' }
+            PricingReason = if ($missingRequestInput) { 'missing_request_input' } elseif ($unsupportedCacheWrite) { 'unsupported_service_tier_cache_write' } elseif ($unsupportedContext) { 'unsupported_service_tier_context' } elseif ($null -eq $basePrice) { 'unknown_model' } else { 'unknown_service_tier_price' }
             InputCost = $null
             CachedCost = $null
             OutputCost = $null
@@ -1335,8 +1681,8 @@ function Get-TokenRaderCost {
             InputMultiplier = 1.0
             OutputMultiplier = 1.0
             ModelContextWindow = if ($ModelContextWindow -gt 0) { $ModelContextWindow } else { $null }
-            LongContextThreshold = if ($LongContextThreshold -gt 0) { $LongContextThreshold } else { $null }
-            LongContextSource = if ($null -eq $basePrice) { 'unknown_model' } else { 'no_threshold' }
+            LongContextThreshold = if ($LongContextThreshold -gt 0) { $LongContextThreshold } elseif ($missingRequestInput) { [Int64]$basePrice.longContextThreshold } else { $null }
+            LongContextSource = if ($missingRequestInput) { 'missing_input' } elseif ($null -eq $basePrice) { 'unknown_model' } else { 'no_threshold' }
         }
     }
 
@@ -1548,7 +1894,10 @@ function Get-TokenRaderIntervalResult {
         }
         $ancestorEvents = Get-TokenRaderUsageEvents -FilePath $ancestorPath -StartOffset 0 -EndOffset ([Int64]$Entry.Length)
         foreach ($ancestorEvent in @($ancestorEvents.Events)) {
-            [void]$keys.Add([string]$ancestorEvent.UsageFingerprint)
+            $hasTotal = if ($null -ne $ancestorEvent.PSObject.Properties['HasTotal']) {
+                [bool]$ancestorEvent.HasTotal
+            } else { $null -ne $ancestorEvent.Total }
+            if ($hasTotal) { [void]$keys.Add([string]$ancestorEvent.UsageFingerprint) }
         }
         $baselineEventFingerprintsByPath[$ancestorPath] = $keys
         return ,$keys
@@ -1625,6 +1974,7 @@ function Get-TokenRaderIntervalResult {
     $lastCountedAt = $null
     [Int64]$bytesRead = 0
     $seenEvents = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $partialStrongIdentities = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
     $rootHistoryEvents = @{}
     $activeFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $models = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -1672,13 +2022,55 @@ function Get-TokenRaderIntervalResult {
         # measurement). The desktop UI keeps the UI responsive by running this
         # in a background runspace and skips recomputes entirely when the
         # session-tree signature is unchanged.
-        $parsed = Get-TokenRaderUsageEvents -FilePath $changePath -StartOffset $startOffset -EndOffset $effectiveEnd -InitialModel $initialModel -InitialServiceTier $initialServiceTier
+        $parsed = Get-TokenRaderUsageEvents -FilePath $changePath -StartOffset $startOffset -EndOffset $effectiveEnd `
+            -InitialModel $initialModel -InitialServiceTier $initialServiceTier -InitialTotal $baselineTask
         $bytesRead += [Int64]$parsed.BytesRead
         if (@($parsed.Events).Count -gt 0) { [void]$activeFiles.Add($changePath) }
         $fallbackModel = [string]$parsed.LastModel
         $seenCumulativeSnapshots = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
         if ($null -ne $baselineTask) {
             [void]$seenCumulativeSnapshots.Add((New-TokenRaderCumulativeFingerprint -TotalUsage $baselineTask))
+        }
+
+        # A missing-total row has no safe cumulative identity.  When the same
+        # session nevertheless exposes an explicit request/response id on both
+        # a partial row and a complete row, the complete/terminal observation
+        # must win regardless of arrival order.  Preselect it before the
+        # accounting pass so a partial-first file cannot become first-wins and
+        # a complete-first file cannot double count the later partial row.
+        # Scope this map to the session path, not RootId: sibling sessions may
+        # legitimately reuse a request id and must remain independent.
+        $strongIdentityGroups = New-Object hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($candidateEvent in @($parsed.Events)) {
+            $candidateHasTotal = if ($null -ne $candidateEvent.PSObject.Properties['HasTotal']) {
+                [bool]$candidateEvent.HasTotal
+            } else { $null -ne $candidateEvent.Total }
+            $candidateRequestId = if ($null -ne $candidateEvent.PSObject.Properties['RequestId']) { ([string]$candidateEvent.RequestId).Trim() } else { '' }
+            $candidateResponseId = if ($null -ne $candidateEvent.PSObject.Properties['ResponseId']) { ([string]$candidateEvent.ResponseId).Trim() } else { '' }
+            $candidateStrongIdentity = if (-not [string]::IsNullOrWhiteSpace($candidateRequestId)) {
+                'request:' + $candidateRequestId.ToLowerInvariant()
+            } elseif (-not [string]::IsNullOrWhiteSpace($candidateResponseId)) {
+                'response:' + $candidateResponseId.ToLowerInvariant()
+            } else { '' }
+            if ([string]::IsNullOrWhiteSpace($candidateStrongIdentity)) { continue }
+            $candidateGroupKey = $changePath.ToLowerInvariant() + '|' + $candidateStrongIdentity
+            if (-not $strongIdentityGroups.ContainsKey($candidateGroupKey)) {
+                $strongIdentityGroups[$candidateGroupKey] = [pscustomobject]@{
+                    HasMissingTotal = $false
+                    HasComplete = $false
+                    CompleteEvent = $null
+                }
+            }
+            $candidateGroup = $strongIdentityGroups[$candidateGroupKey]
+            if ($candidateHasTotal) {
+                $candidateGroup.HasComplete = $true
+                if ($null -eq $candidateGroup.CompleteEvent -or
+                    $candidateEvent.Timestamp -ge $candidateGroup.CompleteEvent.Timestamp) {
+                    $candidateGroup.CompleteEvent = $candidateEvent
+                }
+            } else {
+                $candidateGroup.HasMissingTotal = $true
+            }
         }
 
         foreach ($event in @($parsed.Events)) {
@@ -1689,36 +2081,79 @@ function Get-TokenRaderIntervalResult {
                 $latestRateObserved = $event.RateLimits.ObservedAt
             }
             $usageFingerprint = [string]$event.UsageFingerprint
-            $cumulativeFingerprint = New-TokenRaderCumulativeFingerprint -TotalUsage $event.Total
-            # Codex may emit a later token_count record only to refresh status
-            # or rate limits. If total_token_usage did not change, the attached
-            # last_token_usage still describes the previous call and must not
-            # be charged again. Seeding from the baseline also protects the
-            # first record immediately after the measurement boundary.
-            if (-not $seenCumulativeSnapshots.Add($cumulativeFingerprint)) {
-                $duplicateEventCount++
-                continue
+            $hasTotal = if ($null -ne $event.PSObject.Properties['HasTotal']) {
+                [bool]$event.HasTotal
+            } else { $null -ne $event.Total }
+            $callAvailable = if ($null -ne $event.PSObject.Properties['CallAvailable']) {
+                [bool]$event.CallAvailable
+            } else { $null -ne $event.Call }
+
+            $requestId = if ($null -ne $event.PSObject.Properties['RequestId']) { ([string]$event.RequestId).Trim() } else { '' }
+            $responseId = if ($null -ne $event.PSObject.Properties['ResponseId']) { ([string]$event.ResponseId).Trim() } else { '' }
+            $strongIdentity = if (-not [string]::IsNullOrWhiteSpace($requestId)) {
+                'request:' + $requestId.ToLowerInvariant()
+            } elseif (-not [string]::IsNullOrWhiteSpace($responseId)) {
+                'response:' + $responseId.ToLowerInvariant()
+            } else { '' }
+
+            # Reconcile a partial last-only observation with an explicit
+            # request/response identity only inside this same session.  If a
+            # complete terminal row exists anywhere in the parsed group, it is
+            # the sole representative; this is intentionally order-independent.
+            # Groups containing only partial rows retain first-wins behaviour
+            # for the same session/id, while rows without a strong id remain
+            # independent because no cumulative identity can be invented.
+            if (-not [string]::IsNullOrWhiteSpace($strongIdentity)) {
+                $partialKey = $changePath.ToLowerInvariant() + '|' + $strongIdentity
+                $eventGroup = if ($strongIdentityGroups.ContainsKey($partialKey)) { $strongIdentityGroups[$partialKey] } else { $null }
+                if ($null -ne $eventGroup -and $eventGroup.HasMissingTotal) {
+                    if ($eventGroup.HasComplete) {
+                        if (-not [object]::ReferenceEquals($event, $eventGroup.CompleteEvent)) {
+                            $duplicateEventCount++
+                            continue
+                        }
+                    } elseif (-not $hasTotal) {
+                        if ($partialStrongIdentities.ContainsKey($partialKey)) {
+                            $duplicateEventCount++
+                            continue
+                        }
+                        $partialStrongIdentities[$partialKey] = $true
+                    }
+                }
             }
-            if ($change.IsNew -and $null -ne $ancestorEventFingerprints -and $ancestorEventFingerprints.Contains($usageFingerprint)) {
-                $inheritedEventCount++
-                continue
-            }
-            if ($change.Depth -gt 0 -and $rootHistory.Contains($usageFingerprint)) {
-                $duplicateEventCount++
-                continue
-            }
-            [void]$rootHistory.Add($usageFingerprint)
-            # Fingerprints produced by the parser include timestamp/model for
-            # display/debugging. Lineage identity must use token usage only so
-            # a copied parent/child call remains deduplicated across model
-            # attribution and serialization-time differences.
-            $eventKey = ([string]$change.RootId) + '|' + $usageFingerprint
-            if (-not $seenEvents.Add($eventKey)) {
-                $duplicateEventCount++
-                continue
+
+            # Cumulative snapshots are the only reliable identity for a
+            # status refresh. A last-only record has no cumulative identity;
+            # treating its call as a fabricated total would collapse distinct
+            # calls (and parent/child copies) incorrectly, so it is counted
+            # independently.
+            if ($hasTotal) {
+                $cumulativeFingerprint = New-TokenRaderCumulativeFingerprint -TotalUsage $event.Total
+                if (-not $seenCumulativeSnapshots.Add($cumulativeFingerprint)) {
+                    $duplicateEventCount++
+                    continue
+                }
+                if ($change.IsNew -and $null -ne $ancestorEventFingerprints -and $ancestorEventFingerprints.Contains($usageFingerprint)) {
+                    $inheritedEventCount++
+                    continue
+                }
+                if ($change.Depth -gt 0 -and $rootHistory.Contains($usageFingerprint)) {
+                    $duplicateEventCount++
+                    continue
+                }
+                [void]$rootHistory.Add($usageFingerprint)
+                # Fingerprints produced by the parser include timestamp/model
+                # for display/debugging. Lineage identity uses token usage only
+                # for records with a trustworthy cumulative total.
+                $eventKey = ([string]$change.RootId) + '|' + $usageFingerprint
+                if (-not $seenEvents.Add($eventKey)) {
+                    $duplicateEventCount++
+                    continue
+                }
             }
             $call = $event.Call
-            if ([Int64]$call.Input -le 0 -and [Int64]$call.Output -le 0) { continue }
+            if (-not $callAvailable -or $null -eq $call -or
+                ([Int64]$call.Input -le 0 -and [Int64]$call.Output -le 0)) { continue }
             $countedEventCount++
             if ($null -eq $firstCountedAt -or $event.Timestamp -lt $firstCountedAt) { $firstCountedAt = $event.Timestamp }
             if ($null -eq $lastCountedAt -or $event.Timestamp -gt $lastCountedAt) { $lastCountedAt = $event.Timestamp }
@@ -1733,9 +2168,13 @@ function Get-TokenRaderIntervalResult {
                 $priceCache[$model] = Resolve-TokenRaderPrice -Model $model -PricingDocument $PricingDocument
             }
             $price = $priceCache[$model]
+            $callDerived = $null -ne $event.PSObject.Properties['CallDerived'] -and [bool]$event.CallDerived
+            $requestInputObservable = -not $callDerived
+            $longContextThreshold = if ($null -ne $price -and $null -ne $price.PSObject.Properties['longContextThreshold']) { [Int64]$price.longContextThreshold } else { 0L }
+            $longContextPricingUncertain = $callDerived -and $longContextThreshold -gt 0L -and [Int64]$call.Input -gt $longContextThreshold
             $longContext = $false
-            if ($null -ne $price -and $null -ne $price.PSObject.Properties['longContextThreshold']) {
-                $longContext = ([Int64]$price.longContextThreshold -gt 0 -and [Int64]$call.Input -gt [Int64]$price.longContextThreshold)
+            if ($requestInputObservable -and $longContextThreshold -gt 0L) {
+                $longContext = [Int64]$call.Input -gt $longContextThreshold
             }
             if ($null -ne $event.PSObject.Properties['CacheWriteObservable'] -and -not [bool]$event.CacheWriteObservable) { $cacheWriteObservable = $false }
             if ($longContext) {
@@ -1747,12 +2186,15 @@ function Get-TokenRaderIntervalResult {
                 $standardContextInput += [Int64]$call.Input
             }
             $serviceTier = ConvertTo-TokenRaderServiceTier ([string]$event.ServiceTier)
-            $bucketKey = $model.ToLowerInvariant() + '|' + $serviceTier + '|' + $(if ($longContext) { 'long' } else { 'standard' })
+            $bucketKey = $model.ToLowerInvariant() + '|' + $serviceTier + '|' + $(if ($longContext) { 'long' } else { 'standard' }) +
+                $(if (-not $requestInputObservable) { '|' + $(if ($longContextPricingUncertain) { 'uncertain' } else { 'bounded' }) } else { '' })
             if (-not $costBuckets.ContainsKey($bucketKey)) {
                 $costBuckets[$bucketKey] = [pscustomobject]@{
                     Model = $model
                     ServiceTier = $serviceTier
                     LongContext = $longContext
+                    RequestInputObservable = $requestInputObservable
+                    LongContextPricingUncertain = $longContextPricingUncertain
                     Input = [Int64]0
                     Cached = [Int64]0
                     Output = [Int64]0
@@ -1774,6 +2216,8 @@ function Get-TokenRaderIntervalResult {
                 -not [bool]$event.CacheWriteObservable) {
                 $bucket.CacheWriteObservable = $false
             }
+            $bucket.RequestInputObservable = $bucket.RequestInputObservable -and $requestInputObservable
+            $bucket.LongContextPricingUncertain = $bucket.LongContextPricingUncertain -or $longContextPricingUncertain
             $bucket.Events++
         }
     }
@@ -1784,7 +2228,10 @@ function Get-TokenRaderIntervalResult {
         $cost = Get-TokenRaderCost -Usage $bucketUsage -Model ([string]$bucket.Model) -PricingDocument $PricingDocument `
             -Scope call -LongContextApplied ([bool]$bucket.LongContext) `
             -CacheCreationTokens ([Int64]$bucket.CacheCreationTokens) `
-            -CacheWriteObservable ([bool]$bucket.CacheWriteObservable) -ServiceTier ([string]$bucket.ServiceTier)
+            -CacheWriteObservable ([bool]$bucket.CacheWriteObservable) `
+            -RequestInputObservable ([bool]$bucket.RequestInputObservable) `
+            -LongContextPricingUncertain ([bool]$bucket.LongContextPricingUncertain) `
+            -ServiceTier ([string]$bucket.ServiceTier)
         $itemTierComplete = $null -ne $cost.PSObject.Properties['ServiceTierComplete'] -and [bool]$cost.ServiceTierComplete
         $itemModeComplete = $null -ne $cost.PSObject.Properties['ModeEvidenceComplete'] -and [bool]$cost.ModeEvidenceComplete
         $itemAssumption = $null -ne $cost.PSObject.Properties['ModeAssumptionApplied'] -and [bool]$cost.ModeAssumptionApplied
@@ -1840,6 +2287,8 @@ function Get-TokenRaderIntervalResult {
             ManualServiceTierApplied = $itemAssumption
             ServiceTierSource = [string]$cost.ServiceTierSource
             LongContext = [bool]$bucket.LongContext
+            RequestInputObservable = [bool]$bucket.RequestInputObservable
+            LongContextPricingUncertain = [bool]$bucket.LongContextPricingUncertain
             Usage = $bucketUsage
             Cost = $cost
             Events = [Int64]$bucket.Events
@@ -3085,6 +3534,7 @@ function ConvertFrom-TokenRaderIndexRecord {
     }
 
     $recordModel = [string]$Row['model']
+    $recordIdentitySource = if ($Row.Table.Columns.Contains('identity_source')) { [string]$Row['identity_source'] } else { '' }
     [Int64]$recordLongThreshold = if ($Row.Table.Columns.Contains('long_context_threshold') -and -not [DBNull]::Value.Equals($Row['long_context_threshold'])) { [Int64]$Row['long_context_threshold'] } else { 0L }
     $recordLongSource = if ($Row.Table.Columns.Contains('long_context_source')) { [string]$Row['long_context_source'] } else { '' }
     if (@('pricing_threshold', 'no_threshold', 'unknown_model', 'missing_input') -notcontains $recordLongSource) {
@@ -3110,6 +3560,8 @@ function ConvertFrom-TokenRaderIndexRecord {
         LongContextThreshold = if ($recordLongThreshold -gt 0L) { $recordLongThreshold } else { $null }
         LongContextApplied = if ($Row.Table.Columns.Contains('long_context_applied')) { [bool]([int]$Row['long_context_applied']) } else { $false }
         LongContextSource = $recordLongSource
+        RequestInputObservable = -not ($recordIdentitySource -ieq 'missing_last')
+        LongContextPricingUncertain = ($recordIdentitySource -ieq 'missing_last') -and $recordLongThreshold -gt 0L -and $callInput -gt $recordLongThreshold
         CacheCreationTokens = if ($Row.Table.Columns.Contains('cache_creation_tokens')) { [Int64]$Row['cache_creation_tokens'] } else { 0L }
         CacheWriteObservable = if ($Row.Table.Columns.Contains('cache_write_observable')) { [bool]([int]$Row['cache_write_observable']) } else { $false }
         PlanType = [string]$Row['plan_type']
@@ -3492,6 +3944,8 @@ function ConvertFrom-TokenRaderPricedAggregate {
             Usage = $bucketUsage; Model = $model; PricingDocument = $PricingDocument
             ResolvedPrice = $priceCache[$priceCacheKey]; ServiceTier = $tier; Scope = 'call'
             LongContextApplied = [bool]$bucket.LongContext; CacheWriteObservable = $bucketObservable
+            RequestInputObservable = if ($null -ne $bucket.PSObject.Properties['RequestInputObservable']) { [bool]$bucket.RequestInputObservable } else { $true }
+            LongContextPricingUncertain = if ($null -ne $bucket.PSObject.Properties['LongContextPricingUncertain']) { [bool]$bucket.LongContextPricingUncertain } else { $null }
             CacheCreationTokens = $(if ($null -ne $bucket.PSObject.Properties['CacheCreationTokens']) { [Int64]$bucket.CacheCreationTokens } else { 0L })
             ModelContextWindow = $(if ($null -ne $bucket.PSObject.Properties['ModelContextWindow']) { [Int64]$bucket.ModelContextWindow } else { 0L })
         }
@@ -3546,6 +4000,8 @@ function ConvertFrom-TokenRaderPricedAggregate {
             ManualServiceTierApplied = $itemAssumption
             ServiceTierSource = if ($itemAssumption) { 'manual_confirmation' } elseif ($itemTier -eq '') { [string]$cost.ServiceTierSource } elseif ($null -ne $bucket.PSObject.Properties['ServiceTierSource'] -and -not [string]::IsNullOrWhiteSpace([string]$bucket.ServiceTierSource)) { [string]$bucket.ServiceTierSource } else { [string]$cost.ServiceTierSource }
             LongContext = [bool]$bucket.LongContext
+            RequestInputObservable = if ($null -ne $bucket.PSObject.Properties['RequestInputObservable']) { [bool]$bucket.RequestInputObservable } else { $true }
+            LongContextPricingUncertain = if ($null -ne $bucket.PSObject.Properties['LongContextPricingUncertain']) { [bool]$bucket.LongContextPricingUncertain } else { $false }
             Usage = $bucketUsage
             Events = [Int64]$bucket.Events
             ModelContextWindow = $cost.ModelContextWindow
@@ -4227,6 +4683,8 @@ function Get-TokenRaderUsageHistoryWindow {
                 Scope = 'call'; LongContextApplied = [bool]$bucket.LongContext
                 CacheCreationTokens = [Int64]$bucket.CacheCreationTokens
                 CacheWriteObservable = [bool]$bucket.CacheWriteObservable
+                RequestInputObservable = if ($null -ne $bucket.PSObject.Properties['RequestInputObservable']) { [bool]$bucket.RequestInputObservable } else { $true }
+                LongContextPricingUncertain = if ($null -ne $bucket.PSObject.Properties['LongContextPricingUncertain']) { [bool]$bucket.LongContextPricingUncertain } else { $null }
                 ServiceTier = $serviceTier
             }
             if ($null -ne $bucket.PSObject.Properties['ServiceTierSource']) { $costArgs.ServiceTierSource = $serviceTierSource }
