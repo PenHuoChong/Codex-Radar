@@ -104,4 +104,15 @@ $selectorMatch = [regex]::Match($coreSource, '(?s)function Select-TokenRaderQuot
 Assert-PlanBinding $selectorMatch.Success 'selector function source was not found'
 Assert-PlanBinding ($selectorMatch.Value -notmatch 'Get-TokenRaderAccount|Open-TokenRaderIndex|Get-ChildItem|auth\.json|SQLiteConnection') 'selector reads private/auth data or opens the database'
 
+# PS5 unwraps if-expression results with one element; restoration must accept
+# zero, one and multiple candidates without accessing Count on a scalar/null.
+foreach ($count in @(0,1,2)) {
+    $singleWindow=$fiveHour.PSObject.Copy()
+    $singleWindow.ScopeCandidates=@($fiveHour.ScopeCandidates | Select-Object -First $count)
+    $raw=[pscustomobject]@{FiveHour=$singleWindow;Weekly=$weekly.PSObject.Copy();PlanType='pro';ObservedAt=$observed}
+    $automatic=Select-TokenRaderQuotaPlan -RateLimits $raw -PlanType ''
+    Assert-PlanBinding ($null -ne $automatic.Weekly) ('automatic restoration failed for count '+$count)
+    $explicit=Select-TokenRaderQuotaPlan -RateLimits $raw -PlanType 'pro'
+    Assert-PlanBinding ($explicit.Weekly.UsedPercent -eq 21) ('explicit selection failed for count '+$count)
+}
 Write-Output 'QUOTA_PLAN_BINDING_TESTS_PASSED'

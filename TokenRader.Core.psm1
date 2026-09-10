@@ -1394,7 +1394,7 @@ function Restore-TokenRaderQuotaPlanSelection {
         if ($null -eq $property -or $null -eq $property.Value) { $restoredWindows[$windowKind] = $null; continue }
         $window = $property.Value
         $candidateProperty = $window.PSObject.Properties['ScopeCandidates']
-        $scopeCandidates = if ($null -ne $candidateProperty) { @($candidateProperty.Value) } else { @() }
+        [object[]]$scopeCandidates = @(if ($null -ne $candidateProperty) { $candidateProperty.Value })
         if ($scopeCandidates.Count -eq 0) { $restoredWindows[$windowKind] = $window; continue }
         $baseMinutes = 0
         try { $baseMinutes = [int]$window.WindowMinutes } catch { }
@@ -1531,7 +1531,7 @@ function Select-TokenRaderQuotaPlan {
         $originalWindow = $windowProperty.Value
         $windowCopy = Copy-TokenRaderQuotaPlanObject -Object $originalWindow
         $candidateProperty = $originalWindow.PSObject.Properties['ScopeCandidates']
-        $scopeCandidates = if ($null -ne $candidateProperty) { @($candidateProperty.Value) } else { @() }
+        [object[]]$scopeCandidates = @(if ($null -ne $candidateProperty) { $candidateProperty.Value })
 
         # Use only candidates in the same window/reset cycle and limit pool.
         # ScopeCandidates already contains the winning current cycle in normal

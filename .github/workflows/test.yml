@@ -31,3 +31,9 @@ jobs:
       - name: Verify UI callbacks on PowerShell 7
         shell: pwsh
         run: .\tests\Run-UiCallbackTests.ps1
+      - name: Verify quota dialog on Windows PowerShell 5.1
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Run-QuotaPlanDialogTests.ps1
+      - name: Verify quota dialog on PowerShell 7
+        shell: pwsh
+        run: pwsh -NoProfile -STA -File .\tests\Run-QuotaPlanDialogTests.ps1
