@@ -1027,7 +1027,8 @@ function ConvertTo-TokenRaderRateWindow {
         [Parameter(Mandatory = $true)]$RawWindow,
         [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt,
         [string]$SourceFile = '',
-        [string]$PlanType = ''
+        [string]$PlanType = '',
+        [string]$LimitId = ''
     )
 
     $usedPercent = [Math]::Max(0.0, [Math]::Min(100.0, [double]$RawWindow.used_percent))
@@ -1055,6 +1056,10 @@ function ConvertTo-TokenRaderRateWindow {
         ObservedAt = $ObservedAt
         SourceFile = $SourceFile
         PlanType = $PlanType
+        LimitId = $LimitId
+        ScopeConflict = $false
+        ConflictDescription = ''
+        ConflictPlans = @()
         UsedTokens = if ($null -ne $RawWindow.PSObject.Properties['used_tokens']) { [Int64]$RawWindow.used_tokens } else { $null }
         RemainingTokens = if ($null -ne $RawWindow.PSObject.Properties['remaining_tokens']) { [Int64]$RawWindow.remaining_tokens } else { $null }
         LimitTokens = if ($null -ne $RawWindow.PSObject.Properties['limit_tokens']) { [Int64]$RawWindow.limit_tokens } else { $null }
@@ -1077,7 +1082,8 @@ function ConvertTo-TokenRaderRateLimits {
             if ($null -eq $RawRateLimits.PSObject.Properties[$propertyName]) { continue }
             $rawWindow = $RawRateLimits.$propertyName
             if ($null -eq $rawWindow -or $null -eq $rawWindow.PSObject.Properties['window_minutes'] -or $null -eq $rawWindow.PSObject.Properties['used_percent']) { continue }
-            $window = ConvertTo-TokenRaderRateWindow -RawWindow $rawWindow -ObservedAt $ObservedAt -SourceFile $SourceFile -PlanType $planType
+            $limitId = if ($null -ne $RawRateLimits.PSObject.Properties['limit_id']) { [string]$RawRateLimits.limit_id } else { '' }
+            $window = ConvertTo-TokenRaderRateWindow -RawWindow $rawWindow -ObservedAt $ObservedAt -SourceFile $SourceFile -PlanType $planType -LimitId $limitId
             $kind = Get-TokenRaderRateWindowKind -WindowMinutes $window.WindowMinutes
             if ($kind -eq 'FiveHour') { $fiveHour = $window }
             elseif ($kind -eq 'Weekly') { $weekly = $window }
@@ -1095,6 +1101,222 @@ function ConvertTo-TokenRaderRateLimits {
         CreditsBalance = if ($null -ne $RawRateLimits -and $null -ne $RawRateLimits.PSObject.Properties['credits'] -and $null -ne $RawRateLimits.credits -and $null -ne $RawRateLimits.credits.PSObject.Properties['balance']) { [double]$RawRateLimits.credits.balance } else { $null }
         CreditsHas = if ($null -ne $RawRateLimits -and $null -ne $RawRateLimits.PSObject.Properties['credits'] -and $null -ne $RawRateLimits.credits -and $null -ne $RawRateLimits.credits.PSObject.Properties['has_credits']) { [bool]$RawRateLimits.credits.has_credits } else { $null }
         CreditsUnlimited = if ($null -ne $RawRateLimits -and $null -ne $RawRateLimits.PSObject.Properties['credits'] -and $null -ne $RawRateLimits.credits -and $null -ne $RawRateLimits.credits.PSObject.Properties['unlimited']) { [bool]$RawRateLimits.credits.unlimited } else { $null }
+        ScopeConflict = $false
+        ConflictDescription = ''
+        ConflictPlans = @()
+        FiveHour = $fiveHour
+        Weekly = $weekly
+    }
+}
+
+function ConvertFrom-TokenRaderRateLimitCandidates {
+    param(
+        [AllowNull()][object[]]$Candidates
+    )
+
+    $allCandidates = @($Candidates | Where-Object {
+        $null -ne $_ -and $null -ne $_.Window -and
+        -not [string]::IsNullOrWhiteSpace([string]$_.WindowKind)
+    })
+    if ($allCandidates.Count -eq 0) { return $null }
+
+    $selectedWindows = @{}
+    $selectedScopes = @{}
+    foreach ($windowKind in @('FiveHour', 'Weekly')) {
+        $kindCandidates = @($allCandidates | Where-Object { [string]$_.WindowKind -eq $windowKind })
+        if ($kindCandidates.Count -eq 0) { continue }
+
+        # A scope is one normalized reset cycle and limit pool. Keep plans in
+        # the same scope together so an alternate plan cannot be overwritten
+        # by the latest timestamp. Different reset identities remain separate.
+        $scopeGroups = @{}
+        foreach ($candidate in $kindCandidates) {
+            $window = $candidate.Window
+            $windowMinutes = [int]$window.WindowMinutes
+            $resetIdentity = if ($null -ne $window.PSObject.Properties['ResetIdentity']) {
+                [string]$window.ResetIdentity
+            } else {
+                Get-TokenRaderResetIdentity -WindowMinutes $windowMinutes -ResetsAt $window.ResetsAt
+            }
+            $limitId = if ($null -ne $window.PSObject.Properties['LimitId']) {
+                [string]$window.LimitId
+            } elseif ($null -ne $candidate.Metadata -and $null -ne $candidate.Metadata.PSObject.Properties['LimitId']) {
+                [string]$candidate.Metadata.LimitId
+            } else { '' }
+            $planType = if ($null -ne $window.PSObject.Properties['PlanType']) {
+                [string]$window.PlanType
+            } elseif ($null -ne $candidate.Metadata -and $null -ne $candidate.Metadata.PSObject.Properties['PlanType']) {
+                [string]$candidate.Metadata.PlanType
+            } else { '' }
+            if ($null -eq $window.PSObject.Properties['LimitId']) {
+                Add-Member -InputObject $window -NotePropertyName LimitId -NotePropertyValue $limitId -Force
+            } else { $window.LimitId = $limitId }
+            if ($null -eq $window.PSObject.Properties['PlanType']) {
+                Add-Member -InputObject $window -NotePropertyName PlanType -NotePropertyValue $planType -Force
+            } else { $window.PlanType = $planType }
+            $scopeKey = @(
+                $windowMinutes.ToString([Globalization.CultureInfo]::InvariantCulture),
+                $resetIdentity,
+                $limitId.Trim().ToLowerInvariant()
+            ) -join ([char]0x1f)
+            if (-not $scopeGroups.ContainsKey($scopeKey)) {
+                $scopeGroups[$scopeKey] = New-Object System.Collections.ArrayList
+            }
+            [void]$scopeGroups[$scopeKey].Add($candidate)
+        }
+
+        # Select the most recently observed reset scope. The scope key still
+        # includes reset identity, so older cycles do not create a conflict
+        # with the current cycle even if their plan differs.
+        $selectedGroup = $null
+        $selectedLatest = $null
+        [DateTimeOffset]$selectedAt = [DateTimeOffset]::MinValue
+        [Int64]$selectedId = [Int64]::MinValue
+        foreach ($group in @($scopeGroups.Values)) {
+            foreach ($candidate in @($group)) {
+                [DateTimeOffset]$candidateAt = [DateTimeOffset]::MinValue
+                try { $candidateAt = [DateTimeOffset]$candidate.Window.ObservedAt } catch { }
+                [Int64]$candidateId = 0L
+                if ($null -ne $candidate.PSObject.Properties['RecordId']) {
+                    try { $candidateId = [Int64]$candidate.RecordId } catch { }
+                }
+                if ($null -eq $selectedLatest -or $candidateAt -gt $selectedAt -or
+                    ($candidateAt -eq $selectedAt -and $candidateId -gt $selectedId)) {
+                    $selectedGroup = @($group)
+                    $selectedLatest = $candidate
+                    $selectedAt = $candidateAt
+                    $selectedId = $candidateId
+                }
+            }
+        }
+        if ($null -eq $selectedLatest) { continue }
+
+        $planMap = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+        $planLatest = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($candidate in @($selectedGroup)) {
+            $plan = ([string]$candidate.Window.PlanType).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($plan)) {
+                $planMap[$plan] = $true
+                if (-not $planLatest.ContainsKey($plan)) {
+                    $planLatest[$plan] = $candidate
+                } else {
+                    [DateTimeOffset]$existingAt = [DateTimeOffset]::MinValue
+                    [DateTimeOffset]$candidateAt = [DateTimeOffset]::MinValue
+                    try { $existingAt = [DateTimeOffset]$planLatest[$plan].Window.ObservedAt } catch { }
+                    try { $candidateAt = [DateTimeOffset]$candidate.Window.ObservedAt } catch { }
+                    if ($candidateAt -gt $existingAt) { $planLatest[$plan] = $candidate }
+                }
+            }
+        }
+        $plans = @($planMap.Keys | Sort-Object)
+        $scopeConflict = $plans.Count -gt 1
+        $planDetails = @($plans | ForEach-Object {
+            $planCandidate = $planLatest[$_]
+            '{0}={1:0.####}%' -f $_, [double]$planCandidate.Window.UsedPercent
+        })
+        $conflictDescription = if ($scopeConflict) {
+            '额度周期存在冲突计划：' + ($planDetails -join '; ')
+        } else { '' }
+        $selectedWindow = $selectedLatest.Window
+        if ($null -eq $selectedWindow.PSObject.Properties['ScopeConflict']) {
+            Add-Member -InputObject $selectedWindow -NotePropertyName ScopeConflict -NotePropertyValue ([bool]$scopeConflict) -Force
+        } else { $selectedWindow.ScopeConflict = [bool]$scopeConflict }
+        if ($null -eq $selectedWindow.PSObject.Properties['ConflictDescription']) {
+            Add-Member -InputObject $selectedWindow -NotePropertyName ConflictDescription -NotePropertyValue $conflictDescription -Force
+        } else { $selectedWindow.ConflictDescription = $conflictDescription }
+        if ($null -eq $selectedWindow.PSObject.Properties['ConflictPlans']) {
+            Add-Member -InputObject $selectedWindow -NotePropertyName ConflictPlans -NotePropertyValue @($plans) -Force
+        } else { $selectedWindow.ConflictPlans = @($plans) }
+
+        $scopeSummary = foreach ($candidate in @($selectedGroup)) {
+            $candidateResetIdentity = if ($null -ne $candidate.Window.PSObject.Properties['ResetIdentity']) {
+                [string]$candidate.Window.ResetIdentity
+            } else {
+                Get-TokenRaderResetIdentity -WindowMinutes ([int]$candidate.Window.WindowMinutes) -ResetsAt $candidate.Window.ResetsAt
+            }
+            [pscustomobject]@{
+                WindowKind = $windowKind
+                WindowMinutes = [int]$candidate.Window.WindowMinutes
+                ResetIdentity = $candidateResetIdentity
+                PlanType = [string]$candidate.Window.PlanType
+                LimitId = [string]$candidate.Window.LimitId
+                UsedPercent = [double]$candidate.Window.UsedPercent
+                ObservedAt = $candidate.Window.ObservedAt
+                RecordId = if ($null -ne $candidate.PSObject.Properties['RecordId']) { [Int64]$candidate.RecordId } else { 0L }
+            }
+        }
+        if ($null -eq $selectedWindow.PSObject.Properties['ScopeCandidates']) {
+            Add-Member -InputObject $selectedWindow -NotePropertyName ScopeCandidates -NotePropertyValue @($scopeSummary) -Force
+        } else { $selectedWindow.ScopeCandidates = @($scopeSummary) }
+        $selectedWindows[$windowKind] = $selectedWindow
+        $selectedScopes[$windowKind] = [pscustomobject]@{
+            ScopeConflict = [bool]$scopeConflict
+            ConflictDescription = $conflictDescription
+            ConflictPlans = @($plans)
+            Candidates = @($scopeSummary)
+        }
+    }
+
+    $fiveHour = if ($selectedWindows.ContainsKey('FiveHour')) { $selectedWindows['FiveHour'] } else { $null }
+    $weekly = if ($selectedWindows.ContainsKey('Weekly')) { $selectedWindows['Weekly'] } else { $null }
+    if ($null -eq $fiveHour -and $null -eq $weekly) { return $null }
+
+    # Preserve the existing top-level metadata contract by using the newest
+    # source metadata row, while each selected window carries its own scope.
+    $latestMetadata = $null
+    [DateTimeOffset]$latestMetadataAt = [DateTimeOffset]::MinValue
+    [Int64]$latestMetadataId = [Int64]::MinValue
+    foreach ($candidate in $allCandidates) {
+        $metadata = $candidate.Metadata
+        if ($null -eq $metadata) { continue }
+        [DateTimeOffset]$candidateAt = [DateTimeOffset]::MinValue
+        try { $candidateAt = [DateTimeOffset]$candidate.Window.ObservedAt } catch { }
+        [Int64]$candidateId = 0L
+        if ($null -ne $candidate.PSObject.Properties['RecordId']) {
+            try { $candidateId = [Int64]$candidate.RecordId } catch { }
+        }
+        if ($null -eq $latestMetadata -or $candidateAt -gt $latestMetadataAt -or
+            ($candidateAt -eq $latestMetadataAt -and $candidateId -gt $latestMetadataId)) {
+            $latestMetadata = $metadata
+            $latestMetadataAt = $candidateAt
+            $latestMetadataId = $candidateId
+        }
+    }
+    $planType = if ($null -ne $fiveHour -and $null -ne $weekly -and
+        [DateTimeOffset]$fiveHour.ObservedAt -ge [DateTimeOffset]$weekly.ObservedAt) { [string]$fiveHour.PlanType }
+        elseif ($null -ne $weekly) { [string]$weekly.PlanType }
+        elseif ($null -ne $fiveHour) { [string]$fiveHour.PlanType } else { '' }
+    $scopeConflict = ($null -ne $fiveHour -and [bool]$fiveHour.ScopeConflict) -or
+        ($null -ne $weekly -and [bool]$weekly.ScopeConflict)
+    $conflictPlans = @(
+        if ($null -ne $fiveHour -and [bool]$fiveHour.ScopeConflict) { @($fiveHour.ConflictPlans) }
+        if ($null -ne $weekly -and [bool]$weekly.ScopeConflict) { @($weekly.ConflictPlans) }
+    ) | Sort-Object -Unique
+    [pscustomobject]@{
+        ObservedAt = if ($null -ne $fiveHour -and $null -ne $weekly -and [DateTimeOffset]$fiveHour.ObservedAt -gt [DateTimeOffset]$weekly.ObservedAt) { $fiveHour.ObservedAt } elseif ($null -ne $weekly) { $weekly.ObservedAt } else { $fiveHour.ObservedAt }
+        PlanType = $planType
+        LimitId = if ($null -ne $latestMetadata) { [string]$latestMetadata.LimitId } else { '' }
+        LimitName = if ($null -ne $latestMetadata) { [string]$latestMetadata.LimitName } else { '' }
+        IndividualLimit = if ($null -ne $latestMetadata) { $latestMetadata.IndividualLimit } else { $null }
+        RateLimitReachedType = if ($null -ne $latestMetadata) { [string]$latestMetadata.RateLimitReachedType } else { '' }
+        SpendControlReached = if ($null -ne $latestMetadata) { $latestMetadata.SpendControlReached } else { $null }
+        CreditsBalance = if ($null -ne $latestMetadata) { $latestMetadata.CreditsBalance } else { $null }
+        CreditsHas = if ($null -ne $latestMetadata) { $latestMetadata.CreditsHas } else { $null }
+        CreditsUnlimited = if ($null -ne $latestMetadata) { $latestMetadata.CreditsUnlimited } else { $null }
+        ScopeConflict = [bool]$scopeConflict
+        ConflictDescription = if ($scopeConflict) {
+            $details = @()
+            foreach ($plan in @($conflictPlans)) {
+                $window = if ($null -ne $fiveHour -and @($fiveHour.ConflictPlans) -contains $plan) { $fiveHour } else { $weekly }
+                if ($null -ne $window) { $details += ('{0}={1:0.####}%' -f $plan, [double]$window.UsedPercent) }
+            }
+            '额度周期存在冲突计划：' + ($details -join '; ')
+        } else { '' }
+        ConflictPlans = @($conflictPlans)
+        ScopeCandidates = @(
+            if ($null -ne $fiveHour -and $null -ne $fiveHour.PSObject.Properties['ScopeCandidates']) { @($fiveHour.ScopeCandidates) }
+            if ($null -ne $weekly -and $null -ne $weekly.PSObject.Properties['ScopeCandidates']) { @($weekly.ScopeCandidates) }
+        )
         FiveHour = $fiveHour
         Weekly = $weekly
     }
@@ -1340,11 +1562,7 @@ function Get-TokenRaderLatestRateLimits {
     if ($MaximumFiles -gt 0 -and $files.Count -gt $MaximumFiles) {
         $files = @($files | Select-Object -First $MaximumFiles)
     }
-    $fiveHour = $null
-    $weekly = $null
-    $fiveObserved = [DateTimeOffset]::MinValue
-    $weeklyObserved = [DateTimeOffset]::MinValue
-    $planType = ''
+    $candidates = New-Object System.Collections.ArrayList
 
     foreach ($file in $files) {
         $canonicalPath = ConvertTo-TokenRaderCanonicalPath -Path ([string]$file.FullName)
@@ -1373,25 +1591,20 @@ function Get-TokenRaderLatestRateLimits {
         }
         if ($null -eq $snapshot -or $null -eq $snapshot.RateLimits) { continue }
         $rateLimits = $snapshot.RateLimits
-        if ($null -ne $rateLimits.FiveHour -and $rateLimits.FiveHour.ObservedAt -gt $fiveObserved) {
-            $fiveHour = $rateLimits.FiveHour
-            $fiveObserved = $rateLimits.FiveHour.ObservedAt
+        if ($null -ne $rateLimits.FiveHour) {
+            [void]$candidates.Add([pscustomobject]@{
+                WindowKind = 'FiveHour'; Window = $rateLimits.FiveHour; Metadata = $rateLimits
+                RecordId = 0L; SourceFile = $canonicalPath
+            })
         }
-        if ($null -ne $rateLimits.Weekly -and $rateLimits.Weekly.ObservedAt -gt $weeklyObserved) {
-            $weekly = $rateLimits.Weekly
-            $weeklyObserved = $rateLimits.Weekly.ObservedAt
+        if ($null -ne $rateLimits.Weekly) {
+            [void]$candidates.Add([pscustomobject]@{
+                WindowKind = 'Weekly'; Window = $rateLimits.Weekly; Metadata = $rateLimits
+                RecordId = 0L; SourceFile = $canonicalPath
+            })
         }
     }
-
-    if ($null -eq $fiveHour -and $null -eq $weekly) { return $null }
-    if ($fiveObserved -ge $weeklyObserved -and $null -ne $fiveHour) { $planType = [string]$fiveHour.PlanType }
-    elseif ($null -ne $weekly) { $planType = [string]$weekly.PlanType }
-    [pscustomobject]@{
-        ObservedAt = if ($fiveObserved -gt $weeklyObserved) { $fiveObserved } else { $weeklyObserved }
-        PlanType = $planType
-        FiveHour = $fiveHour
-        Weekly = $weekly
-    }
+    return ConvertFrom-TokenRaderRateLimitCandidates -Candidates @($candidates)
 }
 
 function Get-TokenRaderPrices {
@@ -2491,6 +2704,7 @@ function Get-TokenRaderQuotaEstimate {
     function Get-WindowEstimate {
         param($StartWindow, $EndWindow, [string]$StartPlanType, [string]$EndPlanType, $Evidence)
         if ($null -eq $EndWindow) { return $null }
+        if ($null -ne $EndWindow.PSObject.Properties['ScopeConflict'] -and [bool]$EndWindow.ScopeConflict) { return $null }
         if ($useQuotaEvidence) {
             $evidenceServiceTierComplete = if ($null -ne $Evidence -and $null -ne $Evidence.PSObject.Properties['ServiceTierComplete']) { [bool]$Evidence.ServiceTierComplete } else { $true }
             $evidenceModeComplete = if ($null -ne $Evidence -and $null -ne $Evidence.PSObject.Properties['ModeEvidenceComplete']) { [bool]$Evidence.ModeEvidenceComplete } else { $true }
@@ -2532,7 +2746,7 @@ function Get-TokenRaderQuotaEstimate {
             }
             if ($null -ne $EndReferenceAt -and $null -ne $EndWindow.ResetsAt -and
                 [DateTimeOffset]$EndWindow.ResetsAt -le [DateTimeOffset]$EndReferenceAt) { return $null }
-            if ($null -ne $Evidence.LastCountedAt -and
+            if ($null -ne $Evidence.PSObject.Properties['LastCountedAt'] -and $null -ne $Evidence.LastCountedAt -and
                 [DateTimeOffset]$Evidence.LastCountedAt -gt [DateTimeOffset]$Evidence.EndObservedAt) { return $null }
             [double]$currentUsedPercent = [double]$EndWindow.UsedPercent
             [double]$totalUsd = [double]$Evidence.EstimatedTotalUsd
@@ -2545,6 +2759,8 @@ function Get-TokenRaderQuotaEstimate {
                 PercentResolution = if ($null -ne $Evidence.PSObject.Properties['PercentResolution']) { [double]$Evidence.PercentResolution } else { [double](Get-TokenRaderWindowPercentResolution $EndWindow) }
                 ResolutionAssumptionApplied = if ($null -ne $Evidence.PSObject.Properties['ResolutionAssumptionApplied']) { [bool]$Evidence.ResolutionAssumptionApplied } else { $false }
                 HistoryLookbackApplied = if ($null -ne $Evidence.PSObject.Properties['HistoryLookbackApplied']) { [bool]$Evidence.HistoryLookbackApplied } else { $false }
+                CalibrationStartObservedAt = if ($null -ne $Evidence.PSObject.Properties['StartObservedAt']) { $Evidence.StartObservedAt } else { $null }
+                CalibrationEndObservedAt = if ($null -ne $Evidence.PSObject.Properties['EndObservedAt']) { $Evidence.EndObservedAt } else { $null }
                 CurrentObservedAt = $evidenceCurrentAt
                 TotalTokens = if ($null -ne $Evidence.PSObject.Properties['TotalTokens']) { [Int64]$Evidence.TotalTokens } else { 0L }
                 UsedTokens = if ($null -ne $Evidence.PSObject.Properties['UsedTokens']) { [Int64]$Evidence.UsedTokens } else { 0L }
@@ -2562,8 +2778,8 @@ function Get-TokenRaderQuotaEstimate {
                 IdentitySources = if ($null -ne $Evidence.PSObject.Properties['IdentitySources']) { @($Evidence.IdentitySources) } else { @() }
                 UnidentifiedEvents = if ($null -ne $Evidence.PSObject.Properties['UnidentifiedEvents']) { [Int64]$Evidence.UnidentifiedEvents } else { 0L }
                 EvidenceCost = [double]$Evidence.TotalCost
-                EvidenceFirstCountedAt = $Evidence.FirstCountedAt
-                EvidenceLastCountedAt = $Evidence.LastCountedAt
+                EvidenceFirstCountedAt = if ($null -ne $Evidence.PSObject.Properties['FirstCountedAt']) { $Evidence.FirstCountedAt } else { $null }
+                EvidenceLastCountedAt = if ($null -ne $Evidence.PSObject.Properties['LastCountedAt']) { $Evidence.LastCountedAt } else { $null }
                 AverageUsdPerToken = if ($null -ne $Evidence.PSObject.Properties['AverageUsdPerToken']) { [double]$Evidence.AverageUsdPerToken } else { 0.0 }
                 TotalUsd = $totalUsd
                 UsedUsd = if ($null -ne $Evidence.PSObject.Properties['EstimatedUsedUsd']) { [double]$Evidence.EstimatedUsedUsd } else { $totalUsd * ($currentUsedPercent / 100.0) }
@@ -2609,6 +2825,8 @@ function Get-TokenRaderQuotaEstimate {
             EffectiveDeltaPercent = $effectiveDeltaPercent
             PercentResolution = $percentResolution
             ResolutionAssumptionApplied = $deltaPercent -eq 0.0
+            CalibrationStartObservedAt = if ($null -ne $StartWindow.PSObject.Properties['ObservedAt']) { $StartWindow.ObservedAt } else { $null }
+            CalibrationEndObservedAt = if ($null -ne $EndWindow.PSObject.Properties['ObservedAt']) { $EndWindow.ObservedAt } else { $null }
             EvidenceCost = $effectiveCost
             EvidenceFirstCountedAt = if ($useQuotaEvidence -and $null -ne $Evidence) { $Evidence.FirstCountedAt } else { $null }
             EvidenceLastCountedAt = if ($useQuotaEvidence -and $null -ne $Evidence) { $Evidence.LastCountedAt } else { $null }
@@ -3490,6 +3708,9 @@ function ConvertFrom-TokenRaderIndexRecord {
             SourceFile = $sourceFile
             PlanType = $planType
             LimitId = if ($Row.Table.Columns.Contains('rate_limit_id')) { [string]$Row['rate_limit_id'] } else { '' }
+            ScopeConflict = $false
+            ConflictDescription = ''
+            ConflictPlans = @()
             LimitName = if ($Row.Table.Columns.Contains('rate_limit_name')) { [string]$Row['rate_limit_name'] } else { '' }
             UsedTokens = & $readNullableInt64 'five_hour_used_tokens'
             RemainingTokens = & $readNullableInt64 'five_hour_remaining_tokens'
@@ -3509,6 +3730,9 @@ function ConvertFrom-TokenRaderIndexRecord {
             SourceFile = $sourceFile
             PlanType = $planType
             LimitId = if ($Row.Table.Columns.Contains('rate_limit_id')) { [string]$Row['rate_limit_id'] } else { '' }
+            ScopeConflict = $false
+            ConflictDescription = ''
+            ConflictPlans = @()
             LimitName = if ($Row.Table.Columns.Contains('rate_limit_name')) { [string]$Row['rate_limit_name'] } else { '' }
             UsedTokens = & $readNullableInt64 'weekly_used_tokens'
             RemainingTokens = & $readNullableInt64 'weekly_remaining_tokens'
@@ -3529,6 +3753,9 @@ function ConvertFrom-TokenRaderIndexRecord {
         CreditsBalance = if ($Row.Table.Columns.Contains('credits_balance') -and -not [DBNull]::Value.Equals($Row['credits_balance'])) { [double]$Row['credits_balance'] } else { $null }
         CreditsHas = if ($Row.Table.Columns.Contains('credits_has') -and -not [DBNull]::Value.Equals($Row['credits_has'])) { [bool]([int]$Row['credits_has']) } else { $null }
         CreditsUnlimited = if ($Row.Table.Columns.Contains('credits_unlimited') -and -not [DBNull]::Value.Equals($Row['credits_unlimited'])) { [bool]([int]$Row['credits_unlimited']) } else { $null }
+        ScopeConflict = $false
+        ConflictDescription = ''
+        ConflictPlans = @()
         FiveHour = $fiveHour
         Weekly = $weekly
     }
@@ -3620,53 +3847,24 @@ function Get-TokenRaderCursorOffsets {
 function ConvertFrom-TokenRaderRateLimitRows {
     param($Table)
     if ($null -eq $Table -or $Table.Rows.Count -eq 0) { return $null }
-    $fiveHour = $null
-    $weekly = $null
-    $fiveObserved = [DateTimeOffset]::MinValue
-    $weeklyObserved = [DateTimeOffset]::MinValue
-    $latestMetadata = $null
-    $latestMetadataObserved = [DateTimeOffset]::MinValue
-    $latestMetadataId = -1L; $fiveId = -1L; $weeklyId = -1L
+    $candidates = New-Object System.Collections.ArrayList
     foreach ($row in @($Table.Rows)) {
         $record = ConvertFrom-TokenRaderIndexRecord -Row $row
         $rowId = if ($Table.Columns.Contains('id') -and $row['id'] -isnot [DBNull]) { [long]$row['id'] } else { 0L }
-        if ([DateTimeOffset]$record.RateLimits.ObservedAt -gt $latestMetadataObserved -or
-            ([DateTimeOffset]$record.RateLimits.ObservedAt -eq $latestMetadataObserved -and $rowId -gt $latestMetadataId)) {
-            $latestMetadata = $record.RateLimits
-            $latestMetadataObserved = [DateTimeOffset]$record.RateLimits.ObservedAt
-            $latestMetadataId = $rowId
+        if ($null -ne $record.RateLimits.FiveHour) {
+            [void]$candidates.Add([pscustomobject]@{
+                WindowKind = 'FiveHour'; Window = $record.RateLimits.FiveHour
+                Metadata = $record.RateLimits; RecordId = $rowId
+            })
         }
-        if ($null -ne $record.RateLimits.FiveHour -and ([DateTimeOffset]$record.RateLimits.FiveHour.ObservedAt -gt $fiveObserved -or
-            ([DateTimeOffset]$record.RateLimits.FiveHour.ObservedAt -eq $fiveObserved -and $rowId -gt $fiveId))) {
-            $fiveHour = $record.RateLimits.FiveHour
-            $fiveObserved = [DateTimeOffset]$fiveHour.ObservedAt
-            $fiveId = $rowId
-        }
-        if ($null -ne $record.RateLimits.Weekly -and ([DateTimeOffset]$record.RateLimits.Weekly.ObservedAt -gt $weeklyObserved -or
-            ([DateTimeOffset]$record.RateLimits.Weekly.ObservedAt -eq $weeklyObserved -and $rowId -gt $weeklyId))) {
-            $weekly = $record.RateLimits.Weekly
-            $weeklyObserved = [DateTimeOffset]$weekly.ObservedAt
-            $weeklyId = $rowId
+        if ($null -ne $record.RateLimits.Weekly) {
+            [void]$candidates.Add([pscustomobject]@{
+                WindowKind = 'Weekly'; Window = $record.RateLimits.Weekly
+                Metadata = $record.RateLimits; RecordId = $rowId
+            })
         }
     }
-    if ($null -eq $fiveHour -and $null -eq $weekly) { return $null }
-    $planType = if ($fiveObserved -ge $weeklyObserved -and $null -ne $fiveHour) { [string]$fiveHour.PlanType }
-                elseif ($null -ne $weekly) { [string]$weekly.PlanType }
-                else { '' }
-    [pscustomobject]@{
-        ObservedAt = if ($fiveObserved -ge $weeklyObserved) { $fiveObserved } else { $weeklyObserved }
-        PlanType = $planType
-        LimitId = if ($null -ne $latestMetadata) { [string]$latestMetadata.LimitId } else { '' }
-        LimitName = if ($null -ne $latestMetadata) { [string]$latestMetadata.LimitName } else { '' }
-        IndividualLimit = if ($null -ne $latestMetadata) { $latestMetadata.IndividualLimit } else { $null }
-        RateLimitReachedType = if ($null -ne $latestMetadata) { [string]$latestMetadata.RateLimitReachedType } else { '' }
-        SpendControlReached = if ($null -ne $latestMetadata) { $latestMetadata.SpendControlReached } else { $null }
-        CreditsBalance = if ($null -ne $latestMetadata) { $latestMetadata.CreditsBalance } else { $null }
-        CreditsHas = if ($null -ne $latestMetadata) { $latestMetadata.CreditsHas } else { $null }
-        CreditsUnlimited = if ($null -ne $latestMetadata) { $latestMetadata.CreditsUnlimited } else { $null }
-        FiveHour = $fiveHour
-        Weekly = $weekly
-    }
+    return ConvertFrom-TokenRaderRateLimitCandidates -Candidates @($candidates)
 }
 
 function Get-TokenRaderIndexedRateLimitsAtOffsets {
@@ -4082,6 +4280,15 @@ function Get-TokenRaderQuotaWindowEvidence {
         $null -eq $EndWindow.PSObject.Properties['UsedPercent'] -or $null -eq $EndWindow.UsedPercent -or
         $null -eq $EndWindow.PSObject.Properties['PlanType'] -or
         [string]::IsNullOrWhiteSpace([string]$EndWindow.PlanType)) { return $null }
+    $endScopeConflict = $null -ne $EndWindow.PSObject.Properties['ScopeConflict'] -and [bool]$EndWindow.ScopeConflict
+    if ($endScopeConflict) {
+        $conflictDescription = if ($endScopeConflict -and $null -ne $EndWindow.PSObject.Properties['ConflictDescription']) {
+            [string]$EndWindow.ConflictDescription
+        } else { '额度周期存在冲突计划' }
+        if ($null -ne $DiagnosticState) { $DiagnosticState.ConflictDescription = $conflictDescription }
+        Set-TokenRaderQuotaDiagnostic $DiagnosticState 'scope_conflict' $conflictDescription
+        return $null
+    }
     [DateTimeOffset]$currentObservedAt = [DateTimeOffset]$EndWindow.ObservedAt
     [double]$currentUsedPercent = [double]$EndWindow.UsedPercent
     if ([DateTimeOffset]$EndWindow.ResetsAt -le $currentObservedAt) {

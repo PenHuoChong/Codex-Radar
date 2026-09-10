@@ -1345,10 +1345,15 @@ function Merge-LatestRateLimits {
     $currentWeeklyObserved = if ($null -ne $current.Weekly -and $null -ne $current.Weekly.PSObject.Properties['ObservedAt']) { [DateTimeOffset]$current.Weekly.ObservedAt } else { [DateTimeOffset]$current.ObservedAt }
     $useCandidateFive = ($null -ne $Candidate.FiveHour -and ($null -eq $current.FiveHour -or $candidateFiveObserved -ge $currentFiveObserved))
     $useCandidateWeekly = ($null -ne $Candidate.Weekly -and ($null -eq $current.Weekly -or $candidateWeeklyObserved -ge $currentWeeklyObserved))
+    # A conflict describes the candidate set, not merely its latest row.
+    # Never let a larger percentage from an older single source hide it.
+    if ($null -ne $Candidate.FiveHour -and $null -ne $Candidate.FiveHour.PSObject.Properties['ScopeConflict'] -and $Candidate.FiveHour.ScopeConflict) { $useCandidateFive = $true }
+    if ($null -ne $Candidate.Weekly -and $null -ne $Candidate.Weekly.PSObject.Properties['ScopeConflict'] -and $Candidate.Weekly.ScopeConflict) { $useCandidateWeekly = $true }
     foreach ($windowName in @('FiveHour', 'Weekly')) {
         $oldWindow = $current.$windowName
         $newWindow = $Candidate.$windowName
         if ($null -eq $oldWindow -or $null -eq $newWindow -or $null -eq $oldWindow.ResetsAt -or $null -eq $newWindow.ResetsAt) { continue }
+        if ($null -ne $newWindow.PSObject.Properties['ScopeConflict'] -and $newWindow.ScopeConflict) { continue }
         $sameReset = (Get-TokenRaderResetIdentity -WindowMinutes $oldWindow.WindowMinutes -ResetsAt $oldWindow.ResetsAt) -eq
             (Get-TokenRaderResetIdentity -WindowMinutes $newWindow.WindowMinutes -ResetsAt $newWindow.ResetsAt)
         $oldPlan = if ($null -ne $oldWindow.PSObject.Properties['PlanType']) { [string]$oldWindow.PlanType } else { '' }
@@ -1459,6 +1464,14 @@ function Set-QuotaWindowCard {
         $Diagnostic = $null
     )
 
+    if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['ScopeConflict'] -and [bool]$Window.ScopeConflict) {
+        $UsageText.Text = '来源冲突'
+        $Progress.Value = 0
+        $detail = if ($null -ne $Window.PSObject.Properties['ConflictDescription']) { [string]$Window.ConflictDescription } else { '检测到多个计划的额度快照，无法确认当前来源' }
+        $DollarText.Text = '美金额度：不可估 · ' + $detail
+        $ResetText.Text = if ($null -ne $Window.ResetsAt) { '重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt } else { '' }
+        return
+    }
     $usingPreviousSnapshot = $false
     if ($null -eq $Window -and $null -ne $Estimate -and
         $null -ne $Estimate.PSObject.Properties['EndUsedPercent'] -and
@@ -1505,7 +1518,7 @@ function Set-QuotaWindowCard {
         } else {
             ' · ' + $estimateStateLabel + ' · ' + $diagnosticMessage
         }
-        $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 已用≈{2} · 剩余≈{3}{4}{5} · 来源：{6}{7}' -f
+        $DollarText.Text = ('当前用量 {0:0.####}% · 反推总额度≈{1} · 比例外推已用≈{2} · 比例外推剩余≈{3}{4}{5} · 来源：{6}{7}' -f
             $currentPercent,
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd)),
             (Format-TokenRaderUsd ([double]$Estimate.TotalUsd * $currentPercent / 100.0)),
@@ -1515,6 +1528,9 @@ function Set-QuotaWindowCard {
             $sourceLabel,
             ($identityLabel + $diagnosticLabel))
         if ($usingPreviousSnapshot) { $DollarText.Text += ' · 沿用最近有效快照，正在更新' }
+        if ($null -ne $Estimate.PSObject.Properties['CalibrationEndObservedAt'] -and $null -ne $Estimate.CalibrationEndObservedAt) {
+            $DollarText.Text += ' · 校准截至 {0:MM-dd HH:mm:ss}' -f ([DateTimeOffset]$Estimate.CalibrationEndObservedAt).ToLocalTime()
+        }
     } else {
         $DollarText.Text = '美金额度：不可估 · ' + (Get-TokenRaderQuotaDiagnosticMessage -Diagnostic $Diagnostic -Fallback '尚无有效估算结果')
     }
@@ -1550,6 +1566,7 @@ function Update-QuotaCards {
 
 function Test-TokenRaderQuotaEstimateMatchesWindow {
     param($Estimate, $Window)
+    if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['ScopeConflict'] -and [bool]$Window.ScopeConflict) { return $false }
     if ($null -eq $Estimate) { return $false }
     if ($null -ne $Estimate.PSObject.Properties['ResetsAt'] -and $null -ne $Estimate.ResetsAt -and
         [DateTimeOffset]$Estimate.ResetsAt -le [DateTimeOffset]::Now) { return $false }
@@ -1676,6 +1693,17 @@ function Mark-TokenRaderQuotaEstimatesRetainedAfterFailure {
     }
 }
 
+function Test-TokenRaderSameQuotaEvidence {
+    param($Previous, $Current)
+    if ($null -eq $Previous -or $null -eq $Current) { return $false }
+    foreach ($name in @('CalibrationStartObservedAt','CalibrationEndObservedAt','StartUsedPercent','CalibrationEndUsedPercent','EvidenceCost','TotalUsd','PlanType','WindowMinutes','ResetsAt','LimitId','AccountIdentity')) {
+        if ($null -eq $Previous.PSObject.Properties[$name] -or $null -eq $Current.PSObject.Properties[$name]) { return $false }
+        if ($null -eq $Previous.$name -or $null -eq $Current.$name) { return $false }
+        if ($Previous.$name -ne $Current.$name) { return $false }
+    }
+    return $true
+}
+
 function Update-QuotaEstimatesFromInterval {
     param(
         [Parameter(Mandatory = $true)]$Result,
@@ -1782,6 +1810,10 @@ function Update-QuotaEstimatesFromInterval {
         (-not $hasDiagnostics -or ($diagnosticFiveAccountValid -and $diagnosticWeeklyAccountValid))
     $retainedFive = $false
     $retainedWeekly = $false
+    if ($canRetainPrevious) {
+        $retainedFive = Test-TokenRaderSameQuotaEvidence -Previous $previousFive -Current $newEstimates.FiveHour
+        $retainedWeekly = Test-TokenRaderSameQuotaEvidence -Previous $previousWeekly -Current $newEstimates.Weekly
+    }
     $effectiveFive = $newEstimates.FiveHour
     if ($null -eq $effectiveFive -and $canRetainPrevious -and
         (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $previousFive -Window $validationFive)) {
@@ -1810,6 +1842,13 @@ function Update-QuotaEstimatesFromInterval {
                     $diagnosticRetention.Diagnostic.Retained = [bool]$diagnosticRetention.Retained
                 } else {
                     Add-Member -InputObject $diagnosticRetention.Diagnostic -NotePropertyName Retained -NotePropertyValue ([bool]$diagnosticRetention.Retained) -Force
+                }
+                if ($diagnosticRetention.Retained -and
+                    (Get-TokenRaderQuotaDiagnosticValue -Diagnostic $diagnosticRetention.Diagnostic -Name 'ReasonCode' -Default '') -eq 'ok') {
+                    foreach ($entry in @(@('Status','retained'),@('ReasonCode','unchanged_evidence'),@('Message','校准证据未变化，沿用上次结果'))) {
+                        if ($diagnosticRetention.Diagnostic -is [System.Collections.IDictionary]) { $diagnosticRetention.Diagnostic[$entry[0]]=$entry[1] }
+                        else { Add-Member -InputObject $diagnosticRetention.Diagnostic -NotePropertyName $entry[0] -NotePropertyValue $entry[1] -Force }
+                    }
                 }
             }
             $script:State.QuotaDiagnostics = $resultDiagnostics

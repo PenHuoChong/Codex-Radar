@@ -1920,6 +1920,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-UsageCompatibilityTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaEvidenceFixTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaCycleTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-QuotaScopeConflictTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-MeasurementPricingUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ExplorerTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ExplorerBackfillTests.ps1')
@@ -2078,8 +2079,8 @@ try {
     }
     $indexerSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'indexer\TokenRader.Indexer.cs'))
     if ($indexerSource -notmatch 'QueryLatestRateLimitRowsByOffsetRanges' -or
-        $indexerSource -notmatch 'MAX\(CASE WHEN five_hour_used IS NOT NULL THEN source_offset_end END\)' -or
-        $indexerSource -notmatch 'MAX\(CASE WHEN weekly_used IS NOT NULL THEN source_offset_end END\)' -or
+        $indexerSource -notmatch 'MAX\(source_offset_end\) AS latest_offset' -or
+        $indexerSource -notmatch 'GROUP BY source_path, window_kind, plan_type, rate_limit_id, window_minutes, reset_minute' -or
         $indexerSource -match 'DataTable candidates = QueryRowsByOffsetRanges\(db, ReadOffsetRanges\([^;]+true\)') {
         throw 'INDEX CONTRACT FAILED: latest quota lookup must reduce historical rows inside SQLite'
     }

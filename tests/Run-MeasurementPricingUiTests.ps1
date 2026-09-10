@@ -9,7 +9,7 @@ foreach ($name in @('Reset-MeasurementPricingConfirmation','Set-MeasurementPrici
     'Test-TokenRaderQuotaEstimateMatchesWindow','Set-QuotaWindowCard','Merge-LatestRateLimits',
     'Get-ServiceTierLabel','Get-ResultServiceTierSummary','Get-TokenRaderQuotaDiagnostic',
     'Get-TokenRaderQuotaDiagnosticValue','Get-TokenRaderQuotaDiagnosticMessage','Test-TokenRaderQuotaDiagnosticRetained',
-    'Get-TokenRaderQuotaDiagnosticAccountIdentity','Update-QuotaEstimatesFromInterval','Retain-TokenRaderQuotaEstimatesForCurrentWindow')) {
+    'Get-TokenRaderQuotaDiagnosticAccountIdentity','Test-TokenRaderSameQuotaEvidence','Update-QuotaEstimatesFromInterval','Retain-TokenRaderQuotaEstimatesForCurrentWindow')) {
     $match = [regex]::Match($source, '(?s)function ' + $name + '\b.*?(?=\r?\nfunction |\z)')
     if (-not $match.Success) { throw "Missing production function: $name" }
     Invoke-Expression $match.Value
@@ -128,4 +128,28 @@ $script:State.QuotaEstimates=[pscustomobject]@{FiveHour=$null;Weekly=$estimate}
 $script:State.QuotaEstimateAccountIdentity=''
 Retain-TokenRaderQuotaEstimatesForCurrentWindow -RateLimits $script:State.RateLimits -AccountIdentity 'newly-known-account'
 Assert-UiPricing ($null -eq $script:State.QuotaEstimates) 'unknown-account dollars migrated into a newly identified account'
+$conflictWindow=[pscustomobject]@{UsedPercent=11;WindowMinutes=10080;PlanType='prolite';ResetsAt=$reset;ObservedAt=$now;ScopeConflict=$true;ConflictDescription='pro：已用3%；prolite：已用11%'}
+Set-QuotaWindowCard -Window $conflictWindow -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($usage.Text -eq '来源冲突' -and $dollar.Text.Contains('pro：已用3%') -and $dollar.Text.Contains('不可估')) 'conflicting plan snapshot was presented as current account quota'
+Assert-UiPricing (-not (Test-TokenRaderQuotaEstimateMatchesWindow $estimate $conflictWindow)) 'ambiguous scope retained an unbound dollar estimate'
+$sameEvidence=[pscustomobject]@{CalibrationStartObservedAt=$now.AddMinutes(-2);CalibrationEndObservedAt=$now.AddMinutes(-1);StartUsedPercent=10;CalibrationEndUsedPercent=11;EvidenceCost=6.530489;TotalUsd=653.0489;PlanType='pro';WindowMinutes=10080;ResetsAt=$reset;LimitId='codex';AccountIdentity='synthetic'}
+$newEvidence=$sameEvidence.PSObject.Copy()
+Assert-UiPricing (Test-TokenRaderSameQuotaEvidence $sameEvidence $newEvidence) 'unchanged evidence did not compare equal'
+$newEvidence.EvidenceCost=7.0
+Assert-UiPricing (-not (Test-TokenRaderSameQuotaEvidence $sameEvidence $newEvidence)) 'changed cost evidence was marked stale'
+$newEvidence=$sameEvidence.PSObject.Copy();$newEvidence.CalibrationEndObservedAt=$now
+Assert-UiPricing (-not (Test-TokenRaderSameQuotaEvidence $sameEvidence $newEvidence)) 'new calibration boundary was marked stale'
+Set-QuotaWindowCard -Window $window -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($dollar.Text.Contains('比例外推已用') -and $dollar.Text.Contains('比例外推剩余')) 'extrapolated dollars still masquerade as actual spend'
+foreach ($p in $sameEvidence.PSObject.Properties) { $estimate | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force }
+$script:State.AccountIdentity='current-tag';$script:State.QuotaEstimateAccountIdentity='current-tag'
+$script:State.QuotaEstimates=[pscustomobject]@{FiveHour=$null;Weekly=$estimate.PSObject.Copy()}
+$callbackResult.AccountIdentity='current-tag';$callbackResult.QuotaEvidence=[pscustomobject]@{FiveHour=$null;Weekly=[pscustomobject]@{}}
+$callbackResult.QuotaDiagnostics.Weekly=[pscustomobject]@{ReasonCode='ok';Status='updated';Message='本次更新';Retained=$false;AccountIdentity='current-tag'}
+Update-QuotaEstimatesFromInterval -Result $callbackResult
+Assert-UiPricing ($script:State.QuotaDiagnostics.Weekly.Retained -and $script:State.QuotaDiagnostics.Weekly.ReasonCode -eq 'unchanged_evidence') 'refresh callback falsely marked identical calibration as updated'
+$estimate=$estimate.PSObject.Copy();$estimate.EvidenceCost=8.0
+$callbackResult.QuotaDiagnostics.Weekly=[pscustomobject]@{ReasonCode='ok';Status='updated';Message='本次更新';Retained=$false;AccountIdentity='current-tag'}
+Update-QuotaEstimatesFromInterval -Result $callbackResult
+Assert-UiPricing (-not $script:State.QuotaDiagnostics.Weekly.Retained) 'new calibration cost did not immediately mark result updated'
 Write-Output 'MEASUREMENT_PRICING_UI_TESTS_PASSED'

@@ -5904,11 +5904,11 @@ public static class TokenRaderIndexer
     }
 
     /// <summary>
-    /// 额度快照最终只需要全局最新的 5 小时行和周额度行。旧实现先把
-    /// 所有文件边界内的全部历史额度记录载入 DataTable，再在内存选两行；
-    /// 大型索引会因此在“开始计算”阶段长期占用内存和磁盘。这里先在
-    /// SQLite 中按文件及窗口选择 source_offset_end 最大的记录，使每个
-    /// 文件最多返回两条候选，再执行原有的跨文件时间比较。
+    /// 额度快照候选按文件、窗口、归一化重置分钟、计划和额度池分别保留。
+    /// 旧实现每个文件只保留两个窗口的最大 offset，因此同一个 reset 周期
+    /// 内先出现的 plan 可能被另一个 plan 的较新行静默覆盖。这里保留每个
+    /// scope 的最新行，跨文件再按相同 scope 去重；Core 层据此判断同周期
+    /// 的计划冲突，而不是把最新行误当成唯一真相。
     /// </summary>
     private static DataTable QueryLatestRateLimitRowsByOffsetRanges(SQLiteConnection db, List<OffsetRange> ranges)
     {
@@ -5940,18 +5940,36 @@ public static class TokenRaderIndexer
                     cmd.Parameters.AddWithValue("@end" + i.ToString(CultureInfo.InvariantCulture), range.End);
                 }
 
-                // One grouped scan computes both latest offsets. The outer join
-                // returns one common row when it carries both windows, or two
-                // rows when 5-hour and weekly snapshots were logged separately.
+                // Expand the two windows into scope rows before grouping. Reset
+                // identity is normalized to UTC minutes, matching the Core
+                // Get-TokenRaderResetIdentity contract. COALESCE keeps legacy
+                // empty plan/limit and unknown reset rows queryable without
+                // treating a missing reset as a real conflict later.
                 cmd.CommandText =
                     "SELECT tr.* FROM token_records AS tr INNER JOIN (" +
-                    "SELECT source_path, " +
-                    "MAX(CASE WHEN five_hour_used IS NOT NULL THEN source_offset_end END) AS five_offset, " +
-                    "MAX(CASE WHEN weekly_used IS NOT NULL THEN source_offset_end END) AS weekly_offset " +
-                    "FROM token_records WHERE (" + predicates + ") " +
-                    "AND (five_hour_used IS NOT NULL OR weekly_used IS NOT NULL) GROUP BY source_path" +
-                    ") AS latest ON tr.source_path=latest.source_path AND " +
-                    "(tr.source_offset_end=latest.five_offset OR tr.source_offset_end=latest.weekly_offset)";
+                    "SELECT source_path, window_kind, plan_type, rate_limit_id, window_minutes, reset_minute, " +
+                    "MAX(source_offset_end) AS latest_offset FROM (" +
+                    "SELECT source_path, source_offset_end, 'FiveHour' AS window_kind, " +
+                    "COALESCE(plan_type,'') AS plan_type, COALESCE(rate_limit_id,'') AS rate_limit_id, " +
+                    "COALESCE(five_hour_window,-1) AS window_minutes, " +
+                    "COALESCE(CAST(five_hour_resets / 60 AS INTEGER),-1) AS reset_minute " +
+                    "FROM token_records WHERE (" + predicates + ") AND five_hour_used IS NOT NULL " +
+                    "UNION ALL " +
+                    "SELECT source_path, source_offset_end, 'Weekly' AS window_kind, " +
+                    "COALESCE(plan_type,'') AS plan_type, COALESCE(rate_limit_id,'') AS rate_limit_id, " +
+                    "COALESCE(weekly_window,-1) AS window_minutes, " +
+                    "COALESCE(CAST(weekly_resets / 60 AS INTEGER),-1) AS reset_minute " +
+                    "FROM token_records WHERE (" + predicates + ") AND weekly_used IS NOT NULL" +
+                    ") AS scoped GROUP BY source_path, window_kind, plan_type, rate_limit_id, window_minutes, reset_minute" +
+                    ") AS latest ON tr.source_path=latest.source_path AND tr.source_offset_end=latest.latest_offset AND (" +
+                    "(latest.window_kind='FiveHour' AND tr.five_hour_used IS NOT NULL AND " +
+                    "COALESCE(tr.plan_type,'')=latest.plan_type AND COALESCE(tr.rate_limit_id,'')=latest.rate_limit_id AND " +
+                    "COALESCE(tr.five_hour_window,-1)=latest.window_minutes AND " +
+                    "COALESCE(CAST(tr.five_hour_resets / 60 AS INTEGER),-1)=latest.reset_minute) OR " +
+                    "(latest.window_kind='Weekly' AND tr.weekly_used IS NOT NULL AND " +
+                    "COALESCE(tr.plan_type,'')=latest.plan_type AND COALESCE(tr.rate_limit_id,'')=latest.rate_limit_id AND " +
+                    "COALESCE(tr.weekly_window,-1)=latest.window_minutes AND " +
+                    "COALESCE(CAST(tr.weekly_resets / 60 AS INTEGER),-1)=latest.reset_minute))";
 
                 var chunk = new DataTable();
                 using (var da = new SQLiteDataAdapter(cmd)) { da.Fill(chunk); }
@@ -5982,16 +6000,54 @@ public static class TokenRaderIndexer
         DataTable result = candidates == null ? new DataTable() : candidates.Clone();
         if (candidates == null || candidates.Rows.Count == 0) return result;
 
-        DataRow latestFive = null;
-        DataRow latestWeekly = null;
+        // Keep one latest row for each normalized window scope. A row carrying
+        // both windows can satisfy two keys, but it must be imported only once.
+        var latestByScope = new Dictionary<string, DataRow>(StringComparer.OrdinalIgnoreCase);
         foreach (DataRow row in candidates.Rows)
         {
-            if (HasData(row, "five_hour_used") && IsLaterTokenRow(row, latestFive)) latestFive = row;
-            if (HasData(row, "weekly_used") && IsLaterTokenRow(row, latestWeekly)) latestWeekly = row;
+            if (HasData(row, "five_hour_used"))
+            {
+                string key = GetRateLimitScopeKey(row, false);
+                DataRow current;
+                if (!latestByScope.TryGetValue(key, out current) || IsLaterTokenRow(row, current))
+                    latestByScope[key] = row;
+            }
+            if (HasData(row, "weekly_used"))
+            {
+                string key = GetRateLimitScopeKey(row, true);
+                DataRow current;
+                if (!latestByScope.TryGetValue(key, out current) || IsLaterTokenRow(row, current))
+                    latestByScope[key] = row;
+            }
         }
-        if (latestFive != null) result.ImportRow(latestFive);
-        if (latestWeekly != null && !object.ReferenceEquals(latestFive, latestWeekly)) result.ImportRow(latestWeekly);
+
+        var importedIds = new HashSet<long>();
+        foreach (DataRow row in latestByScope.Values)
+        {
+            long id;
+            if (!TryConvertInt64(row["id"], out id)) id = 0L;
+            if (importedIds.Add(id)) result.ImportRow(row);
+        }
         return SortTokenRecordTable(result, true);
+    }
+
+    private static string GetRateLimitScopeKey(DataRow row, bool weekly)
+    {
+        string plan = HasData(row, "plan_type")
+            ? Convert.ToString(row["plan_type"], CultureInfo.InvariantCulture) ?? "" : "";
+        string limit = HasData(row, "rate_limit_id")
+            ? Convert.ToString(row["rate_limit_id"], CultureInfo.InvariantCulture) ?? "" : "";
+        string windowColumn = weekly ? "weekly_window" : "five_hour_window";
+        string resetColumn = weekly ? "weekly_resets" : "five_hour_resets";
+        long window;
+        long reset;
+        if (!TryConvertInt64(row[windowColumn], out window)) window = -1L;
+        if (!TryConvertInt64(row[resetColumn], out reset)) reset = -1L;
+        long resetMinute = reset >= 0L ? reset / 60L : -1L;
+        return (weekly ? "Weekly" : "FiveHour") + "\u001F" +
+            window.ToString(CultureInfo.InvariantCulture) + "\u001F" +
+            resetMinute.ToString(CultureInfo.InvariantCulture) + "\u001F" +
+            plan + "\u001F" + limit;
     }
 
     private static DataTable SortTokenRecordTable(DataTable table, bool descending)
