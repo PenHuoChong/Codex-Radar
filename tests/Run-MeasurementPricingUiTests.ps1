@@ -163,4 +163,15 @@ foreach ($messages in @(@('', ''), @('only diagnostic', ''), @('same diagnostic'
     Update-QuotaEstimatesFromInterval -Result $callbackResult
     Assert-UiPricing ($null -ne $script:State.QuotaCalibrationMessage) 'empty/single diagnostic pipeline failed'
 }
+$regularWindow=$window.PSObject.Copy()
+$regularWindow | Add-Member -NotePropertyName LimitId -NotePropertyValue 'codex' -Force
+$regularWindow.UsedPercent=74
+$regularLimits=[pscustomobject]@{FiveHour=$null;Weekly=$regularWindow;ObservedAt=$now;PlanType='synthetic'}
+$script:State.RateLimits=$regularLimits;$script:State.QuotaPlanSelection=''
+$foreignWindow=$regularWindow.PSObject.Copy();$foreignWindow.LimitId='codex_bengalfox';$foreignWindow.UsedPercent=0;$foreignWindow.ObservedAt=$now.AddMinutes(1)
+$foreignLimits=[pscustomobject]@{FiveHour=$foreignWindow;Weekly=$foreignWindow;ObservedAt=$now.AddMinutes(1);PlanType='synthetic'}
+Merge-LatestRateLimits $foreignLimits
+Assert-UiPricing ($script:State.RateLimits.Weekly.UsedPercent -eq 74 -and $null -eq $script:State.RateLimits.FiveHour) 'newer specialized pool replaced the regular cards'
+$foreignEstimate=$estimate.PSObject.Copy();$foreignEstimate.LimitId='codex_bengalfox'
+Assert-UiPricing (-not (Test-TokenRaderQuotaEstimateMatchesWindow $foreignEstimate $regularWindow)) 'specialized-pool estimate survived regular-card retention'
 Write-Output 'MEASUREMENT_PRICING_UI_TESTS_PASSED'

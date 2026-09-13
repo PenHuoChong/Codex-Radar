@@ -18,7 +18,7 @@ foreach($value in @($null,'','NaN','Infinity','bad',-1,101,$true,0)) {
 }
 function New-RefreshLimits($percent,$observed,$reset) {
     $identity=Get-TokenRaderResetIdentity -WindowMinutes 10080 -ResetsAt $reset
-    $w=[pscustomobject]@{PlanType='pro';UsedPercent=$percent;RemainingPercent=(100-$percent);ObservedAt=$observed;ResetsAt=$reset;ResetIdentity=$identity;WindowMinutes=10080;LimitId='synthetic';ScopeConflict=$false;ScopeCandidates=@([pscustomobject]@{PlanType='pro';UsedPercent=$percent;ObservedAt=$observed;ResetIdentity=$identity;WindowMinutes=10080;LimitId='synthetic'})}
+    $w=[pscustomobject]@{PlanType='pro';UsedPercent=$percent;RemainingPercent=(100-$percent);ObservedAt=$observed;ResetsAt=$reset;ResetIdentity=$identity;WindowMinutes=10080;LimitId='codex';ScopeConflict=$false;ScopeCandidates=@([pscustomobject]@{PlanType='pro';UsedPercent=$percent;ObservedAt=$observed;ResetIdentity=$identity;WindowMinutes=10080;LimitId='codex'})}
     [pscustomobject]@{FiveHour=$null;Weekly=$w;ObservedAt=$observed;PlanType='pro'}
 }
 $script:State.QuotaPlanSelection='pro';$script:State.RateLimits=$null
@@ -31,7 +31,7 @@ foreach($plan in @('pro','')) {
     $selected=Select-TokenRaderQuotaPlan $script:State.RateLimits $plan
     Assert-Refresh ($selected.Weekly.UsedPercent-eq9) 'rejected original snapshot returned during plan selection'
 }
-$oldEstimate=[pscustomobject]@{TotalUsd=100;PlanType='pro';WindowMinutes=10080;ResetsAt=$reset;LimitId='synthetic'}
+$oldEstimate=[pscustomobject]@{TotalUsd=100;PlanType='pro';WindowMinutes=10080;ResetsAt=$reset;LimitId='codex'}
 $estimate=$oldEstimate.PSObject.Copy();$estimate.TotalUsd=500
 $script:State.AccountIdentity='current-tag';$script:State.QuotaEstimateAccountIdentity='current-tag'
 $script:State.QuotaEstimates=[pscustomobject]@{FiveHour=$null;Weekly=$oldEstimate}

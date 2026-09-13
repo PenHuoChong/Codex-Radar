@@ -1337,10 +1337,31 @@ function Format-IntervalDuration {
 function Merge-LatestRateLimits {
     param($Candidate)
     if ($null -eq $Candidate) { return }
+    # These cards represent the regular Codex pool, not model-specific pools.
+    $Candidate=if ($null -ne $Candidate.PSObject.Properties['QuotaPlanOriginal'] -and $null -ne $Candidate.QuotaPlanOriginal) {
+        $Candidate.QuotaPlanOriginal.PSObject.Copy()
+    } else { $Candidate.PSObject.Copy() }
+    $Candidate.PSObject.Properties.Remove('QuotaPlanOriginal')
+    foreach ($kind in @('FiveHour','Weekly')) {
+        $window=$Candidate.$kind
+        if ($null -eq $window) { continue }
+        $pool=if ($null -ne $window.PSObject.Properties['LimitId']) { [string]$window.LimitId }
+              elseif ($null -ne $Candidate.PSObject.Properties['LimitId']) { [string]$Candidate.LimitId } else { '' }
+        if ($pool -and $pool -ine 'codex') { $Candidate.$kind=$null }
+    }
+    if ($null -eq $Candidate.FiveHour -and $null -eq $Candidate.Weekly) { return }
     if ($script:State.ContainsKey('QuotaPlanSelection') -and -not [string]::IsNullOrWhiteSpace([string]$script:State.QuotaPlanSelection)) {
         $Candidate = Select-TokenRaderQuotaPlan -RateLimits $Candidate -PlanType ([string]$script:State.QuotaPlanSelection)
     }
     $current = $script:State.RateLimits
+    if ($null -ne $current) {
+        $current=$current.PSObject.Copy()
+        foreach ($kind in @('FiveHour','Weekly')) {
+            $w=$current.$kind
+            if ($null -ne $w -and $null -ne $w.PSObject.Properties['LimitId'] -and
+                [string]$w.LimitId -and [string]$w.LimitId -ine 'codex') { $current.$kind=$null }
+        }
+    }
     if ($null -eq $current) {
         $script:State.RateLimits = $Candidate
         return
@@ -1401,8 +1422,8 @@ function Merge-LatestRateLimits {
         $newRaw = if ($null -ne $Candidate.PSObject.Properties['QuotaPlanOriginal'] -and $null -ne $Candidate.QuotaPlanOriginal) { $Candidate.QuotaPlanOriginal } else { $Candidate }
         $mergedRaw = $newRaw.PSObject.Copy()
         $mergedRaw.PSObject.Properties.Remove('QuotaPlanOriginal')
-        $mergedRaw.FiveHour = if ($useCandidateFive) { $newRaw.FiveHour } else { $oldRaw.FiveHour }
-        $mergedRaw.Weekly = if ($useCandidateWeekly) { $newRaw.Weekly } else { $oldRaw.Weekly }
+        $mergedRaw.FiveHour = if ($null -eq $fiveHour) { $null } elseif ($useCandidateFive) { $newRaw.FiveHour } else { $oldRaw.FiveHour }
+        $mergedRaw.Weekly = if ($null -eq $weekly) { $null } elseif ($useCandidateWeekly) { $newRaw.Weekly } else { $oldRaw.Weekly }
         $mergedRaw.ObservedAt = $script:State.RateLimits.ObservedAt
         $script:State.RateLimits | Add-Member -NotePropertyName QuotaPlanOriginal -NotePropertyValue $mergedRaw -Force
     }
@@ -1483,6 +1504,11 @@ function Set-QuotaWindowCard {
         $Diagnostic = $null
     )
 
+    if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['LimitId'] -and
+        [string]$Window.LimitId -and [string]$Window.LimitId -ine 'codex') {
+        $Window=$null
+        $Estimate=$null
+    }
     if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['ScopeConflict'] -and [bool]$Window.ScopeConflict) {
         $UsageText.Text = '来源冲突'
         $Progress.Value = 0
@@ -1588,6 +1614,8 @@ function Update-QuotaCards {
 
 function Test-TokenRaderQuotaEstimateMatchesWindow {
     param($Estimate, $Window)
+    if ($null -ne $Estimate -and $null -ne $Estimate.PSObject.Properties['LimitId'] -and
+        [string]$Estimate.LimitId -and [string]$Estimate.LimitId -ine 'codex') { return $false }
     if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['ScopeConflict'] -and [bool]$Window.ScopeConflict) { return $false }
     if ($null -eq $Estimate) { return $false }
     if ($null -ne $Estimate.PSObject.Properties['ResetsAt'] -and $null -ne $Estimate.ResetsAt -and

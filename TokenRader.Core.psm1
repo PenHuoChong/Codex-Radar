@@ -555,7 +555,8 @@ function ConvertFrom-TokenRaderRateWindowTextFast {
         [Parameter(Mandatory = $true)][string]$InnerText,
         [Parameter(Mandatory = $true)][DateTimeOffset]$ObservedAt,
         [string]$SourceFile = '',
-        [string]$PlanType = ''
+        [string]$PlanType = '',
+        [string]$LimitId = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($InnerText)) { return $null }
@@ -596,6 +597,7 @@ function ConvertFrom-TokenRaderRateWindowTextFast {
         ObservedAt = $ObservedAt
         SourceFile = $SourceFile
         PlanType = $PlanType
+        LimitId = $LimitId
         PercentResolution = $percentResolution
         UsedTokens = if ($usedTokensMatch.Success) { ConvertTo-TokenRaderSafeInt64 $usedTokensMatch.Groups[1].Value } else { $null }
         RemainingTokens = if ($remainingTokensMatch.Success) { ConvertTo-TokenRaderSafeInt64 $remainingTokensMatch.Groups[1].Value } else { $null }
@@ -655,10 +657,12 @@ function ConvertFrom-TokenRaderTokenLineFast {
     if ($LineText.Contains('rate_limits')) {
         $planMatch = [regex]::Match($LineText, '"plan_type"\s*:\s*"([^"]*)"')
         $planType = if ($planMatch.Success) { $planMatch.Groups[1].Value } else { '' }
+        $poolMatch = [regex]::Match($LineText, '"limit_id"\s*:\s*"([^"]*)"')
+        $poolId = if ($poolMatch.Success) { $poolMatch.Groups[1].Value } else { '' }
         $primaryMatch = [regex]::Match($LineText, '"primary"\s*:\s*\{([^{}]*)\}')
         $secondaryMatch = [regex]::Match($LineText, '"secondary"\s*:\s*\{([^{}]*)\}')
-        $primaryWindow = if ($primaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $primaryMatch.Groups[1].Value -ObservedAt $timestamp -SourceFile $SourceFile -PlanType $planType } else { $null }
-        $secondaryWindow = if ($secondaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $secondaryMatch.Groups[1].Value -ObservedAt $timestamp -SourceFile $SourceFile -PlanType $planType } else { $null }
+        $primaryWindow = if ($primaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $primaryMatch.Groups[1].Value -ObservedAt $timestamp -SourceFile $SourceFile -PlanType $planType -LimitId $poolId } else { $null }
+        $secondaryWindow = if ($secondaryMatch.Success) { ConvertFrom-TokenRaderRateWindowTextFast -InnerText $secondaryMatch.Groups[1].Value -ObservedAt $timestamp -SourceFile $SourceFile -PlanType $planType -LimitId $poolId } else { $null }
         if (($primaryMatch.Success -and $null -eq $primaryWindow) -or ($secondaryMatch.Success -and $null -eq $secondaryWindow)) { return $null }
 
         # Inline equivalent of ConvertTo-TokenRaderRateLimits over the two
@@ -678,6 +682,7 @@ function ConvertFrom-TokenRaderTokenLineFast {
         $rateLimits = [pscustomobject]@{
             ObservedAt = $timestamp
             PlanType = $planType
+            LimitId = $poolId
             FiveHour = $fiveHour
             Weekly = $weekly
         }
@@ -1122,7 +1127,8 @@ function ConvertTo-TokenRaderRateLimits {
 
 function ConvertFrom-TokenRaderRateLimitCandidates {
     param(
-        [AllowNull()][object[]]$Candidates
+        [AllowNull()][object[]]$Candidates,
+        [string]$LimitId = ''
     )
 
     $allCandidates = @($Candidates | Where-Object {
@@ -1130,6 +1136,22 @@ function ConvertFrom-TokenRaderRateLimitCandidates {
         -not [string]::IsNullOrWhiteSpace([string]$_.WindowKind)
     })
     if ($allCandidates.Count -eq 0) { return $null }
+    if (-not [string]::IsNullOrWhiteSpace($LimitId)) {
+        $explicitPools = @($allCandidates | Where-Object {
+            $id = if ($null -ne $_.Window.PSObject.Properties['LimitId']) { [string]$_.Window.LimitId }
+                  elseif ($null -ne $_.PSObject.Properties['Metadata'] -and $null -ne $_.Metadata -and $null -ne $_.Metadata.PSObject.Properties['LimitId']) { [string]$_.Metadata.LimitId } else { '' }
+            -not [string]::IsNullOrWhiteSpace($id)
+        })
+        # Legacy logs without any pool identifier remain a separate legacy
+        # scope. Never use that fallback in a mixed/explicit-pool candidate set.
+        if ($explicitPools.Count -gt 0) {
+            $allCandidates = @($explicitPools | Where-Object {
+                $id = if ($null -ne $_.Window.PSObject.Properties['LimitId']) { [string]$_.Window.LimitId } else { [string]$_.Metadata.LimitId }
+                [string]::Equals($id, $LimitId, [StringComparison]::OrdinalIgnoreCase)
+            })
+            if ($allCandidates.Count -eq 0) { return $null }
+        }
+    }
 
     $selectedWindows = @{}
     $selectedScopes = @{}
@@ -1983,7 +2005,7 @@ function Get-TokenRaderLatestRateLimits {
             })
         }
     }
-    return ConvertFrom-TokenRaderRateLimitCandidates -Candidates @($candidates)
+    return ConvertFrom-TokenRaderRateLimitCandidates -Candidates @($candidates) -LimitId 'codex'
 }
 
 function Get-TokenRaderPrices {
@@ -4224,7 +4246,7 @@ function Get-TokenRaderCursorOffsets {
 }
 
 function ConvertFrom-TokenRaderRateLimitRows {
-    param($Table)
+    param($Table, [string]$LimitId = '')
     if ($null -eq $Table -or $Table.Rows.Count -eq 0) { return $null }
     $candidates = New-Object System.Collections.ArrayList
     foreach ($row in @($Table.Rows)) {
@@ -4243,7 +4265,7 @@ function ConvertFrom-TokenRaderRateLimitRows {
             })
         }
     }
-    return ConvertFrom-TokenRaderRateLimitCandidates -Candidates @($candidates)
+    return ConvertFrom-TokenRaderRateLimitCandidates -Candidates @($candidates) -LimitId $LimitId
 }
 
 function Get-TokenRaderIndexedRateLimitsAtOffsets {
@@ -4256,7 +4278,7 @@ function Get-TokenRaderIndexedRateLimitsAtOffsets {
     foreach ($path in @($ends.Keys)) { $starts[$path] = 0L }
     if ($ends.Count -eq 0) { return $null }
     $table = [TokenRaderIndexer]::QueryLatestRateLimitsByOffsets($Connection, $starts, $ends)
-    return ConvertFrom-TokenRaderRateLimitRows -Table $table
+    return ConvertFrom-TokenRaderRateLimitRows -Table $table -LimitId 'codex'
 }
 
 function Get-TokenRaderIndexedLatestRateLimits {
