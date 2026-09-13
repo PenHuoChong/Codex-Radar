@@ -2202,7 +2202,11 @@ public static class TokenRaderIndexer
                                 foreach (TokenRaderJsonRateWindow win in new[] { rateLimits.Primary, rateLimits.Secondary })
                                 {
                                     if (win == null) continue;
-                                    double used = GetDoubleValueOrZero(win.UsedPercent);
+                                    double used;
+                                    if (win.UsedPercent == null || win.UsedPercent is bool ||
+                                        !TryGetDoubleValue(win.UsedPercent, out used) ||
+                                        double.IsNaN(used) || double.IsInfinity(used) ||
+                                        used < 0.0 || used > 100.0) continue;
                                     int winMin = (int)GetInt64Value(win.WindowMinutes);
                                     long resetSeconds;
                                     long? normalizedResets = TryGetResetUnixSeconds(win, hasObservedAt ? (DateTimeOffset?)observedAt : null, out resetSeconds)

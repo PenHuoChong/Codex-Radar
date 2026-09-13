@@ -1921,6 +1921,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-QuotaEvidenceFixTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaCycleTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaScopeConflictTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-QuotaRefreshRegressionTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaPlanBindingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaPlanUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-MeasurementPricingUiTests.ps1')

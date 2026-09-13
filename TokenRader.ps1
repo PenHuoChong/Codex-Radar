@@ -1393,8 +1393,18 @@ function Merge-LatestRateLimits {
         FiveHour = $fiveHour
         Weekly = $weekly
     }
-    if ($null -ne $Candidate.PSObject.Properties['QuotaPlanOriginal']) {
-        $script:State.RateLimits | Add-Member -NotePropertyName QuotaPlanOriginal -NotePropertyValue $Candidate.QuotaPlanOriginal -Force
+    if ($null -ne $Candidate.PSObject.Properties['QuotaPlanOriginal'] -or
+        $null -ne $current.PSObject.Properties['QuotaPlanOriginal']) {
+        # Retained display windows and their selection sources must advance
+        # together. A rejected candidate cannot become a future plan source.
+        $oldRaw = if ($null -ne $current.PSObject.Properties['QuotaPlanOriginal'] -and $null -ne $current.QuotaPlanOriginal) { $current.QuotaPlanOriginal } else { $current }
+        $newRaw = if ($null -ne $Candidate.PSObject.Properties['QuotaPlanOriginal'] -and $null -ne $Candidate.QuotaPlanOriginal) { $Candidate.QuotaPlanOriginal } else { $Candidate }
+        $mergedRaw = $newRaw.PSObject.Copy()
+        $mergedRaw.PSObject.Properties.Remove('QuotaPlanOriginal')
+        $mergedRaw.FiveHour = if ($useCandidateFive) { $newRaw.FiveHour } else { $oldRaw.FiveHour }
+        $mergedRaw.Weekly = if ($useCandidateWeekly) { $newRaw.Weekly } else { $oldRaw.Weekly }
+        $mergedRaw.ObservedAt = $script:State.RateLimits.ObservedAt
+        $script:State.RateLimits | Add-Member -NotePropertyName QuotaPlanOriginal -NotePropertyValue $mergedRaw -Force
     }
 }
 
@@ -1809,7 +1819,21 @@ function Update-QuotaEstimatesFromInterval {
         $newEstimates = [pscustomobject]@{ FiveHour = $null; Weekly = $null }
     }
     $previousEstimates = $script:State.QuotaEstimates
-    $validationRateLimits = if ($null -ne $endRateLimits) { $endRateLimits } else { $script:State.RateLimits }
+    $validationRateLimits = if ($null -ne $script:State.RateLimits) { $script:State.RateLimits } else { $endRateLimits }
+    # Do not rebind a computed cost to a newer display snapshot. Only estimates
+    # using the actually accepted endpoint can replace the retained estimate.
+    foreach ($kind in @('FiveHour','Weekly')) {
+        $computedWindow = if ($null -ne $endRateLimits) { $endRateLimits.$kind } else { $null }
+        $acceptedWindow = if ($null -ne $validationRateLimits) { $validationRateLimits.$kind } else { $null }
+        if ($null -ne $newEstimates.$kind -and $null -ne $acceptedWindow -and $null -ne $computedWindow) {
+            $endpointAccepted = $true
+            foreach ($field in @('ObservedAt','UsedPercent','PlanType','WindowMinutes','ResetsAt','LimitId')) {
+                if ($null -ne $computedWindow.PSObject.Properties[$field] -and $null -ne $acceptedWindow.PSObject.Properties[$field] -and
+                    $computedWindow.$field -ne $acceptedWindow.$field) { $endpointAccepted = $false; break }
+            }
+            if (-not $endpointAccepted) { $newEstimates.$kind = $null }
+        }
+    }
     $validationFive = if ($null -ne $validationRateLimits) { $validationRateLimits.FiveHour } else { $null }
     $validationWeekly = if ($null -ne $validationRateLimits) { $validationRateLimits.Weekly } else { $null }
     $previousFive = if ($null -ne $previousEstimates) { $previousEstimates.FiveHour } else { $null }

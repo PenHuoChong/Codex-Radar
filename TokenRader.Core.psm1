@@ -559,11 +559,15 @@ function ConvertFrom-TokenRaderRateWindowTextFast {
     )
 
     if ([string]::IsNullOrWhiteSpace($InnerText)) { return $null }
-    $used = [regex]::Match($InnerText, '"used_percent"\s*:\s*"?([0-9.]+)"?')
+    $used = [regex]::Match($InnerText, '"used_percent"\s*:\s*"?([0-9.]+)"?\s*(?=[,}]|$)')
     $minutes = [regex]::Match($InnerText, '"window_minutes"\s*:\s*"?(\d+)"?')
     if (-not $used.Success -or -not $minutes.Success) { return $null }
     $usedText = [string]$used.Groups[1].Value
-    $usedPercent = [Math]::Max(0.0, [Math]::Min(100.0, [double]$usedText))
+    [double]$usedPercent = 0
+    if (-not [double]::TryParse($usedText, [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$usedPercent) -or
+        [double]::IsNaN($usedPercent) -or [double]::IsInfinity($usedPercent) -or
+        $usedPercent -lt 0 -or $usedPercent -gt 100) { return $null }
     $usedDecimal = $usedText.IndexOf('.')
     $percentResolution = if ($usedDecimal -ge 0 -and $usedDecimal -lt ($usedText.Length - 1)) {
         [Math]::Pow(10.0, -($usedText.Length - $usedDecimal - 1))
@@ -1031,7 +1035,13 @@ function ConvertTo-TokenRaderRateWindow {
         [string]$LimitId = ''
     )
 
-    $usedPercent = [Math]::Max(0.0, [Math]::Min(100.0, [double]$RawWindow.used_percent))
+    $usedProperty = $RawWindow.PSObject.Properties['used_percent']
+    if ($null -eq $usedProperty -or $null -eq $usedProperty.Value -or $usedProperty.Value -is [bool]) { return $null }
+    [double]$usedPercent = 0
+    if (-not [double]::TryParse([string]$usedProperty.Value, [Globalization.NumberStyles]::Float,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$usedPercent) -or
+        [double]::IsNaN($usedPercent) -or [double]::IsInfinity($usedPercent) -or
+        $usedPercent -lt 0 -or $usedPercent -gt 100) { return $null }
     $windowMinutes = [int]$RawWindow.window_minutes
     $resetValue = $null
     foreach ($propertyName in @('resets_at', 'reset_at')) {
@@ -1084,6 +1094,7 @@ function ConvertTo-TokenRaderRateLimits {
             if ($null -eq $rawWindow -or $null -eq $rawWindow.PSObject.Properties['window_minutes'] -or $null -eq $rawWindow.PSObject.Properties['used_percent']) { continue }
             $limitId = if ($null -ne $RawRateLimits.PSObject.Properties['limit_id']) { [string]$RawRateLimits.limit_id } else { '' }
             $window = ConvertTo-TokenRaderRateWindow -RawWindow $rawWindow -ObservedAt $ObservedAt -SourceFile $SourceFile -PlanType $planType -LimitId $limitId
+            if ($null -eq $window) { continue }
             $kind = Get-TokenRaderRateWindowKind -WindowMinutes $window.WindowMinutes
             if ($kind -eq 'FiveHour') { $fiveHour = $window }
             elseif ($kind -eq 'Weekly') { $weekly = $window }
