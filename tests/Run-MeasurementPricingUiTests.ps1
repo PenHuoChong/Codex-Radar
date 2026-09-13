@@ -152,4 +152,15 @@ $estimate=$estimate.PSObject.Copy();$estimate.EvidenceCost=8.0
 $callbackResult.QuotaDiagnostics.Weekly=[pscustomobject]@{ReasonCode='ok';Status='updated';Message='本次更新';Retained=$false;AccountIdentity='current-tag'}
 Update-QuotaEstimatesFromInterval -Result $callbackResult
 Assert-UiPricing (-not $script:State.QuotaDiagnostics.Weekly.Retained) 'new calibration cost did not immediately mark result updated'
+foreach ($messages in @(@('', ''), @('only diagnostic', ''), @('same diagnostic','same diagnostic'), @('first diagnostic','second diagnostic'))) {
+    $script:State.QuotaEstimates=$null
+    $callbackResult.QuotaEvidence=$null
+    $callbackResult.PricingComplete=$true
+    $callbackResult.QuotaDiagnostics=[pscustomobject]@{
+        FiveHour=[pscustomobject]@{Status='unavailable';ReasonCode='missing_window';Message=$messages[0];Retained=$false;AccountIdentity='current-tag'}
+        Weekly=[pscustomobject]@{Status='unavailable';ReasonCode='missing_window';Message=$messages[1];Retained=$false;AccountIdentity='current-tag'}
+    }
+    Update-QuotaEstimatesFromInterval -Result $callbackResult
+    Assert-UiPricing ($null -ne $script:State.QuotaCalibrationMessage) 'empty/single diagnostic pipeline failed'
+}
 Write-Output 'MEASUREMENT_PRICING_UI_TESTS_PASSED'

@@ -1900,10 +1900,10 @@ function Update-QuotaEstimatesFromInterval {
     if ($retainedFive -or (Test-TokenRaderQuotaDiagnosticRetained -Diagnostic $diagnosticFive)) { $retained += '5 小时' }
     if ($retainedWeekly -or (Test-TokenRaderQuotaDiagnosticRetained -Diagnostic $diagnosticWeekly)) { $retained += '周' }
     $phase = if ($Final) { '最终' } else { '实时' }
-    $diagnosticMessages = @(
+    $diagnosticMessages = @(@(
         [string](Get-TokenRaderQuotaDiagnosticValue -Diagnostic $diagnosticFive -Name 'Message' -Default ''),
         [string](Get-TokenRaderQuotaDiagnosticValue -Diagnostic $diagnosticWeekly -Name 'Message' -Default '')
-    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     $script:State.QuotaCalibrationMessage = if ($calibrated.Count -gt 0) {
         $retainedSuffix = if ($retained.Count -gt 0) { '；{0}继续显示同一窗口的最近有效结果' -f ($retained -join '、') } else { '' }
         ('{0}额度估算已同步：{1}{2}。' -f $phase, ($calibrated -join '，'), $retainedSuffix)
@@ -2250,7 +2250,6 @@ function Complete-TokenRaderIntervalCompute {
         $result = $Payload.Result
         $script:State.IntervalResult = $result
         $script:State.IntervalLastError = ''
-        if ($Final) { $script:State.IntervalFinalRetry = $null }
         $endLimits = if ($null -ne $result.PSObject.Properties['EndRateLimits']) { $result.EndRateLimits } else { $result.RateLimits }
         $currentTag = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
         $resultTagValid = $null -eq $result.PSObject.Properties['AccountIdentity'] -or
@@ -2274,14 +2273,24 @@ function Complete-TokenRaderIntervalCompute {
             BaselineSnapshots = $baselineSnapshots
         }
         Show-IntervalResult -Result $result -Running ([bool]$script:State.IsMeasuring)
+        if ($Final) { $script:State.IntervalFinalRetry = $null }
         $succeeded = $true
     } catch {
         # A rendering/callback failure must not erase a quota calibration that
         # is already valid for the current window. The token result remains
         # available and a manual retry can refresh both quota cards.
         $script:State.QuotaCalibrationMessage = '时间段后台计算失败：' + $_.Exception.Message
-        Set-TokenRaderUiState -NewState 'Error' -StatusMessage ([string]$script:State.QuotaCalibrationMessage)
-        Update-QuotaCards
+        $script:State.IntervalLastError = [string]$script:State.QuotaCalibrationMessage
+        if ($Final) {
+            # Rendering is not evidence that the measurement boundary failed.
+            # Keep the captured end for a manual retry, never restart counting.
+            Set-TokenRaderUiState -NewState 'Ready' -StatusMessage ($script:State.IntervalLastError + ' 已保留结束边界，点击“查看结果”重试。')
+        } elseif ([string]$script:State.UiState -eq 'Measuring') {
+            Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage ($script:State.IntervalLastError + ' 测量仍然有效，可再次查看。')
+        } else {
+            $script:StatusText.Text = $script:State.IntervalLastError
+        }
+        try { Update-QuotaCards } catch { }
     } finally {
         if ([Int64]$script:State.IntervalComputeRequestId -eq $effectiveRequestId) {
             $script:State.IntervalComputing = $false
@@ -2335,7 +2344,14 @@ function Update-IntervalView {
     param([switch]$Manual)
     if ($null -eq $script:State.IntervalBaseline) { return }
     if ($null -ne $script:State.IntervalResult) {
-        Show-IntervalResult -Result $script:State.IntervalResult -Running ([bool]$script:State.IsMeasuring)
+        try {
+            Show-IntervalResult -Result $script:State.IntervalResult -Running ([bool]$script:State.IsMeasuring)
+        } catch {
+            # A failed cached render must not prevent the retry below from
+            # requesting a fresh result or retaining the final frozen boundary.
+            $script:State.IntervalLastError = '显示上次结果失败：' + $_.Exception.Message
+            $script:StatusText.Text = $script:State.IntervalLastError + ' 正在重试更新。'
+        }
         if ($script:State.UiState -in @('Stopping', 'ComputingFinal')) {
             $script:StatusText.Text = '正在后台结算，当前显示上一次结果…'
         }
