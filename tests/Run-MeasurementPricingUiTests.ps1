@@ -132,6 +132,13 @@ $conflictWindow=[pscustomobject]@{UsedPercent=11;WindowMinutes=10080;PlanType='p
 Set-QuotaWindowCard -Window $conflictWindow -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
 Assert-UiPricing ($usage.Text -eq '来源冲突' -and $dollar.Text.Contains('pro：已用3%') -and $dollar.Text.Contains('不可估')) 'conflicting plan snapshot was presented as current account quota'
 Assert-UiPricing (-not (Test-TokenRaderQuotaEstimateMatchesWindow $estimate $conflictWindow)) 'ambiguous scope retained an unbound dollar estimate'
+$missingWindow=$conflictWindow.PSObject.Copy()
+$missingWindow | Add-Member -NotePropertyName ScopeConflictReason -NotePropertyValue 'selected_plan_missing'
+Set-QuotaWindowCard -Window $missingWindow -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($usage.Text -eq '暂无' -and $resetText.Text -eq '未提供所选套餐窗口') 'missing selected plan is not a source conflict'
+Assert-UiPricing (-not (Test-TokenRaderQuotaEstimateMatchesWindow $estimate $missingWindow)) 'missing selection must still reject stale estimates'
+Set-QuotaWindowCard -Window $conflictWindow -Estimate $estimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText -NotApplicable
+Assert-UiPricing ($usage.Text -eq '不适用' -and $dollar.Text -match '人工确认' -and $resetText.Text -eq '') 'explicit no-five-hour setting overrides display without inventing a limit'
 $sameEvidence=[pscustomobject]@{CalibrationStartObservedAt=$now.AddMinutes(-2);CalibrationEndObservedAt=$now.AddMinutes(-1);StartUsedPercent=10;CalibrationEndUsedPercent=11;EvidenceCost=6.530489;TotalUsd=653.0489;PlanType='pro';WindowMinutes=10080;ResetsAt=$reset;LimitId='codex';AccountIdentity='synthetic'}
 $newEvidence=$sameEvidence.PSObject.Copy()
 Assert-UiPricing (Test-TokenRaderSameQuotaEvidence $sameEvidence $newEvidence) 'unchanged evidence did not compare equal'

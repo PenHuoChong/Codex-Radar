@@ -70,6 +70,7 @@ $script:State = @{
     ProjectCache = @{}
     ManualServiceTiers = @{}
     QuotaPlanSelection = ''
+    FiveHourNotApplicable = $false
 }
 
 $script:WindowClosing = $false
@@ -1501,8 +1502,17 @@ function Set-QuotaWindowCard {
         [Parameter(Mandatory = $true)]$ResetText,
         # Optional for compatibility with existing callers and synthetic UI
         # tests.  The core supplies one diagnostic object per quota window.
-        $Diagnostic = $null
+        $Diagnostic = $null,
+        [switch]$NotApplicable
     )
+
+    if ($NotApplicable) {
+        $UsageText.Text = '不适用'
+        $Progress.Value = 0
+        $DollarText.Text = '本账号无 5 小时限制（人工确认）'
+        $ResetText.Text = ''
+        return
+    }
 
     if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['LimitId'] -and
         [string]$Window.LimitId -and [string]$Window.LimitId -ine 'codex') {
@@ -1510,11 +1520,12 @@ function Set-QuotaWindowCard {
         $Estimate=$null
     }
     if ($null -ne $Window -and $null -ne $Window.PSObject.Properties['ScopeConflict'] -and [bool]$Window.ScopeConflict) {
-        $UsageText.Text = '来源冲突'
+        $selectionMissing = $null -ne $Window.PSObject.Properties['ScopeConflictReason'] -and [string]$Window.ScopeConflictReason -eq 'selected_plan_missing'
+        $UsageText.Text = if ($selectionMissing) { '暂无' } else { '来源冲突' }
         $Progress.Value = 0
         $detail = if ($null -ne $Window.PSObject.Properties['ConflictDescription']) { [string]$Window.ConflictDescription } else { '检测到多个计划的额度快照，无法确认当前来源' }
         $DollarText.Text = '美金额度：不可估 · ' + $detail
-        $ResetText.Text = if ($null -ne $Window.ResetsAt) { '重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt } else { '' }
+        $ResetText.Text = if ($selectionMissing) { '未提供所选套餐窗口' } elseif ($null -ne $Window.ResetsAt) { '重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt } else { '' }
         return
     }
     $usingPreviousSnapshot = $false
@@ -1613,6 +1624,7 @@ function Update-TokenRaderQuotaPlanLabel {
 
     $acceptedWindows = New-Object System.Collections.ArrayList
     foreach ($windowName in @('FiveHour', 'Weekly')) {
+        if ($windowName -eq 'FiveHour' -and $script:State.ContainsKey('FiveHourNotApplicable') -and $script:State.FiveHourNotApplicable) { continue }
         $windowProperty = $rateLimits.PSObject.Properties[$windowName]
         if ($null -eq $windowProperty -or $null -eq $windowProperty.Value) { continue }
         $window = $windowProperty.Value
@@ -1746,10 +1758,14 @@ function Update-QuotaCards {
         $estimates.Weekly
     } else { $null }
     Set-QuotaWindowCard -Window $fiveWindow -Estimate $fiveEstimate -Diagnostic (Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName 'FiveHour') `
+        -NotApplicable:($script:State.ContainsKey('FiveHourNotApplicable') -and [bool]$script:State.FiveHourNotApplicable) `
         -UsageText $script:FiveHourUsageText -Progress $script:FiveHourProgress -DollarText $script:FiveHourDollarText -ResetText $script:FiveHourResetText
     Set-QuotaWindowCard -Window $weeklyWindow -Estimate $weeklyEstimate -Diagnostic (Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName 'Weekly') `
         -UsageText $script:WeeklyUsageText -Progress $script:WeeklyProgress -DollarText $script:WeeklyDollarText -ResetText $script:WeeklyResetText
     $script:QuotaEstimateHintText.Text = [string]$script:State.QuotaCalibrationMessage
+    if ($script:State.ContainsKey('FiveHourNotApplicable') -and $script:State.FiveHourNotApplicable) {
+        $script:QuotaEstimateHintText.Text = '5 小时限制已按人工确认设为不适用。' + (Get-TokenRaderQuotaDiagnosticMessage -Diagnostic (Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName 'Weekly') -Fallback '周额度仍按实际日志证据计算。')
+    }
 }
 
 function Test-TokenRaderQuotaEstimateMatchesWindow {
@@ -2775,10 +2791,11 @@ function Stop-IntervalMeasurement {
 }
 
 function Set-TokenRaderQuotaPlanSelection {
-    param([AllowEmptyString()][string]$PlanType = '')
+    param([AllowEmptyString()][string]$PlanType = '', [bool]$FiveHourNotApplicable = $false)
     if ($script:State.IntervalComputing -or $script:State.UiState -in @('Starting','Stopping','ComputingFinal')) { return $false }
     $plan=$PlanType.Trim().ToLowerInvariant()
     $script:State.QuotaPlanSelection=$plan
+    $script:State.FiveHourNotApplicable=$FiveHourNotApplicable
     $script:State.QuotaEstimates=$null
     $script:State.QuotaEstimateAccountIdentity=''
     $script:State.QuotaDiagnostics=$null
@@ -2804,6 +2821,7 @@ function Show-TokenRaderQuotaPlanDialog {
     $combo=New-Object Windows.Controls.ComboBox;$combo.MinWidth=300;$combo.Margin='0,0,0,12'
     $auto=New-Object Windows.Controls.ComboBoxItem;$auto.Content='自动识别（冲突时不猜测）';$auto.Tag='';[void]$combo.Items.Add($auto);$combo.SelectedItem=$auto
     $plans=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($knownPlan in @('free','go','plus','pro','team','edu','enterprise')) { [void]$plans.Add($knownPlan) }
     foreach($kind in @('FiveHour','Weekly')) {
         if($null-eq$script:State.RateLimits){continue};$window=$script:State.RateLimits.$kind
         if($null-eq$window){continue}
@@ -2811,11 +2829,16 @@ function Show-TokenRaderQuotaPlanDialog {
         if($null-ne$window.PSObject.Properties['ScopeCandidates']) {foreach($candidate in @($window.ScopeCandidates)){if($candidate.PlanType){[void]$plans.Add([string]$candidate.PlanType)}}}
     }
     if($script:State.QuotaPlanSelection){[void]$plans.Add([string]$script:State.QuotaPlanSelection)}
-    foreach($plan in @($plans|Sort-Object)) {$item=New-Object Windows.Controls.ComboBoxItem;$item.Content=$plan;$item.Tag=$plan;[void]$combo.Items.Add($item);if($plan-eq$script:State.QuotaPlanSelection){$combo.SelectedItem=$item}}
+    $planLabels=@{free='Free';go='Go';plus='Plus';pro='Pro（5x/20x，日志通常仅提供 pro）';team='Business / Team（team）';business='Business（business）';edu='Edu';enterprise='Enterprise'}
+    foreach($plan in @($plans|Sort-Object)) {$item=New-Object Windows.Controls.ComboBoxItem;$item.Content=if($planLabels.ContainsKey($plan)){$planLabels[$plan]}else{'其他日志标识：'+$plan};$item.Tag=$plan;[void]$combo.Items.Add($item);if($plan-eq$script:State.QuotaPlanSelection){$combo.SelectedItem=$item}}
     [void]$panel.Children.Add($combo)
+    $noFive=New-Object Windows.Controls.CheckBox
+    $noFive.Content='本账号无 5 小时限制（人工确认，仅停用 5 小时卡）'
+    $noFive.IsChecked=$script:State.ContainsKey('FiveHourNotApplicable') -and [bool]$script:State.FiveHourNotApplicable
+    $noFive.Margin='0,0,0,12';[void]$panel.Children.Add($noFive)
     $ok=New-Object Windows.Controls.Button;$ok.Content='确认并更新额度';$ok.Padding='12,7';$ok.IsDefault=$true
     $ok.Add_Click({$dialog.DialogResult=$true});[void]$panel.Children.Add($ok)
-    if($dialog.ShowDialog()-eq$true){[void](Set-TokenRaderQuotaPlanSelection -PlanType ([string]$combo.SelectedItem.Tag))}
+    if($dialog.ShowDialog()-eq$true){[void](Set-TokenRaderQuotaPlanSelection -PlanType ([string]$combo.SelectedItem.Tag) -FiveHourNotApplicable ([bool]$noFive.IsChecked))}
 }
 
 function Reset-MeasurementPricingConfirmation {
@@ -3199,7 +3222,8 @@ function Refresh-Application {
         $previousAccountIdentity = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
         $newAccountIdentity = [string]$account.AccountId
         if ((-not [string]::IsNullOrWhiteSpace($previousAccountIdentity) -or $null -ne $script:State.QuotaEstimates -or
-                ($script:State.ContainsKey('QuotaPlanSelection') -and -not [string]::IsNullOrWhiteSpace([string]$script:State.QuotaPlanSelection))) -and
+                ($script:State.ContainsKey('QuotaPlanSelection') -and -not [string]::IsNullOrWhiteSpace([string]$script:State.QuotaPlanSelection)) -or
+                ($script:State.ContainsKey('FiveHourNotApplicable') -and [bool]$script:State.FiveHourNotApplicable)) -and
             -not [string]::Equals($previousAccountIdentity, $newAccountIdentity, [StringComparison]::Ordinal)) {
             # The account label is already available from this normal refresh.
             # Mark the switch as a quota attribution boundary and discard only
@@ -3207,6 +3231,7 @@ function Refresh-Application {
             # continue while a worker gathers post-switch evidence.
             $script:State.QuotaAccountEpochAt = [DateTimeOffset]::Now
             $script:State.QuotaPlanSelection = ''
+            $script:State.FiveHourNotApplicable = $false
             $script:QuotaPlanButton.Content = '当前套餐：自动识别…'
             $script:State.RateLimits = $null
             $script:State.QuotaEstimates = $null

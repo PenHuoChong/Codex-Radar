@@ -32,6 +32,13 @@ $timer.Add_Tick({
         $dialog=@($application.Windows | Where-Object {$_.Content -is [Windows.Controls.StackPanel]}) | Select-Object -Last 1
         if($null-eq$dialog){throw 'Synthetic quota dialog was not shown'}
         $dialog.ShowInTaskbar=$false
+        $planCombo=@($dialog.Content.Children | Where-Object {$_ -is [Windows.Controls.ComboBox]})[0]
+        $planTags=@($planCombo.Items | ForEach-Object {[string]$_.Tag})
+        foreach($required in @('free','go','plus','pro','team','edu','enterprise')) {
+            if($planTags -notcontains $required){throw ('Missing built-in plan '+$required)}
+        }
+        $noFive=@($dialog.Content.Children | Where-Object {$_ -is [Windows.Controls.CheckBox]})[0]
+        $noFive.IsChecked=$true
         $button=@($dialog.Content.Children | Where-Object {$_ -is [Windows.Controls.Button]}) | Select-Object -Last 1
         $script:dialogClicked=$true
         $button.RaiseEvent([Windows.RoutedEventArgs]::new([Windows.Controls.Button]::ClickEvent))
@@ -45,5 +52,6 @@ try {
     Show-TokenRaderQuotaPlanDialog
     if($script:dialogFailure){throw $script:dialogFailure}
     if(!$script:dialogClicked-or$script:State.RateLimits.Weekly.UsedPercent-ne3){throw 'Dialog confirmation did not preserve the single candidate'}
+    if(-not $script:State.FiveHourNotApplicable){throw 'No-five-hour choice was not applied'}
     'QUOTA_PLAN_DIALOG_TESTS_PASSED'
 } finally {$timer.Stop()}
