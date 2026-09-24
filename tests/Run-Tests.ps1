@@ -202,6 +202,8 @@ Assert-Equal 1000000 ([Int64]$prices.unitTokens) 'pricing unit metadata'
 Assert-Equal 'OpenAI API Standard processing' ([string]$prices.priceType) 'pricing type metadata'
 $expectedPrices = [ordered]@{
     'gpt-6-astra'     = @(10.00, 1.00, 50.00)
+    'gpt-6-sol'       = @(2.00, 0.20, 10.00)
+    'gpt-6-luna'      = @(0.10, 0.01, 0.50)
     'gpt-5.6-sol'     = @(4.00, 0.40, 20.00)
     'gpt-5.6-terra'   = @(2.00, 0.20, 12.00)
     'gpt-5.6-luna'    = @(0.20, 0.02, 1.20)
@@ -216,9 +218,13 @@ $expectedPrices = [ordered]@{
     'gpt-5-mini'      = @(0.25, 0.025, 2.00)
     'gpt-5'           = @(1.25, 0.125, 10.00)
 }
+$expectedPriorityPrices = [ordered]@{
+    'gpt-6-sol'       = @(4.00, 0.40, 20.00)
+    'gpt-6-luna'      = @(0.20, 0.02, 1.00)
+}
 $canonicalIds = @($prices.models | ForEach-Object { ([string]$_.id).ToLowerInvariant() })
-$largeContextModelIds = @('gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4')
-$longContextModelIds = @('gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-cyber', 'gpt-5.5', 'gpt-5.4')
+$largeContextModelIds = @('gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4')
+$longContextModelIds = @('gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-cyber', 'gpt-5.5', 'gpt-5.4')
 Assert-Equal $canonicalIds.Count @($canonicalIds | Sort-Object -Unique).Count 'pricing canonical model IDs are unique'
 Assert-Equal $expectedPrices.Count $canonicalIds.Count 'every pricing entry has an exact official-price regression'
 foreach ($pricingModelId in @($expectedPrices.Keys)) {
@@ -239,6 +245,19 @@ foreach ($pricingModelId in @($expectedPrices.Keys)) {
     foreach ($alias in @($pricingModel.aliases)) {
         Assert-Equal $pricingModelId ([string](Resolve-TokenRaderPrice -Model ([string]$alias) -PricingDocument $prices).id) "$pricingModelId alias price resolution"
     }
+}
+foreach ($pricingModelId in @($expectedPriorityPrices.Keys)) {
+    $pricingModel = @($prices.models | Where-Object { [string]$_.id -eq $pricingModelId })[0]
+    $priorityPrice = if ($null -ne $pricingModel -and $null -ne $pricingModel.PSObject.Properties['serviceTiers']) {
+        $pricingModel.serviceTiers.priority
+    } else { $null }
+    if ($null -eq $priorityPrice) { throw "ASSERT FAILED: priority pricing entry missing for $pricingModelId" }
+    $expected = @($expectedPriorityPrices[$pricingModelId])
+    Assert-Near ([double]$expected[0]) ([double]$priorityPrice.input) 0.0000001 "$pricingModelId official priority input price"
+    Assert-Near ([double]$expected[1]) ([double]$priorityPrice.cachedInput) 0.0000001 "$pricingModelId official priority cached-input price"
+    Assert-Near ([double]$expected[2]) ([double]$priorityPrice.output) 0.0000001 "$pricingModelId official priority output price"
+    Assert-Near 2.0 ([double]$pricingModel.longContextInputMultiplier) 0.0000001 "$pricingModelId long-context input multiplier"
+    Assert-Near 1.5 ([double]$pricingModel.longContextOutputMultiplier) 0.0000001 "$pricingModelId long-context output multiplier"
 }
 $coreModule = Get-Module TokenRader.Core
 $basePricingCacheKey = & $coreModule { param($document) Get-TokenRaderPricingCacheKey -PricingDocument $document } $prices
@@ -327,7 +346,7 @@ try {
     Assert-Equal 'gpt-5.6-sol' $aliasPrice.id 'model alias price resolution'
     Assert-Equal 'gpt-5.6-sol' ([string](Resolve-TokenRaderPrice -Model 'gpt-daybreak-blue-latest' -PricingDocument $prices).id) 'Daybreak Blue current alias price resolution'
     Assert-Equal 'gpt-5.6-cyber' ([string](Resolve-TokenRaderPrice -Model 'gpt-daybreak-red-latest' -PricingDocument $prices).id) 'Daybreak Red current alias price resolution'
-    Assert-Equal '2026-09-08' ([string]$prices.verifiedAt) 'pricing verification date'
+    Assert-Equal '2026-09-24' ([string]$prices.verifiedAt) 'pricing verification date'
     Assert-Equal 'Promotional' ([string]$aliasPrice.pricingStatus) 'Sol promotional price status'
     Assert-Equal '2026-11-21' ([string]$aliasPrice.promotionalPriceValidThroughAtLeast) 'Sol promotional price minimum validity'
     $terraPrice = Resolve-TokenRaderPrice -Model 'gpt-5.6-terra' -PricingDocument $prices

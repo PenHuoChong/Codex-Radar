@@ -446,11 +446,13 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 
 ## 官方价格与计价边界
 
-`pricing.json` 保存标准 API 价格及已核验的 Fast 价格，最近核对日期为 **2026-09-08**。下表为标准价格，Fast 费率保存在各模型的 `serviceTiers.priority` 中并显示于程序价格表：
+`pricing.json` 保存标准 API 价格及已核验的 Fast 价格，最近核对日期为 **2026-09-24**。下表为标准价格，Fast 费率保存在各模型的 `serviceTiers.priority` 中并显示于程序价格表：
 
 | 模型 | 输入 | 缓存输入 | 输出 |
 |---|---:|---:|---:|
 | GPT-6 Astra | $10.00 | $1.00 | $50.00 |
+| GPT-6 Sol | $2.00 | $0.20 | $10.00 |
+| GPT-6 Luna | $0.10 | $0.01 | $0.50 |
 | GPT-5.6 Sol | $4.00 | $0.40 | $20.00 |
 | GPT-5.6 Terra | $2.00 | $0.20 | $12.00 |
 | GPT-5.6 Luna | $0.20 | $0.02 | $1.20 |
@@ -471,6 +473,8 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 
 - [OpenAI API 标准价格总表](https://developers.openai.com/api/docs/pricing)
 - [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)
+- [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol)
+- [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna)
 - [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
 - [GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
 - [GPT-5.6 Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
@@ -489,6 +493,8 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 金额是按日志服务模式折算的 API 等价估算，不是 ChatGPT/Codex 套餐的实际账单，也不能用来推断一个官方固定的 Pro 周美元池。Pro 5x 的百分比不需要再乘 5。对价格表中明确配置长上下文规则的模型，单次 `input_tokens > 272,000` 时整次请求按输入 2×、输出 1.5×计价；`contextWindow` 保存各模型官方最大上下文窗口（当前为 400,000 或 1,050,000），不会让所有请求自动套用长上下文价格。当前实现将 JSONL 中可观察到的缓存写入 token 按未缓存输入价格的 1.25 倍计价（GPT-5.6 官方规则采用该倍率）；若 JSONL 提供 `cache_creation_tokens`/`cache_write_tokens`，程序会从普通未缓存输入中扣出并单独计入该项，否则将结果标记为仅可观察 Token，绝不猜测缓存写入量。估算仍不包含工具调用费、图片生成、其他共享客户端消耗、区域处理加价和 Batch/Flex 等未收录服务价格，这些不可观测消耗会使本地结果低于实际账单。
 
 ### 日志用量字段兼容与交叉验证
+
+仅使用 272K 上下文时，只要日志中的单次输入不超过 272,000 Token，就不会触发长上下文额外计价（恰好 272,000 也不触发）。程序不因累计输入超过 272K 或模型支持 1M 而加价；保留历史超阈值请求的真实计价规则，不因当前配置改变而重写历史费用。GPT-6 Sol/Luna 的 Fast 短上下文输入、缓存输入、输出价格分别为 $4/$0.40/$20 和 $0.20/$0.02/$1（每百万 Token）。
 
 - 缓存写入兼容 `cache_creation_tokens`、`cache_write_tokens`、`cache_creation_input_tokens`、`cache_write_input_tokens`。按此顺序选择第一个有效字段，零值有效；别名不相加。沿用本项目输入包含缓存写入的口径，将该部分从普通未缓存输入中扣出后单独计价。
 - 缺少累计用量但有单次用量时，保留可观察的单次调用；不能仅凭相同Token数量把不同调用合并。

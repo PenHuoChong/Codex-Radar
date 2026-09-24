@@ -184,7 +184,7 @@ if ($null -eq ('TokenRaderIndexer' -as [type])) { Add-Type -Path $indexerDll }
 # Direct cost checks exercise the same exported pricing function used by the
 # UI and by all compact aggregate buckets. Every boundary is deliberately
 # synthetic and uses call_input (never a cumulative total).
-$boundaryModels = @('gpt-6-astra', 'gpt-5.6', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-cyber', 'gpt-daybreak-blue-latest', 'gpt-daybreak-red-latest', 'gpt-5.4')
+$boundaryModels = @('gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-cyber', 'gpt-daybreak-blue-latest', 'gpt-daybreak-red-latest', 'gpt-5.4')
 foreach ($model in $boundaryModels) {
     $price = Resolve-TokenRaderPrice -Model $model -PricingDocument $prices
     Assert-LongContext ($null -ne $price) ('pricing entry exists for ' + $model)
@@ -197,6 +197,27 @@ foreach ($model in $boundaryModels) {
         Assert-LongContext ([bool]$cost.LongContextApplied -eq $expectedLong) ('272K boundary flag for ' + $model + '/' + $callInput)
         Assert-LongContextNear (Get-LongContextExpectedCost -Price $price -InputTokens $callInput -CachedTokens 1000 -OutputTokens 200 -LongContext $expectedLong) ([double]$cost.TotalCost) 0.0000000001 ('272K boundary cost for ' + $model + '/' + $callInput)
         Assert-LongContext ([Int64]$cost.LongContextThreshold -eq 272000L) ('272K threshold metadata for ' + $model)
+    }
+
+    if (@('gpt-6-sol', 'gpt-6-luna') -contains [string]$price.id) {
+        $priorityRates = $price.serviceTiers.priority
+        Assert-LongContext ($null -ne $priorityRates) ('priority pricing exists for ' + $model)
+        $priorityPrice = [pscustomobject]@{
+            input = [double]$priorityRates.input
+            cachedInput = [double]$priorityRates.cachedInput
+            output = [double]$priorityRates.output
+            longContextInputMultiplier = [double]$price.longContextInputMultiplier
+            longContextOutputMultiplier = [double]$price.longContextOutputMultiplier
+        }
+        foreach ($callInput in @(271999L, 272000L, 272001L)) {
+            $usage = New-LongContextUsage -InputTokens $callInput -CachedTokens 1000 -OutputTokens 200
+            $cost = Get-TokenRaderCost -Usage $usage -Model $model -PricingDocument $prices -Scope call -ServiceTier 'priority'
+            $expectedLong = $callInput -gt 272000L
+            Assert-LongContext ([bool]$cost.Known) ('priority cost is known for ' + $model + '/' + $callInput)
+            Assert-LongContext ([string]$cost.ServiceTier -eq 'priority') ('priority tier is retained for ' + $model + '/' + $callInput)
+            Assert-LongContext ([bool]$cost.LongContextApplied -eq $expectedLong) ('priority 272K boundary flag for ' + $model + '/' + $callInput)
+            Assert-LongContextNear (Get-LongContextExpectedCost -Price $priorityPrice -InputTokens $callInput -CachedTokens 1000 -OutputTokens 200 -LongContext $expectedLong) ([double]$cost.TotalCost) 0.0000000001 ('priority 272K boundary cost for ' + $model + '/' + $callInput)
+        }
     }
 }
 
@@ -294,6 +315,37 @@ try {
     Assert-LongContext ([bool]$aggregate.CacheWriteObservable) 'all cache-write fields are recognized as observable writes'
     $longBucket = @($aggregate.Buckets | Where-Object { $_.LongContext })[0]
     Assert-LongContext ([Int64]$longBucket.Input -eq 272001L -and [Int64]$longBucket.Output -eq 200L) 'long bucket uses per-call input/output'
+
+    # The indexer independently knows these model thresholds. Keep the two
+    # exact boundary values synthetic so import-side classification cannot
+    # drift from the pricing-side strict greater-than rule.
+    $knownContextModels = @(
+        [pscustomobject]@{ Model = 'gpt-6-sol'; SessionId = '81000000-0000-0000-0000-000000000004' },
+        [pscustomobject]@{ Model = 'gpt-6-luna'; SessionId = '81000000-0000-0000-0000-000000000005' }
+    )
+    foreach ($knownModel in $knownContextModels) {
+        $knownModelPath = Join-Path $tempRoot ('rollout-' + $knownModel.SessionId + '.jsonl')
+        $knownModelLines = @(
+            (New-LongContextJsonlLine -Timestamp '2026-08-30T00:01:00Z' -Model $knownModel.Model `
+                -TotalInput 272000 -TotalCached 0 -TotalOutput 20 -CallInput 272000 -CallCached 0 -CallOutput 10 `
+                -IncludeContextWindow -IncludeTurnContext)
+            (New-LongContextJsonlLine -Timestamp '2026-08-30T00:01:01Z' -Model $knownModel.Model `
+                -TotalInput 544001 -TotalCached 0 -TotalOutput 40 -CallInput 272001 -CallCached 0 -CallOutput 20 `
+                -IncludeContextWindow)
+        )
+        Write-LongContextJsonl -Path $knownModelPath -Lines @($knownModelLines)
+        [void](Add-LongContextIndexedFile -Connection $db -Path $knownModelPath -SessionId $knownModel.SessionId)
+        $knownModelRows = Get-LongContextRows -Connection $db -Path $knownModelPath
+        Assert-LongContext ($knownModelRows.Rows.Count -eq 2) ('C# import retained both boundary calls for ' + $knownModel.Model)
+        Assert-LongContext ([string]$knownModelRows.Rows[0]['model'] -eq $knownModel.Model -and
+            [string]$knownModelRows.Rows[1]['model'] -eq $knownModel.Model) ('C# import resolved model identity for ' + $knownModel.Model)
+        Assert-LongContext ([Int64]$knownModelRows.Rows[0]['model_context_window'] -eq 1050000L -and
+            [Int64]$knownModelRows.Rows[1]['model_context_window'] -eq 1050000L) ('C# import retained context window for ' + $knownModel.Model)
+        Assert-LongContext ([Int64]$knownModelRows.Rows[0]['long_context_threshold'] -eq 272000L -and
+            [Int64]$knownModelRows.Rows[0]['long_context_applied'] -eq 0L -and
+            [Int64]$knownModelRows.Rows[1]['long_context_threshold'] -eq 272000L -and
+            [Int64]$knownModelRows.Rows[1]['long_context_applied'] -eq 1L) ('C# import uses strict threshold for ' + $knownModel.Model)
+    }
 
     $noContextSession = '81000000-0000-0000-0000-000000000002'
     $noContextPath = Join-Path $tempRoot ('rollout-' + $noContextSession + '.jsonl')

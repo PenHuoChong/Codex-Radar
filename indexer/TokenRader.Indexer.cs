@@ -7039,7 +7039,7 @@ public static class TokenRaderIndexer
     private static bool IsKnownLongContextModel(string model)
     {
         string normalized = (model ?? "").Trim().ToLowerInvariant();
-        foreach (string id in new[] { "gpt-6-astra", "gpt-5.6", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-cyber", "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "gpt-5.4" })
+        foreach (string id in new[] { "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-cyber", "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "gpt-5.4" })
         {
             if (normalized == id || normalized.StartsWith(id + "-20", StringComparison.OrdinalIgnoreCase)) return true;
         }

@@ -1,7 +1,7 @@
 {
   "currency": "USD",
   "unitTokens": 1000000,
-  "verifiedAt": "2026-09-08",
+  "verifiedAt": "2026-09-24",
   "priceType": "OpenAI API Standard processing",
   "models": [
     {
@@ -29,6 +29,58 @@
         }
       },
       "source": "https://developers.openai.com/api/docs/models/gpt-6-astra"
+    },
+    {
+      "id": "gpt-6-sol",
+      "displayName": "GPT-6 Sol",
+      "aliases": [],
+      "input": 2.00,
+      "cachedInput": 0.20,
+      "output": 10.00,
+      "contextWindow": 1050000,
+      "longContextThreshold": 272000,
+      "longContextInputMultiplier": 2.0,
+      "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 4.00,
+          "cachedInput": 0.40,
+          "cacheWrite": 5.00,
+          "cacheWriteMultiplier": 1.25,
+          "output": 20.00,
+          "longContextThreshold": 272000,
+          "longContextInputMultiplier": 2.0,
+          "longContextOutputMultiplier": 1.5,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-sol"
+    },
+    {
+      "id": "gpt-6-luna",
+      "displayName": "GPT-6 Luna",
+      "aliases": [],
+      "input": 0.10,
+      "cachedInput": 0.01,
+      "output": 0.50,
+      "contextWindow": 1050000,
+      "longContextThreshold": 272000,
+      "longContextInputMultiplier": 2.0,
+      "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 0.20,
+          "cachedInput": 0.02,
+          "cacheWrite": 0.25,
+          "cacheWriteMultiplier": 1.25,
+          "output": 1.00,
+          "longContextThreshold": 272000,
+          "longContextInputMultiplier": 2.0,
+          "longContextOutputMultiplier": 1.5,
+          "source": "https://developers.openai.com/api/docs/pricing"
+        }
+      },
+      "source": "https://developers.openai.com/api/docs/models/gpt-6-luna"
     },
     {
       "id": "gpt-5.6-sol",
