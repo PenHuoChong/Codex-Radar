@@ -43,6 +43,8 @@ Invoke-Expression $setterSource
 # the quota/interval views without touching the main interval result.
 Assert-QuotaPlanUi ($setterSource -match '\bSelect-TokenRaderQuotaPlan\b') 'setter bypasses Select-TokenRaderQuotaPlan'
 Assert-QuotaPlanUi ($setterSource -match '\bUpdate-QuotaCards\b') 'setter does not refresh quota cards'
+Assert-QuotaPlanUi ($setterSource -match 'Update-QuotaCards\s+-DisplayOnly') 'same-plan confirmation does not request display-only cards'
+Assert-QuotaPlanUi ($quotaCardsMatch.Value -match 'if\s*\(-not\s+\$DisplayOnly\)') 'display-only card refresh can mutate retained quota evidence'
 Assert-QuotaPlanUi ($setterSource -match 'Update-IntervalView\s+-Manual') 'setter does not request a manual interval refresh'
 Assert-QuotaPlanUi ($setterSource -notmatch 'State\.IntervalResult\s*=') 'setter rewrites the main interval result'
 Assert-QuotaPlanUi ($setterSource -notmatch 'State\.IntervalBaseline\s*=') 'setter rewrites the measurement baseline'
@@ -62,9 +64,14 @@ function Select-TokenRaderQuotaPlan {
 }
 
 $script:QuotaCardRefreshes = 0
+$script:DisplayOnlyCardRefreshes = 0
 $script:ManualIntervalRefreshes = 0
 $script:AutomaticIntervalRefreshes = 0
-function Update-QuotaCards { $script:QuotaCardRefreshes++ }
+function Update-QuotaCards {
+    param([switch]$DisplayOnly)
+    $script:QuotaCardRefreshes++
+    if ($DisplayOnly) { $script:DisplayOnlyCardRefreshes++ }
+}
 function Update-IntervalView {
     param([switch]$Manual)
     if ($Manual) { $script:ManualIntervalRefreshes++ }
@@ -80,7 +87,9 @@ function New-QuotaPlanUiState {
     $baseline = [pscustomobject]@{ Kind = 'synthetic-baseline' }
     $result = [pscustomobject]@{ Kind = 'synthetic-interval-result' }
     $estimate = [pscustomobject]@{ Weekly = 'old-estimate' }
+    $diagnostics = [pscustomobject]@{ Weekly = 'old-weekly-diagnostic' }
     $cache = [pscustomobject]@{ Signature = 'old-cache' }
+    $frozenEnd = [pscustomobject]@{ Kind = 'synthetic-frozen-end' }
     $limits = [pscustomobject]@{ PlanType = 'old-plan'; FiveHour = $null; Weekly = $null }
     $script:State = @{
         UiState = $UiState
@@ -89,19 +98,58 @@ function New-QuotaPlanUiState {
         RateLimits = $limits
         QuotaEstimates = $estimate
         QuotaEstimateAccountIdentity = 'old-account'
-        QuotaDiagnostics = [pscustomobject]@{ Status = 'old' }
+        QuotaDiagnostics = $diagnostics
+        FiveHourNotApplicable = $false
         IntervalCache = $cache
         IntervalBaseline = if ($WithBaseline) { $baseline } else { $null }
+        IntervalEnd = $frozenEnd
         IntervalResult = $result
         QuotaCalibrationMessage = 'old-message'
     }
     $script:QuotaPlanButton = [pscustomobject]@{ Content = 'old button content' }
     $script:QuotaCardRefreshes = 0
+    $script:DisplayOnlyCardRefreshes = 0
     $script:ManualIntervalRefreshes = 0
     $script:AutomaticIntervalRefreshes = 0
     $script:SelectPlanCalls = @()
-    [pscustomobject]@{ Baseline = $baseline; Result = $result; Estimate = $estimate; Cache = $cache; Limits = $limits }
+    [pscustomobject]@{ Baseline = $baseline; Result = $result; End = $frozenEnd; Estimate = $estimate; Diagnostics = $diagnostics; Cache = $cache; Limits = $limits }
 }
+
+# Confirming the same normalized plan, including either direction of the
+# display-only 5-hour switch, must retain weekly evidence and the frozen
+# measurement state. It must not queue an interval recomputation.
+$fixture = New-QuotaPlanUiState
+foreach ($choice in @(
+    [pscustomobject]@{ Plan = ' OLD-PLAN '; NoFive = $true },
+    [pscustomobject]@{ Plan = 'old-plan'; NoFive = $false },
+    [pscustomobject]@{ Plan = '  Old-Plan  '; NoFive = $false }
+)) {
+    $beforeCards = $script:QuotaCardRefreshes
+    Assert-QuotaPlanUi (Set-TokenRaderQuotaPlanSelection -PlanType $choice.Plan -FiveHourNotApplicable $choice.NoFive) 'same-plan confirmation was rejected'
+    Assert-QuotaPlanUi ([bool]$script:State.FiveHourNotApplicable -eq $choice.NoFive) 'display-only 5-hour choice was not updated'
+    Assert-QuotaPlanUi ([string]$script:State.QuotaPlanSelection -eq 'old-plan' -and
+        [object]::ReferenceEquals($script:State.RateLimits, $fixture.Limits) -and
+        [object]::ReferenceEquals($script:State.QuotaEstimates, $fixture.Estimate) -and
+        [object]::ReferenceEquals($script:State.QuotaDiagnostics, $fixture.Diagnostics) -and
+        [string]$script:State.QuotaEstimateAccountIdentity -eq 'old-account' -and
+        [object]::ReferenceEquals($script:State.IntervalCache, $fixture.Cache) -and
+        [object]::ReferenceEquals($script:State.IntervalBaseline, $fixture.Baseline) -and
+        [object]::ReferenceEquals($script:State.IntervalEnd, $fixture.End) -and
+        [object]::ReferenceEquals($script:State.IntervalResult, $fixture.Result) -and
+        [string]$script:State.QuotaCalibrationMessage -eq 'old-message') 'same-plan confirmation changed quota evidence or measurement state'
+    Assert-QuotaPlanUi ($script:SelectPlanCalls.Count -eq 0 -and
+        $script:ManualIntervalRefreshes -eq 0 -and $script:AutomaticIntervalRefreshes -eq 0 -and
+        $script:QuotaCardRefreshes -eq ($beforeCards + 1) -and
+        $script:DisplayOnlyCardRefreshes -eq $script:QuotaCardRefreshes) 'same-plan confirmation recomputed instead of repainting cards'
+}
+
+# Automatic mode is also a normalized same-plan confirmation.
+$fixture = New-QuotaPlanUiState
+$script:State.QuotaPlanSelection = ''
+Assert-QuotaPlanUi (Set-TokenRaderQuotaPlanSelection -PlanType '  ' -FiveHourNotApplicable $true) 'unchanged automatic mode was rejected'
+Assert-QuotaPlanUi ($script:SelectPlanCalls.Count -eq 0 -and $script:ManualIntervalRefreshes -eq 0 -and
+    [object]::ReferenceEquals($script:State.QuotaEstimates, $fixture.Estimate) -and
+    [object]::ReferenceEquals($script:State.IntervalEnd, $fixture.End)) 'unchanged automatic mode invalidated evidence or recomputed'
 
 # A normal selection is normalized, delegated, and only invalidated quota
 # caches are discarded. The token interval result and its immutable baseline
@@ -115,10 +163,14 @@ Assert-QuotaPlanUi ($script:SelectPlanCalls.Count -eq 1 -and
     [object]::ReferenceEquals($script:SelectPlanCalls[0].RateLimits, $fixture.Limits)) 'selection did not use the current RateLimits through the pure helper'
 Assert-QuotaPlanUi ([string]$script:State.RateLimits.SelectedPlanType -eq 'candidate') 'helper-selected RateLimits were not retained'
 Assert-QuotaPlanUi ($null -eq $script:State.QuotaEstimates -and $null -eq $script:State.IntervalCache) 'old quota estimate/cache survived selection'
+Assert-QuotaPlanUi ($null -eq $script:State.QuotaDiagnostics -and
+    [string]$script:State.QuotaEstimateAccountIdentity -eq '') 'changed plan retained old quota diagnostics or account binding'
 Assert-QuotaPlanUi ([object]::ReferenceEquals($script:State.IntervalBaseline, $fixture.Baseline)) 'selection changed IntervalBaseline'
+Assert-QuotaPlanUi ([object]::ReferenceEquals($script:State.IntervalEnd, $fixture.End)) 'selection changed the frozen ending'
 Assert-QuotaPlanUi ([object]::ReferenceEquals($script:State.IntervalResult, $fixture.Result)) 'selection changed the main IntervalResult'
 Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -match 'candidate' -and $script:QuotaPlanButton.Content -match '已确认') 'selected plan was not shown on QuotaPlanButton'
 Assert-QuotaPlanUi ($script:QuotaCardRefreshes -eq 1) 'selection did not refresh quota cards exactly once'
+Assert-QuotaPlanUi ($script:DisplayOnlyCardRefreshes -eq 0) 'changed plan used display-only card refresh'
 Assert-QuotaPlanUi ($script:ManualIntervalRefreshes -eq 1 -and $script:AutomaticIntervalRefreshes -eq 0) 'selection did not perform one manual interval refresh'
 
 # Clearing the selection follows the same safe path and restores the automatic
@@ -159,6 +211,8 @@ foreach ($blockedState in @('Starting', 'Stopping', 'ComputingFinal')) {
         [string]$script:QuotaPlanButton.Content -eq $beforeButton) "$blockedState changed quota state"
     Assert-QuotaPlanUi ($script:SelectPlanCalls.Count -eq 0 -and $script:QuotaCardRefreshes -eq 0 -and
         $script:ManualIntervalRefreshes -eq 0) "$blockedState invoked downstream UI work"
+    Assert-QuotaPlanUi (-not (Set-TokenRaderQuotaPlanSelection -PlanType ' OLD-PLAN ' -FiveHourNotApplicable $true)) "$blockedState allowed a display-only mutation"
+    Assert-QuotaPlanUi (-not [bool]$script:State.FiveHourNotApplicable -and $script:QuotaCardRefreshes -eq 0) "$blockedState changed the display-only flag"
 }
 
 $fixture = New-QuotaPlanUiState -UiState 'Ready' -IntervalComputing:$true

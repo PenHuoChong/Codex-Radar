@@ -1736,15 +1736,19 @@ function Update-TokenRaderQuotaPlanLabel {
 }
 
 function Update-QuotaCards {
+    param([switch]$DisplayOnly)
     $rateLimits = $script:State.RateLimits
     Update-TokenRaderQuotaPlanLabel
     # Keep state aligned with what is rendered: an expired estimate must not
-    # remain available for a later transient refresh or account switch.
-    try {
-        Retain-TokenRaderQuotaEstimatesForCurrentWindow `
-            -RateLimits $rateLimits `
-            -AccountIdentity $(if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' })
-    } catch { }
+    # remain available for a later transient refresh or account switch. A
+    # display-only choice leaves all frozen evidence untouched.
+    if (-not $DisplayOnly) {
+        try {
+            Retain-TokenRaderQuotaEstimatesForCurrentWindow `
+                -RateLimits $rateLimits `
+                -AccountIdentity $(if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' })
+        } catch { }
+    }
     $estimates = $script:State.QuotaEstimates
     $diagnostics = if ($script:State.ContainsKey('QuotaDiagnostics')) { $script:State.QuotaDiagnostics } else { $null }
     $fiveWindow = if ($null -ne $rateLimits) { $rateLimits.FiveHour } else { $null }
@@ -2794,6 +2798,14 @@ function Set-TokenRaderQuotaPlanSelection {
     param([AllowEmptyString()][string]$PlanType = '', [bool]$FiveHourNotApplicable = $false)
     if ($script:State.IntervalComputing -or $script:State.UiState -in @('Starting','Stopping','ComputingFinal')) { return $false }
     $plan=$PlanType.Trim().ToLowerInvariant()
+    $currentPlan=([string]$script:State.QuotaPlanSelection).Trim().ToLowerInvariant()
+    if ($plan -eq $currentPlan) {
+        # A display-only 5-hour choice must not discard weekly evidence or
+        # request another interval calculation at the frozen measurement end.
+        $script:State.FiveHourNotApplicable=$FiveHourNotApplicable
+        Update-QuotaCards -DisplayOnly
+        return $true
+    }
     $script:State.QuotaPlanSelection=$plan
     $script:State.FiveHourNotApplicable=$FiveHourNotApplicable
     $script:State.QuotaEstimates=$null
