@@ -15,6 +15,18 @@ function Assert-QuotaPlanUi {
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $tokenRaderSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
 
+$labelMatch = [regex]::Match(
+    $tokenRaderSource,
+    '(?s)function Update-TokenRaderQuotaPlanLabel\b.*?(?=\r?\nfunction |\z)'
+)
+Assert-QuotaPlanUi $labelMatch.Success 'automatic quota-plan label helper was not found'
+Invoke-Expression $labelMatch.Value
+$quotaCardsMatch = [regex]::Match(
+    $tokenRaderSource,
+    '(?s)function Update-QuotaCards\b.*?(?=\r?\nfunction |\z)'
+)
+Assert-QuotaPlanUi ($quotaCardsMatch.Success -and $quotaCardsMatch.Value -match 'Update-TokenRaderQuotaPlanLabel') 'quota-card refresh does not update the plan label'
+
 # Extract only the pure setter, as the measurement UI tests do.  Loading the
 # application would run startup refresh and could touch the user's auth/index;
 # this test intentionally exercises neither path.
@@ -155,6 +167,93 @@ Assert-QuotaPlanUi (-not (Set-TokenRaderQuotaPlanSelection -PlanType 'candidate'
 Assert-QuotaPlanUi ([object]::ReferenceEquals($script:State.RateLimits, $beforeRateLimits) -and
     $script:SelectPlanCalls.Count -eq 0 -and $script:QuotaCardRefreshes -eq 0) 'IntervalComputing changed quota state or repainted the UI'
 
+function New-AutoPlanLabelWindow {
+    param(
+        [string]$PlanType,
+        [string]$LimitId = 'codex',
+        [DateTimeOffset]$ResetsAt = [DateTimeOffset]::Now.AddHours(2),
+        [bool]$ScopeConflict = $false,
+        [string[]]$ConflictPlans = @()
+    )
+    [pscustomobject]@{
+        PlanType = $PlanType
+        LimitId = $LimitId
+        ResetsAt = $ResetsAt
+        WindowMinutes = 300
+        ResetIdentity = 'synthetic-current-cycle'
+        ScopeConflict = $ScopeConflict
+        ConflictPlans = @($ConflictPlans)
+        ScopeCandidates = @(
+            foreach ($plan in $ConflictPlans) {
+                [pscustomobject]@{ WindowKind = 'FiveHour'; WindowMinutes = 300; ResetIdentity = 'synthetic-current-cycle'; LimitId = $LimitId; PlanType = $plan }
+            }
+        )
+    }
+}
+
+function Set-AutoPlanLabelFixture {
+    param($RateLimits, [string]$Selection = '')
+    $script:State = @{ RateLimits = $RateLimits; QuotaPlanSelection = $Selection }
+    $script:QuotaPlanButton = [pscustomobject]@{ Content = 'old label' }
+}
+
+$future = [DateTimeOffset]::Now.AddHours(2)
+$proLimits = [pscustomobject]@{
+    FiveHour = New-AutoPlanLabelWindow -PlanType 'pro' -ResetsAt $future
+    Weekly = [pscustomobject]@{ PlanType = 'pro'; LimitId = 'codex'; ResetsAt = $future.AddDays(3); ScopeConflict = $false }
+}
+Set-AutoPlanLabelFixture -RateLimits $proLimits
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ([string]$script:QuotaPlanButton.Content -eq '当前套餐：Pro（pro；档位未提供，自动）') 'active pro was not identified without inventing a tier'
+
+# Replacing the accepted snapshot must replace the automatic label too; the
+# helper must not retain an old plan across a current-plan switch.
+$teamLimits = [pscustomobject]@{
+    FiveHour = New-AutoPlanLabelWindow -PlanType 'team' -ResetsAt $future
+    Weekly = [pscustomobject]@{ PlanType = 'team'; LimitId = 'codex'; ResetsAt = $future.AddDays(3); ScopeConflict = $false }
+}
+Set-AutoPlanLabelFixture -RateLimits $teamLimits
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ([string]$script:QuotaPlanButton.Content -eq '当前套餐：Business（team，自动）') 'current plan switch retained the previous automatic label'
+
+Set-AutoPlanLabelFixture -RateLimits $null
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ([string]$script:QuotaPlanButton.Content -match '自动识别' -and $script:QuotaPlanButton.Content -match '暂无有效窗口') 'missing quota data was not labeled as unavailable'
+
+$conflictWindow = New-AutoPlanLabelWindow -PlanType 'pro-lite' -ResetsAt $future -ScopeConflict:$true -ConflictPlans @('pro', 'pro-lite')
+$conflictLimits = [pscustomobject]@{ FiveHour = $conflictWindow; Weekly = $null }
+Set-AutoPlanLabelFixture -RateLimits $conflictLimits
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ([string]$script:QuotaPlanButton.Content -match '冲突' -and
+    [string]$script:QuotaPlanButton.Content -match 'pro' -and
+    [string]$script:QuotaPlanButton.Content -match 'pro-lite' -and
+    [string]$script:QuotaPlanButton.Content -notmatch '5x') 'plan conflict was hidden or a Pro tier was inferred'
+
+$expiredWindow = New-AutoPlanLabelWindow -PlanType 'plus' -ResetsAt ([DateTimeOffset]::Now.AddMinutes(-1))
+Set-AutoPlanLabelFixture -RateLimits ([pscustomobject]@{ FiveHour = $expiredWindow; Weekly = $null })
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ([string]$script:QuotaPlanButton.Content -match '自动识别' -and
+    $script:QuotaPlanButton.Content -match '暂无有效窗口') 'an expired window was used for automatic plan identification'
+
+$foreignWindow = New-AutoPlanLabelWindow -PlanType 'enterprise' -LimitId 'model-specialized' -ResetsAt $future
+Set-AutoPlanLabelFixture -RateLimits ([pscustomobject]@{ FiveHour = $foreignWindow; Weekly = $null })
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ([string]$script:QuotaPlanButton.Content -match '暂无有效窗口') 'a non-codex pool was used for automatic plan identification'
+
+# Manual selection keeps its historical raw, confirmed-plan label and takes
+# precedence over any automatically inferred conflict.
+Set-AutoPlanLabelFixture -RateLimits $conflictLimits -Selection 'pro-5x'
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ([string]$script:QuotaPlanButton.Content -eq '当前套餐：pro-5x（已确认）…') 'automatic labeling overrode the manual plan selection'
+
+$unknownLimits = [pscustomobject]@{
+    FiveHour = New-AutoPlanLabelWindow -PlanType 'pro-lite' -ResetsAt $future
+    Weekly = $null
+}
+Set-AutoPlanLabelFixture -RateLimits $unknownLimits
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ([string]$script:QuotaPlanButton.Content -eq '当前套餐：pro-lite（自动）') 'an unrecognized variant was not preserved as raw text'
+
 # XAML and account-switch contracts are checked as source/data only. No
 # Refresh-Application call is made, so this test never reads real auth or an
 # index database.
@@ -171,4 +270,41 @@ Assert-QuotaPlanUi ($refreshSource -match 'previousAccountIdentity' -and $refres
 Assert-QuotaPlanUi ($refreshSource -match '\$script:State\.QuotaPlanSelection\s*=\s*[''\"]{2}') 'account switch does not clear QuotaPlanSelection'
 Assert-QuotaPlanUi ($refreshSource -match [regex]::Escape("QuotaPlanButton.Content = '当前套餐：自动识别…'")) 'account switch does not restore QuotaPlanButton Content'
 
+$labelMatch = [regex]::Match($tokenRaderSource, '(?s)function Update-TokenRaderQuotaPlanLabel\b.*?(?=\r?\nfunction |\z)')
+Assert-QuotaPlanUi $labelMatch.Success 'automatic plan label helper exists'
+Invoke-Expression $labelMatch.Value
+$cardMatch = [regex]::Match($tokenRaderSource, '(?s)function Update-QuotaCards\b.*?(?=\r?\nfunction |\z)')
+Assert-QuotaPlanUi ($cardMatch.Value -match 'Update-TokenRaderQuotaPlanLabel') 'quota refresh updates plan label'
+$script:State = @{ QuotaPlanSelection=''; RateLimits=$null }
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -match '暂无有效窗口') 'missing data is explicit'
+$window = [pscustomobject]@{ PlanType='pro'; LimitId='codex'; ResetsAt=[DateTimeOffset]::Now.AddDays(1); ScopeConflict=$false }
+$script:State.RateLimits = [pscustomobject]@{ FiveHour=$null; Weekly=$window }
+foreach ($plan in @('free','go','plus','pro','team','business','edu','enterprise','prolite','future-plan')) {
+    $window.PlanType=$plan
+    Update-TokenRaderQuotaPlanLabel
+    Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -match [regex]::Escape($plan) -and $script:QuotaPlanButton.Content -match '自动') ('identified raw plan retained: '+$plan)
+    Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -notmatch '5x|20x') 'no inferred Pro multiplier'
+}
+$window.PlanType='pro'
+$window.ScopeConflict=$true
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -match '冲突') 'conflicting plan is not selected'
+$window.ScopeConflict=$false
+$other = [pscustomobject]@{ PlanType='team'; LimitId='codex'; ResetsAt=[DateTimeOffset]::Now.AddHours(1) }
+$script:State.RateLimits.FiveHour=$other
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -match '冲突') 'different active window plans conflict'
+$other.ResetsAt=[DateTimeOffset]::Now.AddHours(-1)
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -match 'Pro' -and $script:QuotaPlanButton.Content -notmatch '冲突') 'expired competing plan ignored'
+$window.LimitId='other-pool'
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -match '暂无有效窗口') 'foreign pool ignored'
+$window.LimitId='codex';$window.ResetsAt=$null
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -match '暂无有效窗口') 'missing reset does not prove current plan'
+$script:State.QuotaPlanSelection='team'
+Update-TokenRaderQuotaPlanLabel
+Assert-QuotaPlanUi ($script:QuotaPlanButton.Content -match 'team' -and $script:QuotaPlanButton.Content -match '已确认') 'manual choice retained'
 Write-Output 'QUOTA_PLAN_UI_TESTS_PASSED'

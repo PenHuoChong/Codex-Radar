@@ -1584,8 +1584,148 @@ function Set-QuotaWindowCard {
     }
 }
 
+function Update-TokenRaderQuotaPlanLabel {
+    # Automatic plan identification is presentation-only.  Trust only the
+    # already accepted regular-pool windows in State.RateLimits; never look up
+    # auth/account data or infer a plan from model names or timestamps.
+    if ($null -eq $script:QuotaPlanButton) { return }
+
+    $manualPlan = if ($script:State -is [System.Collections.IDictionary] -and $script:State.Contains('QuotaPlanSelection')) {
+        [string]$script:State['QuotaPlanSelection']
+    } elseif ($null -ne $script:State.PSObject.Properties['QuotaPlanSelection']) {
+        [string]$script:State.QuotaPlanSelection
+    } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($manualPlan)) {
+        # Keep the existing confirmed-selection label exactly as before.
+        $script:QuotaPlanButton.Content = '当前套餐：' + $manualPlan + '（已确认）…'
+        return
+    }
+
+    $rateLimits = if ($script:State -is [System.Collections.IDictionary] -and $script:State.Contains('RateLimits')) {
+        $script:State['RateLimits']
+    } elseif ($null -ne $script:State.PSObject.Properties['RateLimits']) {
+        $script:State.RateLimits
+    } else { $null }
+    if ($null -eq $rateLimits) {
+        $script:QuotaPlanButton.Content = '当前套餐：自动识别（暂无有效窗口）'
+        return
+    }
+
+    $acceptedWindows = New-Object System.Collections.ArrayList
+    foreach ($windowName in @('FiveHour', 'Weekly')) {
+        $windowProperty = $rateLimits.PSObject.Properties[$windowName]
+        if ($null -eq $windowProperty -or $null -eq $windowProperty.Value) { continue }
+        $window = $windowProperty.Value
+
+        # Older accepted snapshots may omit LimitId; if present, the window
+        # (or its parent metadata) must identify the regular Codex pool.
+        $limitId = if ($null -ne $window.PSObject.Properties['LimitId'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$window.LimitId)) {
+            [string]$window.LimitId
+        } elseif ($null -ne $rateLimits.PSObject.Properties['LimitId']) {
+            [string]$rateLimits.LimitId
+        } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($limitId) -and $limitId -ine 'codex') { continue }
+
+        # A window without a verifiable active reset boundary is not enough to
+        # identify today's plan. Expired and malformed windows are ignored.
+        $resetProperty = $window.PSObject.Properties['ResetsAt']
+        if ($null -eq $resetProperty -or $null -eq $resetProperty.Value) { continue }
+        try { if ([DateTimeOffset]$resetProperty.Value -le [DateTimeOffset]::Now) { continue } }
+        catch { continue }
+        [void]$acceptedWindows.Add([pscustomobject]@{
+            Window = $window
+            WindowName = $windowName
+            LimitId = $limitId
+        })
+    }
+
+    if ($acceptedWindows.Count -eq 0) {
+        $script:QuotaPlanButton.Content = '当前套餐：自动识别（暂无有效窗口）'
+        return
+    }
+
+    $planNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $windowPlanNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $hasConflict = $false
+    foreach ($acceptedEntry in @($acceptedWindows.ToArray())) {
+        $window = $acceptedEntry.Window
+        $windowPlan = if ($null -ne $window.PSObject.Properties['PlanType']) { ([string]$window.PlanType).Trim() } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($windowPlan)) {
+            [void]$planNames.Add($windowPlan)
+            [void]$windowPlanNames.Add($windowPlan)
+        }
+
+        if ($null -ne $window.PSObject.Properties['ScopeConflict'] -and [bool]$window.ScopeConflict) {
+            $hasConflict = $true
+            if ($null -ne $window.PSObject.Properties['ConflictPlans']) {
+                foreach ($conflictPlan in @($window.ConflictPlans)) {
+                    $name = ([string]$conflictPlan -replace '[\r\n\t]+', ' ').Trim()
+                    if ($name.Length -gt 48) { $name = $name.Substring(0, 47) + '…' }
+                    if (-not [string]::IsNullOrWhiteSpace($name)) { [void]$planNames.Add($name) }
+                }
+            }
+            # ConflictPlans is the production summary.  Older/synthetic
+            # snapshots may carry only ScopeCandidates, so use candidates in
+            # the same window, cycle and pool as an explicit conflict source.
+            if ($null -ne $window.PSObject.Properties['ScopeCandidates']) {
+                foreach ($candidate in @($window.ScopeCandidates)) {
+                    if ($null -eq $candidate) { continue }
+                    $candidateKind = if ($null -ne $candidate.PSObject.Properties['WindowKind']) { [string]$candidate.WindowKind } else { '' }
+                    if ($candidateKind -and $candidateKind -ine [string]$acceptedEntry.WindowName) { continue }
+                    $candidatePool = if ($null -ne $candidate.PSObject.Properties['LimitId']) { [string]$candidate.LimitId } else { [string]$acceptedEntry.LimitId }
+                    if ($candidatePool -and $candidatePool -ine 'codex') { continue }
+                    $baseResetIdentity = if ($null -ne $window.PSObject.Properties['ResetIdentity']) { [string]$window.ResetIdentity } else { '' }
+                    $candidateResetIdentity = if ($null -ne $candidate.PSObject.Properties['ResetIdentity']) { [string]$candidate.ResetIdentity } else { '' }
+                    if ($baseResetIdentity -and $candidateResetIdentity -and $baseResetIdentity -ne $candidateResetIdentity) { continue }
+                    $baseMinutes = if ($null -ne $window.PSObject.Properties['WindowMinutes']) { [int]$window.WindowMinutes } else { 0 }
+                    if ($baseMinutes -gt 0 -and $null -ne $candidate.PSObject.Properties['WindowMinutes'] -and
+                        [int]$candidate.WindowMinutes -ne $baseMinutes) { continue }
+                    $candidatePlan = if ($null -ne $candidate.PSObject.Properties['PlanType']) { ([string]$candidate.PlanType).Trim() } else { '' }
+                    if (-not [string]::IsNullOrWhiteSpace($candidatePlan)) {
+                        $candidatePlan = $candidatePlan -replace '[\r\n\t]+', ' '
+                        if ($candidatePlan.Length -gt 48) { $candidatePlan = $candidatePlan.Substring(0, 47) + '…' }
+                        [void]$planNames.Add($candidatePlan)
+                    }
+                }
+            }
+        }
+    }
+
+    # Different accepted windows can straddle a plan transition even when
+    # neither individual window reports a same-cycle conflict.  Do not pick
+    # whichever observation happens to be newest and call it the account plan.
+    if ($windowPlanNames.Count -gt 1) { $hasConflict = $true }
+    $plans = @($planNames | Sort-Object)
+    if ($hasConflict) {
+        $conflictLabel = if ($plans.Count -gt 0) { '（自动：' + ($plans -join ' / ') + '）' } else { '（自动）' }
+        $script:QuotaPlanButton.Content = '当前套餐：识别冲突' + $conflictLabel
+        return
+    }
+    if ($plans.Count -eq 0) {
+        $script:QuotaPlanButton.Content = '当前套餐：自动识别（套餐标识缺失）'
+        return
+    }
+
+    $rawPlan = ($plans[0] -replace '[\r\n\t]+', ' ').Trim()
+    if ($rawPlan.Length -gt 48) { $rawPlan = $rawPlan.Substring(0, 47) + '…' }
+    $displayPlan = switch ($rawPlan.ToLowerInvariant()) {
+        'free' { 'Free（free，自动）' }
+        'go' { 'Go（go，自动）' }
+        'plus' { 'Plus（plus，自动）' }
+        'team' { 'Business（team，自动）' }
+        'business' { 'Business（business，自动）' }
+        'enterprise' { 'Enterprise（enterprise，自动）' }
+        'edu' { 'Education（edu，自动）' }
+        'pro' { 'Pro（pro；档位未提供，自动）' }
+        default { $rawPlan + '（自动）' }
+    }
+    $script:QuotaPlanButton.Content = '当前套餐：' + $displayPlan
+}
+
 function Update-QuotaCards {
     $rateLimits = $script:State.RateLimits
+    Update-TokenRaderQuotaPlanLabel
     # Keep state aligned with what is rendered: an expired estimate must not
     # remain available for a later transient refresh or account switch.
     try {
