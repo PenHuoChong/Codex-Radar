@@ -22,6 +22,7 @@ foreach ($helperName in @(
         'Get-TokenRaderCallbackContextValue',
         'Complete-TokenRaderIntervalComputeJob',
         'Complete-TokenRaderIntervalCompute',
+        'Update-TokenRaderWeeklyReferenceFromResult',
         'ConvertTo-TokenRaderOffsetHashtable',
         'Update-IntervalView')) {
     $match = [regex]::Match($source, ('(?s)function ' + [regex]::Escape($helperName) + '\b.*?(?=\r?\nfunction |\z)'))

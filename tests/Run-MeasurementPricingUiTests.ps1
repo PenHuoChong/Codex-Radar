@@ -9,7 +9,7 @@ foreach ($name in @('Reset-MeasurementPricingConfirmation','Set-MeasurementPrici
     'Test-TokenRaderQuotaEstimateMatchesWindow','Set-QuotaWindowCard','Merge-LatestRateLimits',
     'Get-ServiceTierLabel','Get-ResultServiceTierSummary','Get-TokenRaderQuotaDiagnostic',
     'Get-TokenRaderQuotaDiagnosticValue','Get-TokenRaderQuotaDiagnosticMessage','Test-TokenRaderQuotaDiagnosticRetained',
-    'Get-TokenRaderQuotaDiagnosticAccountIdentity','Test-TokenRaderSameQuotaEvidence','Update-QuotaEstimatesFromInterval','Retain-TokenRaderQuotaEstimatesForCurrentWindow')) {
+    'Get-TokenRaderQuotaDiagnosticAccountIdentity','Test-TokenRaderSameQuotaEvidence','Update-QuotaEstimatesFromInterval','Update-TokenRaderWeeklyReferenceFromResult','Retain-TokenRaderQuotaEstimatesForCurrentWindow')) {
     $match = [regex]::Match($source, '(?s)function ' + $name + '\b.*?(?=\r?\nfunction |\z)')
     if (-not $match.Success) { throw "Missing production function: $name" }
     Invoke-Expression $match.Value
@@ -181,4 +181,58 @@ Merge-LatestRateLimits $foreignLimits
 Assert-UiPricing ($script:State.RateLimits.Weekly.UsedPercent -eq 74 -and $null -eq $script:State.RateLimits.FiveHour) 'newer specialized pool replaced the regular cards'
 $foreignEstimate=$estimate.PSObject.Copy();$foreignEstimate.LimitId='codex_bengalfox'
 Assert-UiPricing (-not (Test-TokenRaderQuotaEstimateMatchesWindow $foreignEstimate $regularWindow)) 'specialized-pool estimate survived regular-card retention'
+
+# The one-percent reference is scoped to the current measurement and stays
+# separate from frozen quota calibration, including sub-percent observations.
+$script:State.AccountIdentity='current-tag'
+$script:State.IntervalBaseline=[pscustomobject]@{StartedAt=$now.AddMinutes(-5);AccountIdentity='current-tag';RateLimits=$null}
+$startWeek=[pscustomobject]@{UsedPercent=30.0;WindowMinutes=10080;PlanType='synthetic';ResetsAt=$reset;LimitId='codex'}
+$endWeek=$startWeek.PSObject.Copy()
+$referenceResult=[pscustomobject]@{
+    AccountIdentity='current-tag';StartRateLimits=[pscustomobject]@{Weekly=$startWeek}
+    EndRateLimits=[pscustomobject]@{Weekly=$endWeek};TotalCost=12.5;PricingComplete=$true
+}
+foreach ($delta in @(0.0,0.1,0.99,1.0,2.0)) {
+    $endWeek.UsedPercent=30.0+$delta
+    Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+    $reference=$script:State.WeeklyReferenceEstimate
+    Assert-UiPricing ([Math]::Abs([double]$reference.TotalUsd-1250.0) -lt 0.000001 -and
+        [Math]::Abs([double]$reference.ActualDeltaPercent-$delta) -lt 0.000001) "wrong 1% reference at $delta percentage points"
+    Set-QuotaWindowCard -Window $endWeek -Estimate $estimate -WeeklyReference $reference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+    if ($delta -lt 1.0) {
+        Assert-UiPricing ($dollar.Text.StartsWith('周总额度参考≈$1,250') -and $dollar.Text.Contains('本次API消耗×100') -and
+            -not $dollar.Text.Contains('反推总额度≈')) "sub-percent measurement used frozen calibration at $delta"
+    } else {
+        Assert-UiPricing ($dollar.Text.Contains('反推总额度≈') -and -not $dollar.Text.Contains('周总额度参考')) "complete step failed to use frozen calibration at $delta"
+    }
+}
+$endWeek.UsedPercent=32.0
+Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+Set-QuotaWindowCard -Window $endWeek -Estimate $null -WeeklyReference $script:State.WeeklyReferenceEstimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($dollar.Text.StartsWith('周总额度参考≈$1,250') -and $dollar.Text.Contains('严格校准：不可估')) 'unavailable strict calibration hid the 1% reference after a full step'
+$endWeek.UsedPercent=30.0
+Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+$reference=$script:State.WeeklyReferenceEstimate
+Set-QuotaWindowCard -Window $endWeek -Estimate $null -WeeklyReference $reference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($usage.Text -eq '30%' -and $dollar.Text.StartsWith('周总额度参考≈$1,250') -and
+    -not $dollar.Text.Contains('比例外推已用')) 'current percent or reference-only label was fabricated'
+Set-QuotaWindowCard -Window $null -Estimate $null -WeeklyReference $reference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($usage.Text -eq '暂无' -and $dollar.Text.StartsWith('周总额度参考≈$1,250') -and
+    -not $dollar.Text.Contains('美金额度：不可估')) 'missing window hid reference or invented percent'
+Set-QuotaWindowCard -Window $conflictWindow -Estimate $null -WeeklyReference $reference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($usage.Text -eq '来源冲突' -and $dollar.Text.StartsWith('周总额度参考≈$1,250') -and
+    -not $dollar.Text.Contains('美金额度：不可估')) 'conflicting source hid reference or invented percent'
+$referenceResult.PricingComplete=$false
+Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+Set-QuotaWindowCard -Window $null -Estimate $null -WeeklyReference $script:State.WeeklyReferenceEstimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($dollar.Text.Contains('计价不完整（部分参考）')) 'partial pricing reference was unmarked'
+$referenceResult.TotalCost=[double]::NaN
+Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+Assert-UiPricing ($null -eq $script:State.WeeklyReferenceEstimate) 'nonfinite cost produced a reference'
+$referenceResult.TotalCost=12.5;$referenceResult.PricingComplete=$true
+Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+$currentReference=$script:State.WeeklyReferenceEstimate
+$referenceResult.AccountIdentity='old-account'
+Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+Assert-UiPricing ([object]::ReferenceEquals($currentReference,$script:State.WeeklyReferenceEstimate)) 'late old-account result replaced the current reference'
 Write-Output 'MEASUREMENT_PRICING_UI_TESTS_PASSED'

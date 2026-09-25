@@ -58,6 +58,7 @@ $script:State = @{
     RateLimits = $null
     RateLimitSnapshotCache = @{}
     QuotaEstimates = $null
+    WeeklyReferenceEstimate = $null
     QuotaEstimateAccountIdentity = ''
     # When the locally known account tag changes, quota evidence before this
     # boundary belongs to the previous account and must not be calibrated into
@@ -1503,8 +1504,21 @@ function Set-QuotaWindowCard {
         # Optional for compatibility with existing callers and synthetic UI
         # tests.  The core supplies one diagnostic object per quota window.
         $Diagnostic = $null,
+        $WeeklyReference = $null,
         [switch]$NotApplicable
     )
+
+    $referenceText = ''
+    $preferReference = $false
+    if ($null -ne $WeeklyReference -and $null -ne $WeeklyReference.PSObject.Properties['TotalUsd'] -and
+        -not [double]::IsNaN([double]$WeeklyReference.TotalUsd) -and
+        -not [double]::IsInfinity([double]$WeeklyReference.TotalUsd) -and [double]$WeeklyReference.TotalUsd -gt 0) {
+        $referenceText = '周总额度参考≈' + (Format-TokenRaderUsd ([double]$WeeklyReference.TotalUsd)) +
+            ' · 本次API消耗×100（按1%折算）'
+        if ([bool]$WeeklyReference.PricingIncomplete) { $referenceText += ' · 计价不完整（部分参考）' }
+        $preferReference = $null -ne $WeeklyReference.PSObject.Properties['ActualDeltaPercent'] -and
+            $null -ne $WeeklyReference.ActualDeltaPercent -and [double]$WeeklyReference.ActualDeltaPercent -lt 1.0
+    }
 
     if ($NotApplicable) {
         $UsageText.Text = '不适用'
@@ -1524,7 +1538,7 @@ function Set-QuotaWindowCard {
         $UsageText.Text = if ($selectionMissing) { '暂无' } else { '来源冲突' }
         $Progress.Value = 0
         $detail = if ($null -ne $Window.PSObject.Properties['ConflictDescription']) { [string]$Window.ConflictDescription } else { '检测到多个计划的额度快照，无法确认当前来源' }
-        $DollarText.Text = '美金额度：不可估 · ' + $detail
+        $DollarText.Text = if ($referenceText) { $referenceText + ' · 严格校准：不可估 · ' + $detail } else { '美金额度：不可估 · ' + $detail }
         $ResetText.Text = if ($selectionMissing) { '未提供所选套餐窗口' } elseif ($null -ne $Window.ResetsAt) { '重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt } else { '' }
         return
     }
@@ -1542,14 +1556,27 @@ function Set-QuotaWindowCard {
     if ($null -eq $Window -or $windowExpired) {
         $UsageText.Text = '暂无'
         $Progress.Value = 0
-        $DollarText.Text = '美金额度：不可估 · ' + (Get-TokenRaderQuotaDiagnosticMessage -Diagnostic $Diagnostic -Fallback '暂无当前窗口')
+        $reason = Get-TokenRaderQuotaDiagnosticMessage -Diagnostic $Diagnostic -Fallback '暂无当前窗口'
+        $DollarText.Text = if ($referenceText) { $referenceText + ' · 严格校准：不可估 · ' + $reason } else { '美金额度：不可估 · ' + $reason }
         $ResetText.Text = '暂无当前窗口'
         return
     }
-    $UsageText.Text = ('{0:0.####}%' -f [double]$Window.UsedPercent)
+    $validPercent = $null -ne $Window.PSObject.Properties['UsedPercent'] -and $null -ne $Window.UsedPercent
+    if ($validPercent) {
+        try { $percentValue = [double]$Window.UsedPercent; $validPercent = -not [double]::IsNaN($percentValue) -and -not [double]::IsInfinity($percentValue) -and $percentValue -ge 0 -and $percentValue -le 100 }
+        catch { $validPercent = $false }
+    }
+    if (-not $validPercent) {
+        $UsageText.Text = '暂无'
+        $Progress.Value = 0
+        $DollarText.Text = if ($referenceText) { $referenceText + ' · 严格校准：不可估 · 当前窗口缺少有效百分比' } else { '美金额度：不可估 · 当前窗口缺少有效百分比' }
+        $ResetText.Text = if ($null -ne $Window.ResetsAt) { ('重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt) } else { '暂无当前窗口' }
+        return
+    }
+    $UsageText.Text = ('{0:0.####}%' -f $percentValue)
     $Progress.Value = [Math]::Max(0, [Math]::Min(100, [double]$Window.UsedPercent))
     $ResetText.Text = if ($null -ne $Window.ResetsAt) { ('重置 {0:MM-dd HH:mm}' -f $Window.ResetsAt) } else { ('{0} 分钟窗口' -f $Window.WindowMinutes) }
-    if ($null -ne $Estimate) {
+    if ($null -ne $Estimate -and -not $preferReference) {
         $currentPercent = [double]$Window.UsedPercent
         $sourceLabel = if ([string]$Estimate.EstimateSource -eq 'snapshot_delta_usd_estimate') { '快照区间API成本/实际用量增量' } else { '额度快照API成本/用量增量' }
         $identityLabel = if ([bool]$Estimate.IdentityComplete) { '' } else { ' · 请求级去重不完整' }
@@ -1591,7 +1618,12 @@ function Set-QuotaWindowCard {
             $DollarText.Text += ' · 已确认套餐：' + [string]$Window.PlanType
         }
     } else {
-        $DollarText.Text = '美金额度：不可估 · ' + (Get-TokenRaderQuotaDiagnosticMessage -Diagnostic $Diagnostic -Fallback '尚无有效估算结果')
+        if ($referenceText -and $preferReference -and $null -ne $Estimate) {
+            $DollarText.Text = $referenceText + ' · 本次周增量不足1个百分点；既有冻结校准未用于此参考'
+        } else {
+            $reason = Get-TokenRaderQuotaDiagnosticMessage -Diagnostic $Diagnostic -Fallback '尚无有效估算结果'
+            $DollarText.Text = if ($referenceText) { $referenceText + ' · 严格校准：不可估 · ' + $reason } else { '美金额度：不可估 · ' + $reason }
+        }
     }
 }
 
@@ -1764,11 +1796,67 @@ function Update-QuotaCards {
     Set-QuotaWindowCard -Window $fiveWindow -Estimate $fiveEstimate -Diagnostic (Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName 'FiveHour') `
         -NotApplicable:($script:State.ContainsKey('FiveHourNotApplicable') -and [bool]$script:State.FiveHourNotApplicable) `
         -UsageText $script:FiveHourUsageText -Progress $script:FiveHourProgress -DollarText $script:FiveHourDollarText -ResetText $script:FiveHourResetText
-    Set-QuotaWindowCard -Window $weeklyWindow -Estimate $weeklyEstimate -Diagnostic (Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName 'Weekly') `
+    $weeklyReference = if ($script:State.ContainsKey('WeeklyReferenceEstimate')) { $script:State.WeeklyReferenceEstimate } else { $null }
+    Set-QuotaWindowCard -Window $weeklyWindow -Estimate $weeklyEstimate -WeeklyReference $weeklyReference -Diagnostic (Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName 'Weekly') `
         -UsageText $script:WeeklyUsageText -Progress $script:WeeklyProgress -DollarText $script:WeeklyDollarText -ResetText $script:WeeklyResetText
     $script:QuotaEstimateHintText.Text = [string]$script:State.QuotaCalibrationMessage
     if ($script:State.ContainsKey('FiveHourNotApplicable') -and $script:State.FiveHourNotApplicable) {
         $script:QuotaEstimateHintText.Text = '5 小时限制已按人工确认设为不适用。' + (Get-TokenRaderQuotaDiagnosticMessage -Diagnostic (Get-TokenRaderQuotaDiagnostic -Diagnostics $diagnostics -WindowName 'Weekly') -Fallback '周额度仍按实际日志证据计算。')
+    }
+}
+
+function Update-TokenRaderWeeklyReferenceFromResult {
+    param([Parameter(Mandatory = $true)]$Result)
+    # This is a display-only 1% yardstick for the current measurement. It is
+    # never placed in QuotaEstimates or used as a frozen calibration endpoint.
+    if ($null -eq $script:State.IntervalBaseline -or $null -eq $Result.PSObject.Properties['TotalCost'] -or
+        $null -eq $Result.TotalCost) { $script:State.WeeklyReferenceEstimate = $null; return }
+    try { $cost = [double]$Result.TotalCost } catch { $script:State.WeeklyReferenceEstimate = $null; return }
+    if ([double]::IsNaN($cost) -or [double]::IsInfinity($cost) -or $cost -le 0 -or
+        [double]::IsInfinity($cost * 100.0)) { $script:State.WeeklyReferenceEstimate = $null; return }
+    $currentAccount = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
+    $baselineAccount = if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['AccountIdentity']) {
+        [string]$script:State.IntervalBaseline.AccountIdentity
+    } else { '' }
+    if ($null -ne $Result.PSObject.Properties['AccountIdentity']) {
+        if (-not [string]::Equals([string]$Result.AccountIdentity, $currentAccount, [StringComparison]::Ordinal) -or
+            (-not [string]::IsNullOrWhiteSpace($baselineAccount) -and
+                [string]::IsNullOrWhiteSpace($currentAccount) -and [string]::IsNullOrWhiteSpace([string]$Result.AccountIdentity))) { return }
+    } elseif (-not [string]::IsNullOrWhiteSpace($baselineAccount) -and
+        -not [string]::Equals($baselineAccount, $currentAccount, [StringComparison]::Ordinal)) { return }
+
+    $startLimits = if ($null -ne $Result.PSObject.Properties['StartRateLimits']) { $Result.StartRateLimits } elseif ($null -ne $script:State.IntervalBaseline.PSObject.Properties['RateLimits']) { $script:State.IntervalBaseline.RateLimits } else { $null }
+    $endLimits = if ($null -ne $Result.PSObject.Properties['EndRateLimits']) { $Result.EndRateLimits } elseif ($null -ne $Result.PSObject.Properties['RateLimits']) { $Result.RateLimits } else { $null }
+    $start = if ($null -ne $startLimits -and $null -ne $startLimits.PSObject.Properties['Weekly']) { $startLimits.Weekly } else { $null }
+    $end = if ($null -ne $endLimits -and $null -ne $endLimits.PSObject.Properties['Weekly']) { $endLimits.Weekly } else { $null }
+    $delta = $null
+    if ($null -ne $start -and $null -ne $end -and
+        $null -ne $start.PSObject.Properties['UsedPercent'] -and $null -ne $end.PSObject.Properties['UsedPercent'] -and
+        $null -ne $start.UsedPercent -and $null -ne $end.UsedPercent -and
+        $null -ne $start.PSObject.Properties['ResetsAt'] -and $null -ne $end.PSObject.Properties['ResetsAt'] -and
+        $null -ne $start.ResetsAt -and $null -ne $end.ResetsAt -and
+        [string]$start.ResetsAt -eq [string]$end.ResetsAt -and
+        ($null -eq $start.PSObject.Properties['PlanType'] -or $null -eq $end.PSObject.Properties['PlanType'] -or [string]$start.PlanType -eq [string]$end.PlanType) -and
+        ($null -eq $start.PSObject.Properties['ScopeConflict'] -or -not [bool]$start.ScopeConflict) -and
+        ($null -eq $end.PSObject.Properties['ScopeConflict'] -or -not [bool]$end.ScopeConflict) -and
+        ($null -eq $start.PSObject.Properties['LimitId'] -or [string]::IsNullOrWhiteSpace([string]$start.LimitId) -or [string]$start.LimitId -ieq 'codex') -and
+        ($null -eq $end.PSObject.Properties['LimitId'] -or [string]::IsNullOrWhiteSpace([string]$end.LimitId) -or [string]$end.LimitId -ieq 'codex')) {
+        try {
+            $startPercent = [double]$start.UsedPercent
+            $endPercent = [double]$end.UsedPercent
+            if (-not [double]::IsNaN($startPercent) -and -not [double]::IsInfinity($startPercent) -and
+                -not [double]::IsNaN($endPercent) -and -not [double]::IsInfinity($endPercent) -and
+                $startPercent -ge 0 -and $endPercent -le 100 -and $endPercent -ge $startPercent) {
+                $delta = $endPercent - $startPercent
+            }
+        } catch { }
+    }
+    $pricingComplete = if ($null -ne $Result.PSObject.Properties['PricingComplete']) { [bool]$Result.PricingComplete } elseif ($null -ne $Result.PSObject.Properties['CostComplete']) { [bool]$Result.CostComplete } else { $false }
+    $script:State.WeeklyReferenceEstimate = [pscustomobject]@{
+        TotalUsd = $cost * 100.0
+        ActualDeltaPercent = $delta
+        PricingIncomplete = -not $pricingComplete
+        AccountIdentity = $currentAccount
     }
 }
 
@@ -2476,6 +2564,7 @@ function Complete-TokenRaderIntervalCompute {
         if ($ScanRateLimits) {
             Update-QuotaEstimatesFromInterval -Result $result -Final $Final
         }
+        Update-TokenRaderWeeklyReferenceFromResult -Result $result
         $baselineSnapshots = if ($null -ne $result.PSObject.Properties['BaselineSnapshots']) { $result.BaselineSnapshots } else { @{} }
         $script:State.IntervalCache = [pscustomobject]@{
             BaselineStartedAt = $BaselineStartedAt
@@ -2730,6 +2819,7 @@ function Start-IntervalMeasurement {
     $script:State.IntervalEnd = $null
     $script:State.IntervalBaseline = $null
     $script:State.IntervalResult = $null
+    $script:State.WeeklyReferenceEstimate = $null
     $script:State.IntervalCache = $null
     $script:State.PendingMeasurementStart = $waitForIndex
     Retain-TokenRaderQuotaEstimatesForCurrentWindow
@@ -2809,6 +2899,7 @@ function Set-TokenRaderQuotaPlanSelection {
     $script:State.QuotaPlanSelection=$plan
     $script:State.FiveHourNotApplicable=$FiveHourNotApplicable
     $script:State.QuotaEstimates=$null
+    $script:State.WeeklyReferenceEstimate=$null
     $script:State.QuotaEstimateAccountIdentity=''
     $script:State.QuotaDiagnostics=$null
     $script:State.IntervalCache=$null
@@ -2864,6 +2955,7 @@ function Reset-MeasurementPricingConfirmation {
     }
     if (-not $samePolicy) {
         $script:State.QuotaEstimates = $null
+        $script:State.WeeklyReferenceEstimate = $null
         $script:State.QuotaEstimateAccountIdentity = ''
     }
     $script:State.ManualServiceTiers = $defaults
@@ -2886,6 +2978,7 @@ function Set-MeasurementPricingConfirmation {
     $script:State.ManualServiceTiers = $clean
     # Results priced under a different assumption cannot calibrate this one.
     $script:State.QuotaEstimates = $null
+    $script:State.WeeklyReferenceEstimate = $null
     $script:State.QuotaEstimateAccountIdentity = ''
     $script:State.IntervalCache = $null
     $script:State.QuotaCalibrationMessage = '正在按本次计价模式重新计算额度…'
@@ -3247,6 +3340,7 @@ function Refresh-Application {
             $script:QuotaPlanButton.Content = '当前套餐：自动识别…'
             $script:State.RateLimits = $null
             $script:State.QuotaEstimates = $null
+            $script:State.WeeklyReferenceEstimate = $null
             $script:State.QuotaEstimateAccountIdentity = ''
             $script:State.QuotaDiagnostics = $null
             $script:State.QuotaCalibrationMessage = '账号已切换；等待当前账号形成新的额度证据。'

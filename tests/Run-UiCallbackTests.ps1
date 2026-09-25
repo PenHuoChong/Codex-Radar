@@ -110,6 +110,7 @@ try {
         }
         $script:QuotaUpdatedBeforeResult = $true
     }
+    function Update-TokenRaderWeeklyReferenceFromResult { param($Result) }
     function Show-IntervalResult {
         param($Result, [bool]$Running)
         if ($script:ExpectQuotaBeforeResult -and -not $script:QuotaUpdatedBeforeResult) {
