@@ -105,6 +105,9 @@ $script:IntervalComputeScript = {
     $prices = Get-TokenRaderPrices -PricingPath $PricingPath
     $prices | Add-Member -NotePropertyName ManualServiceTiers -NotePropertyValue $ManualServiceTiers -Force
     $prices | Add-Member -NotePropertyName QuotaPlanSelection -NotePropertyValue $QuotaPlanSelection -Force
+    # Opt in from this UI generation only. An already-running old window
+    # may load the updated core in a worker, but must retain its API basis.
+    $prices | Add-Member -NotePropertyName QuotaPricingBasis -NotePropertyValue 'plan_standard_api_reference' -Force
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '同步增量日志'
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
@@ -1564,6 +1567,11 @@ function Set-QuotaWindowCard {
         -not [double]::IsInfinity([double]$WeeklyReference.TotalUsd) -and [double]$WeeklyReference.TotalUsd -gt 0) {
         $referenceText = '周总额度参考≈' + (Format-TokenRaderUsd ([double]$WeeklyReference.TotalUsd)) +
             ' · 本次API消耗×100（按1%折算）'
+        if ($null -ne $WeeklyReference.PSObject.Properties['QuotaPricingBasis'] -and
+            [string]$WeeklyReference.QuotaPricingBasis -eq 'plan_standard_api_reference') {
+            $referenceText = '周套餐折算总额度参考≈' + (Format-TokenRaderUsd ([double]$WeeklyReference.TotalUsd)) +
+                ' · 本次套餐折算消耗×100（按1%折算，非账单）'
+        }
         if ([bool]$WeeklyReference.PricingIncomplete) { $referenceText += ' · 计价不完整（部分参考）' }
         $preferReference = $null -ne $WeeklyReference.PSObject.Properties['ActualDeltaPercent'] -and
             $null -ne $WeeklyReference.ActualDeltaPercent -and [double]$WeeklyReference.ActualDeltaPercent -lt 1.0
@@ -1628,6 +1636,9 @@ function Set-QuotaWindowCard {
     if ($null -ne $Estimate -and -not $preferReference) {
         $currentPercent = [double]$Window.UsedPercent
         $sourceLabel = if ([string]$Estimate.EstimateSource -eq 'snapshot_delta_usd_estimate') { '快照区间API成本/实际用量增量' } else { '额度快照API成本/用量增量' }
+        $planReference = $null -ne $Estimate.PSObject.Properties['QuotaPricingBasis'] -and
+            [string]$Estimate.QuotaPricingBasis -eq 'plan_standard_api_reference'
+        if ($planReference) { $sourceLabel = '快照区间套餐折算成本/实际用量增量（非账单）' }
         $identityLabel = if ([bool]$Estimate.IdentityComplete) { '' } else { ' · 请求级去重不完整' }
         $startLabel = if ($null -ne $Estimate.PSObject.Properties['StartUsedPercent']) {
             ' · 从 {0:0.####}% 开始 · 校准增量 +{1:0.####}%' -f ([double]$Estimate.StartUsedPercent), ([double]$Estimate.EffectiveDeltaPercent)
@@ -1659,6 +1670,7 @@ function Set-QuotaWindowCard {
             $historyLabel,
             $sourceLabel,
             ($identityLabel + $diagnosticLabel))
+        if ($planReference) { $DollarText.Text = $DollarText.Text.Replace('反推总额度≈', '套餐折算总额度参考≈') }
         if ($usingPreviousSnapshot) { $DollarText.Text += ' · 沿用最近有效快照，正在更新' }
         if ($null -ne $Estimate.PSObject.Properties['CalibrationEndObservedAt'] -and $null -ne $Estimate.CalibrationEndObservedAt) {
             $DollarText.Text += ' · 校准截至 {0:MM-dd HH:mm:ss}' -f ([DateTimeOffset]$Estimate.CalibrationEndObservedAt).ToLocalTime()
@@ -1867,14 +1879,19 @@ function Update-TokenRaderWeeklyReferenceFromResult {
         if (-not [string]::Equals([string]$Result.AccountIdentity, $currentAccount, [StringComparison]::Ordinal) -or
             (-not [string]::IsNullOrWhiteSpace($baselineAccount) -and
                 [string]::IsNullOrWhiteSpace($currentAccount) -and [string]::IsNullOrWhiteSpace([string]$Result.AccountIdentity))) { return }
-    } elseif (-not [string]::IsNullOrWhiteSpace($baselineAccount) -and
-        -not [string]::Equals($baselineAccount, $currentAccount, [StringComparison]::Ordinal)) { return }
+    } elseif (-not [string]::Equals($baselineAccount, $currentAccount, [StringComparison]::Ordinal)) { return }
 
     # Account ownership is checked before ANY mutation, including rejecting a
     # zero/invalid cost. A late foreign result cannot erase the current value.
     if ($null -eq $Result.PSObject.Properties['TotalCost'] -or
         $null -eq $Result.TotalCost) { $script:State.WeeklyReferenceEstimate = $null; return }
     try { $cost = [double]$Result.TotalCost } catch { $script:State.WeeklyReferenceEstimate = $null; return }
+    $quotaBasis = if ($null -ne $Result.PSObject.Properties['QuotaPricingBasis']) { [string]$Result.QuotaPricingBasis } else { 'api_equivalent' }
+    if ($quotaBasis -eq 'plan_standard_api_reference') {
+        if ($null -eq $Result.PSObject.Properties['PlanNormalizedTotalCost'] -or
+            $null -eq $Result.PlanNormalizedTotalCost) { $script:State.WeeklyReferenceEstimate = $null; return }
+        try { $cost = [double]$Result.PlanNormalizedTotalCost } catch { $script:State.WeeklyReferenceEstimate = $null; return }
+    }
     if ([double]::IsNaN($cost) -or [double]::IsInfinity($cost) -or $cost -le 0 -or
         [double]::IsInfinity($cost * 100.0)) { $script:State.WeeklyReferenceEstimate = $null; return }
 
@@ -1905,11 +1922,15 @@ function Update-TokenRaderWeeklyReferenceFromResult {
         } catch { }
     }
     $pricingComplete = if ($null -ne $Result.PSObject.Properties['PricingComplete']) { [bool]$Result.PricingComplete } elseif ($null -ne $Result.PSObject.Properties['CostComplete']) { [bool]$Result.CostComplete } else { $false }
+    if ($quotaBasis -eq 'plan_standard_api_reference') {
+        $pricingComplete = $null -ne $Result.PSObject.Properties['PlanPricingComplete'] -and [bool]$Result.PlanPricingComplete
+    }
     $script:State.WeeklyReferenceEstimate = [pscustomobject]@{
         TotalUsd = $cost * 100.0
         ActualDeltaPercent = $delta
         PricingIncomplete = -not $pricingComplete
         AccountIdentity = $currentAccount
+        QuotaPricingBasis = $quotaBasis
     }
 }
 
@@ -2047,6 +2068,9 @@ function Mark-TokenRaderQuotaEstimatesRetainedAfterFailure {
 function Test-TokenRaderSameQuotaEvidence {
     param($Previous, $Current)
     if ($null -eq $Previous -or $null -eq $Current) { return $false }
+    $previousBasis = if ($null -ne $Previous.PSObject.Properties['QuotaPricingBasis']) { [string]$Previous.QuotaPricingBasis } else { 'api_equivalent' }
+    $currentBasis = if ($null -ne $Current.PSObject.Properties['QuotaPricingBasis']) { [string]$Current.QuotaPricingBasis } else { 'api_equivalent' }
+    if ($previousBasis -ne $currentBasis) { return $false }
     foreach ($name in @('CalibrationStartObservedAt','CalibrationEndObservedAt','StartUsedPercent','CalibrationEndUsedPercent','EvidenceCost','TotalUsd','PlanType','WindowMinutes','ResetsAt','LimitId','AccountIdentity')) {
         if ($null -eq $Previous.PSObject.Properties[$name] -or $null -eq $Current.PSObject.Properties[$name]) { return $false }
         if ($null -eq $Previous.$name -or $null -eq $Current.$name) { return $false }
@@ -2167,6 +2191,15 @@ function Update-QuotaEstimatesFromInterval {
     $validationWeekly = if ($null -ne $validationRateLimits) { $validationRateLimits.Weekly } else { $null }
     $previousFive = if ($null -ne $previousEstimates) { $previousEstimates.FiveHour } else { $null }
     $previousWeekly = if ($null -ne $previousEstimates) { $previousEstimates.Weekly } else { $null }
+    $resultBasis = if ($null -ne $Result.PSObject.Properties['QuotaPricingBasis']) { [string]$Result.QuotaPricingBasis } else { 'api_equivalent' }
+    if ($null -ne $previousFive) {
+        $previousBasis = if ($null -ne $previousFive.PSObject.Properties['QuotaPricingBasis']) { [string]$previousFive.QuotaPricingBasis } else { 'api_equivalent' }
+        if ($previousBasis -ne $resultBasis) { $previousFive = $null }
+    }
+    if ($null -ne $previousWeekly) {
+        $previousBasis = if ($null -ne $previousWeekly.PSObject.Properties['QuotaPricingBasis']) { [string]$previousWeekly.QuotaPricingBasis } else { 'api_equivalent' }
+        if ($previousBasis -ne $resultBasis) { $previousWeekly = $null }
+    }
     # Price incompleteness, transient worker failures, and an absent diagnostic
     # estimate must not erase a valid estimate from the same account/window/
     # reset cycle.  Account switches and explicit boundary failures are the
@@ -2244,10 +2277,12 @@ function Update-QuotaEstimatesFromInterval {
 
     $calibrated = @()
     if ($null -ne $effectiveFive -and -not $retainedFive) {
-        $calibrated += ('5 小时 API等价美元≈{0}' -f (Format-TokenRaderUsd ([double]$effectiveFive.TotalUsd)))
+        $basisLabel = if ($null -ne $effectiveFive.PSObject.Properties['QuotaPricingBasis'] -and [string]$effectiveFive.QuotaPricingBasis -eq 'plan_standard_api_reference') { '套餐折算美元参考' } else { 'API等价美元' }
+        $calibrated += ('5 小时 {0}≈{1}' -f $basisLabel, (Format-TokenRaderUsd ([double]$effectiveFive.TotalUsd)))
     }
     if ($null -ne $effectiveWeekly -and -not $retainedWeekly) {
-        $calibrated += ('周 API等价美元≈{0}' -f (Format-TokenRaderUsd ([double]$effectiveWeekly.TotalUsd)))
+        $basisLabel = if ($null -ne $effectiveWeekly.PSObject.Properties['QuotaPricingBasis'] -and [string]$effectiveWeekly.QuotaPricingBasis -eq 'plan_standard_api_reference') { '套餐折算美元参考' } else { 'API等价美元' }
+        $calibrated += ('周 {0}≈{1}' -f $basisLabel, (Format-TokenRaderUsd ([double]$effectiveWeekly.TotalUsd)))
     }
     $retained = @()
     if ($retainedFive -or (Test-TokenRaderQuotaDiagnosticRetained -Diagnostic $diagnosticFive)) { $retained += '5 小时' }

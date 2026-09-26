@@ -249,4 +249,41 @@ Assert-UiPricing ([object]::ReferenceEquals($currentReference,$script:State.Week
 $referenceResult.AccountIdentity = 'current-tag'; $referenceResult.TotalCost = 15
 Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
 Assert-UiPricing ($script:State.WeeklyReferenceEstimate.TotalUsd -eq 1500) 'valid current result failed to update after rejecting late results'
+# Plan-normalized quota dollars are separate from the unchanged API card.
+$planResult = [pscustomobject]@{
+    AccountIdentity='current-tag'; TotalCost=20.0; PricingComplete=$true
+    PlanNormalizedTotalCost=25.0; PlanPricingComplete=$true
+    QuotaPricingBasis='plan_standard_api_reference'
+}
+Update-TokenRaderWeeklyReferenceFromResult -Result $planResult
+Assert-UiPricing ($script:State.WeeklyReferenceEstimate.TotalUsd -eq 2500) 'plan reference reused API tier cost instead of plan valuation'
+Assert-UiPricing ($planResult.TotalCost -eq 20.0) 'plan reference mutated main API dollars'
+Set-QuotaWindowCard -Window $window -Estimate $null -WeeklyReference $script:State.WeeklyReferenceEstimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($dollar.Text.Contains('套餐折算') -and $dollar.Text.Contains('非账单') -and -not $dollar.Text.Contains('本次API消耗')) 'plan reference presented as API billing'
+$planEstimate = $estimate.PSObject.Copy()
+$planEstimate | Add-Member -NotePropertyName QuotaPricingBasis -NotePropertyValue 'plan_standard_api_reference'
+Set-QuotaWindowCard -Window $window -Estimate $planEstimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-UiPricing ($dollar.Text.Contains('套餐折算总额度参考') -and $dollar.Text.Contains('非账单')) 'strict plan quota did not disclose its basis'
+$currentReference = $script:State.WeeklyReferenceEstimate
+$untaggedPlanResult = [pscustomobject]@{ TotalCost=0; PlanNormalizedTotalCost=0; QuotaPricingBasis='plan_standard_api_reference' }
+$script:State.IntervalBaseline.AccountIdentity = ''
+Update-TokenRaderWeeklyReferenceFromResult -Result $untaggedPlanResult
+Assert-UiPricing ([object]::ReferenceEquals($currentReference,$script:State.WeeklyReferenceEstimate)) 'untagged plan result erased a newly identified account reference'
+$planResult.AccountIdentity = 'old-account'; $planResult.PlanNormalizedTotalCost = [double]::NaN
+Update-TokenRaderWeeklyReferenceFromResult -Result $planResult
+Assert-UiPricing ([object]::ReferenceEquals($currentReference,$script:State.WeeklyReferenceEstimate)) 'foreign invalid plan cost erased current reference'
+$planResult.AccountIdentity = 'current-tag'
+Update-TokenRaderWeeklyReferenceFromResult -Result $planResult
+Assert-UiPricing ($null -eq $script:State.WeeklyReferenceEstimate) 'nonfinite plan cost produced dollars'
+$script:State.IntervalBaseline=[pscustomobject]@{StartedAt=$now.AddMinutes(-5);AccountIdentity='current-tag';RateLimits=$null}
+$script:State.RateLimits=[pscustomobject]@{FiveHour=$null;Weekly=$window}
+$script:State.QuotaEstimates=[pscustomobject]@{FiveHour=$null;Weekly=$estimate}
+$script:State.QuotaEstimateAccountIdentity='current-tag'
+$basisSwitchResult=[pscustomobject]@{
+    AccountIdentity='current-tag'; TotalCost=20.0; PricingComplete=$true
+    EndRateLimits=$script:State.RateLimits; QuotaEvidence=$null
+    QuotaPricingBasis='plan_standard_api_reference'
+}
+Update-QuotaEstimatesFromInterval -Result $basisSwitchResult
+Assert-UiPricing ($null -eq $script:State.QuotaEstimates.Weekly) 'API estimate survived a switch to plan-reference basis'
 Write-Output 'MEASUREMENT_PRICING_UI_TESTS_PASSED'

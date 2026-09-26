@@ -1935,6 +1935,8 @@ try {
     else { & $aggregateTestScript }
     & (Join-Path $PSScriptRoot 'Run-ModelBackfillTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ServiceTierTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-PlanPricingTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-PlanQuotaEvidenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IndexEvidenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-UsageCompatibilityTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-CacheReadAliasTests.ps1')

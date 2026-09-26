@@ -3,6 +3,23 @@
   "unitTokens": 1000000,
   "verifiedAt": "2026-09-24",
   "priceType": "OpenAI API Standard processing",
+  "subscriptionPricing": {
+    "verifiedAt": "2026-09-26",
+    "source": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+    "basis": "standard_api_normalized_reference",
+    "fastMultipliers": {
+      "gpt-6-astra": 2.5,
+      "gpt-6-sol": 2.5,
+      "gpt-6-luna": 2.5,
+      "gpt-5.6-sol": 2.5,
+      "gpt-5.6-terra": 2.5,
+      "gpt-5.6-luna": 2.5,
+      "gpt-5.5": 2.5,
+      "gpt-5.4": 2.0
+    },
+    "cacheWritePremium": false,
+    "note": "Application-normalized dollar reference only; not official USD subscription rates and not a dollar-to-credit conversion."
+  },
   "models": [
     {
       "id": "gpt-6-astra",

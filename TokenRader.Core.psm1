@@ -2518,6 +2518,113 @@ function New-TokenRaderMeasurementBaseline {
     }
 }
 
+function Get-TokenRaderPlanNormalizedCost {
+    param(
+        [Parameter(Mandatory = $true)]$Usage,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Model,
+        [Parameter(Mandatory = $true)]$PricingDocument,
+        [AllowEmptyString()][string]$ServiceTier = '',
+        [Nullable[bool]]$LongContextApplied = $null,
+        [bool]$RequestInputObservable = $true,
+        [Nullable[bool]]$LongContextPricingUncertain = $null,
+        $ResolvedPrice = $null
+    )
+    # This is an explicitly labelled subscription-plan reference expressed in
+    # Standard API dollars, not API billing or an official credit-to-USD rate.
+    # In particular, subscription credits have no separately documented cache
+    # write tariff, so all uncached input uses the Standard input valuation.
+    $basePrice = if ($null -ne $ResolvedPrice) { $ResolvedPrice } else {
+        Resolve-TokenRaderPrice -Model $Model -PricingDocument $PricingDocument
+    }
+    $tier = ConvertTo-TokenRaderServiceTier $ServiceTier
+    $reason = ''
+    [double]$multiplier = 1.0
+    $planMetadata = if ($null -ne $PricingDocument.PSObject.Properties['subscriptionPricing']) {
+        $PricingDocument.subscriptionPricing
+    } else { $null }
+    if ($null -eq $planMetadata -or $null -eq $planMetadata.PSObject.Properties['basis'] -or
+        [string]$planMetadata.basis -ne 'standard_api_normalized_reference' -or
+        $null -eq $planMetadata.PSObject.Properties['cacheWritePremium'] -or
+        [bool]$planMetadata.cacheWritePremium) { $reason = 'missing_plan_pricing_metadata' }
+    elseif ($null -eq $basePrice) { $reason = 'unknown_model' }
+    elseif ($tier -eq 'priority') {
+        # Exact canonical model ID only. No family inference or API multiplier.
+        $canonicalId = ([string]$basePrice.id).ToLowerInvariant()
+        $factorProperty = if ($null -ne $planMetadata.PSObject.Properties['fastMultipliers'] -and
+            $null -ne $planMetadata.fastMultipliers) {
+            $planMetadata.fastMultipliers.PSObject.Properties[$canonicalId]
+        } else { $null }
+        [double]$factor = 0
+        if ($null -eq $factorProperty -or
+            -not [double]::TryParse([string]$factorProperty.Value, [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$factor) -or
+            [double]::IsNaN($factor) -or [double]::IsInfinity($factor) -or $factor -le 0) {
+            $reason = 'unknown_plan_fast_multiplier'
+        } else {
+            $multiplier = $factor
+        }
+    } elseif ($tier -ne '' -and $tier -ne 'default') { $reason = 'unknown_service_tier' }
+    if ($reason -eq '' -and $null -ne $LongContextPricingUncertain -and [bool]$LongContextPricingUncertain -and
+        -not $RequestInputObservable -and $null -ne $basePrice.PSObject.Properties['longContextThreshold'] -and
+        [Int64]$basePrice.longContextThreshold -gt 0L) { $reason = 'missing_request_input' }
+    if ($reason -eq '') {
+        foreach ($name in @('Uncached','Cached','Output')) {
+            [double]$tokens = [double]$Usage.$name
+            if ([double]::IsNaN($tokens) -or [double]::IsInfinity($tokens) -or $tokens -lt 0) {
+                $reason = 'invalid_usage'; break
+            }
+        }
+    }
+    if ($reason -eq '') {
+        foreach ($name in @('input','cachedInput','output')) {
+            [double]$rate = 0
+            if ($null -eq $basePrice.PSObject.Properties[$name] -or
+                -not [double]::TryParse([string]$basePrice.PSObject.Properties[$name].Value,
+                    [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$rate) -or
+                [double]::IsNaN($rate) -or [double]::IsInfinity($rate) -or $rate -lt 0) {
+                $reason = 'invalid_standard_price'; break
+            }
+        }
+    }
+    [double]$unitTokens = 1000000.0
+    if ($reason -eq '' -and $null -ne $PricingDocument.PSObject.Properties['unitTokens']) {
+        if (-not [double]::TryParse([string]$PricingDocument.unitTokens, [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$unitTokens) -or
+            [double]::IsNaN($unitTokens) -or [double]::IsInfinity($unitTokens) -or $unitTokens -le 0) {
+            $reason = 'invalid_unit_tokens'
+        }
+    }
+    if ($reason -ne '') {
+        return [pscustomobject]@{
+            Known = $false; PricingReason = $reason; Model = $Model; ServiceTier = $tier
+            Multiplier = $null; InputCost = $null; CachedCost = $null
+            OutputCost = $null; TotalCost = $null
+        }
+    }
+    # Preserve the Standard API long-context valuation as an internal
+    # normalization assumption; it is not a documented subscription premium.
+    $context = Resolve-TokenRaderLongContextPricing -Price $basePrice -Usage $Usage -Scope call -LongContextApplied $LongContextApplied
+    [double]$inputCost = ([double]$Usage.Uncached / $unitTokens) * [double]$basePrice.input * [double]$context.InputMultiplier * $multiplier
+    [double]$cachedCost = ([double]$Usage.Cached / $unitTokens) * [double]$basePrice.cachedInput * [double]$context.InputMultiplier * $multiplier
+    [double]$outputCost = ([double]$Usage.Output / $unitTokens) * [double]$basePrice.output * [double]$context.OutputMultiplier * $multiplier
+    [double]$totalCost = $inputCost + $cachedCost + $outputCost
+    if ([double]::IsNaN($totalCost) -or [double]::IsInfinity($totalCost)) {
+        return [pscustomobject]@{
+            Known = $false; PricingReason = 'nonfinite_plan_reference'; Model = $Model; ServiceTier = $tier
+            Multiplier = $null; InputCost = $null; CachedCost = $null
+            OutputCost = $null; TotalCost = $null
+        }
+    }
+    [pscustomobject]@{
+        Known = $true; PricingReason = 'plan_standard_api_reference'; Model = $Model; ServiceTier = $tier
+        Multiplier = $multiplier; InputCost = $inputCost; CachedCost = $cachedCost
+        OutputCost = $outputCost; TotalCost = $totalCost
+        LongContextApplied = [bool]$context.Applied
+        InputMultiplier = [double]$context.InputMultiplier
+        OutputMultiplier = [double]$context.OutputMultiplier
+    }
+}
+
 function ConvertTo-TokenRaderSignature {
     param([string[]]$Parts)
 
@@ -3311,6 +3418,8 @@ function Get-TokenRaderQuotaEstimate {
                 IdentitySources = if ($null -ne $Evidence.PSObject.Properties['IdentitySources']) { @($Evidence.IdentitySources) } else { @() }
                 UnidentifiedEvents = if ($null -ne $Evidence.PSObject.Properties['UnidentifiedEvents']) { [Int64]$Evidence.UnidentifiedEvents } else { 0L }
                 EvidenceCost = [double]$Evidence.TotalCost
+                ApiEvidenceCost = if ($null -ne $Evidence.PSObject.Properties['ApiTotalCost']) { [double]$Evidence.ApiTotalCost } else { [double]$Evidence.TotalCost }
+                QuotaPricingBasis = if ($null -ne $Evidence.PSObject.Properties['QuotaPricingBasis']) { [string]$Evidence.QuotaPricingBasis } else { 'api_equivalent' }
                 EvidenceFirstCountedAt = if ($null -ne $Evidence.PSObject.Properties['FirstCountedAt']) { $Evidence.FirstCountedAt } else { $null }
                 EvidenceLastCountedAt = if ($null -ne $Evidence.PSObject.Properties['LastCountedAt']) { $Evidence.LastCountedAt } else { $null }
                 AverageUsdPerToken = if ($null -ne $Evidence.PSObject.Properties['AverageUsdPerToken']) { [double]$Evidence.AverageUsdPerToken } else { 0.0 }
@@ -4653,6 +4762,14 @@ function ConvertFrom-TokenRaderPricedAggregate {
     [double]$outputCost = 0
     [double]$cacheCreationCost = 0
     [double]$longContextExtraCost = 0
+    $quotaPricingBasis = if ($null -ne $PricingDocument.PSObject.Properties['QuotaPricingBasis'] -and
+        [string]$PricingDocument.QuotaPricingBasis -eq 'plan_standard_api_reference') { 'plan_standard_api_reference' } else { 'api_equivalent' }
+    [double]$planInputCost = 0
+    [double]$planCachedCost = 0
+    [double]$planOutputCost = 0
+    [double]$planLongContextExtraCost = 0
+    [bool]$planPricingComplete = $true
+    $unknownPlanModels = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     [Int64]$standardContextEvents = 0
     [Int64]$longContextEvents = 0
     [Int64]$standardContextInput = 0
@@ -4693,6 +4810,26 @@ function ConvertFrom-TokenRaderPricedAggregate {
             $costArgs.ServiceTierEvidenceComplete = [bool]$bucket.ModeEvidenceComplete
         }
         $cost = Get-TokenRaderCost @costArgs
+        $planCost = $null
+        if ($quotaPricingBasis -eq 'plan_standard_api_reference') {
+            $planCost = Get-TokenRaderPlanNormalizedCost -Usage $bucketUsage -Model $model -PricingDocument $PricingDocument `
+                -ServiceTier ([string]$cost.ServiceTier) -LongContextApplied ([bool]$bucket.LongContext) `
+                -RequestInputObservable ([bool]$costArgs.RequestInputObservable) `
+                -LongContextPricingUncertain $costArgs.LongContextPricingUncertain -ResolvedPrice $priceCache[$priceCacheKey]
+            if ([bool]$planCost.Known) {
+                $planInputCost += [double]$planCost.InputCost
+                $planCachedCost += [double]$planCost.CachedCost
+                $planOutputCost += [double]$planCost.OutputCost
+                if ([bool]$planCost.LongContextApplied) {
+                    $shortPlanCost = ([double]$planCost.InputCost + [double]$planCost.CachedCost) / [double]$planCost.InputMultiplier +
+                        [double]$planCost.OutputCost / [double]$planCost.OutputMultiplier
+                    $planLongContextExtraCost += [double]$planCost.TotalCost - $shortPlanCost
+                }
+            } else {
+                $planPricingComplete = $false
+                [void]$unknownPlanModels.Add($(if ([string]::IsNullOrWhiteSpace($model)) { '未知模型' } else { $model }))
+            }
+        }
         $itemTier = [string]$cost.ServiceTier
         $itemTierComplete = $null -ne $cost.PSObject.Properties['ServiceTierComplete'] -and [bool]$cost.ServiceTierComplete
         $itemModeComplete = $null -ne $cost.PSObject.Properties['ModeEvidenceComplete'] -and [bool]$cost.ModeEvidenceComplete
@@ -4744,6 +4881,7 @@ function ConvertFrom-TokenRaderPricedAggregate {
             LongContextSource = $cost.LongContextSource
             CacheWriteObservable = $bucketObservable
             Cost = $cost
+            PlanNormalizedCost = $planCost
         }
     }
     $models = @($Aggregate.Models)
@@ -4758,6 +4896,14 @@ function ConvertFrom-TokenRaderPricedAggregate {
         OutputCost = $outputCost
         CacheCreationCost = $cacheCreationCost
         TotalCost = $inputCost + $cachedCost + $outputCost
+        QuotaPricingBasis = $quotaPricingBasis
+        PlanNormalizedInputCost = if ($quotaPricingBasis -eq 'plan_standard_api_reference') { $planInputCost } else { $null }
+        PlanNormalizedCachedCost = if ($quotaPricingBasis -eq 'plan_standard_api_reference') { $planCachedCost } else { $null }
+        PlanNormalizedOutputCost = if ($quotaPricingBasis -eq 'plan_standard_api_reference') { $planOutputCost } else { $null }
+        PlanNormalizedTotalCost = if ($quotaPricingBasis -eq 'plan_standard_api_reference') { $planInputCost + $planCachedCost + $planOutputCost } else { $null }
+        PlanNormalizedLongContextExtraCost = if ($quotaPricingBasis -eq 'plan_standard_api_reference') { $planLongContextExtraCost } else { $null }
+        PlanPricingComplete = $quotaPricingBasis -eq 'plan_standard_api_reference' -and $planPricingComplete
+        UnknownPlanModels = @($unknownPlanModels | Sort-Object)
         PricingComplete = $unknownModels.Count -eq 0
         CostComplete = $unknownModels.Count -eq 0
         ServiceTierComplete = $serviceTierComplete
@@ -4916,7 +5062,13 @@ function Get-TokenRaderQuotaWindowEvidence {
     $coverageComplete = $currentObservedAt -ge $endObservedAt -and ($null -eq $MainLastCountedAt -or
         $currentObservedAt -ge [DateTimeOffset]$MainLastCountedAt)
 
-    $cacheKey = '{0}|{1}|{2}|{3}|{4}|{5}|{6}' -f $startObservedAt.UtcDateTime.Ticks, $endObservedAt.UtcDateTime.Ticks,$WindowKind,$EndWindow.WindowMinutes,$endReset,$EndWindow.PlanType,$effectiveLimitId
+    $quotaPricingBasis = if ($null -ne $PricingDocument.PSObject.Properties['QuotaPricingBasis'] -and
+        [string]$PricingDocument.QuotaPricingBasis -eq 'plan_standard_api_reference') { 'plan_standard_api_reference' } else { 'api_equivalent' }
+    $planMetadataKey = if ($quotaPricingBasis -eq 'plan_standard_api_reference' -and
+        $null -ne $PricingDocument.PSObject.Properties['subscriptionPricing']) {
+        ConvertTo-Json -InputObject $PricingDocument.subscriptionPricing -Compress -Depth 8
+    } else { '' }
+    $cacheKey = '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}' -f $startObservedAt.UtcDateTime.Ticks, $endObservedAt.UtcDateTime.Ticks,$WindowKind,$EndWindow.WindowMinutes,$endReset,$EndWindow.PlanType,$effectiveLimitId,$quotaPricingBasis,$planMetadataKey
     $aggregate = if ($null -ne $Cache -and $Cache.ContainsKey($cacheKey)) {
         $Cache[$cacheKey]
     } else {
@@ -4928,10 +5080,29 @@ function Get-TokenRaderQuotaWindowEvidence {
         $value
     }
     $priced = ConvertFrom-TokenRaderPricedAggregate -Aggregate $aggregate -PricingDocument $PricingDocument
+    [double]$apiTotalCost = [double]$priced.TotalCost
+    if ($quotaPricingBasis -eq 'plan_standard_api_reference') {
+        # Leave the main interval's API pricing intact. Only the independent
+        # quota calibration uses the subscription-plan valuation.
+        $priced = Copy-TokenRaderQuotaPlanObject -Object $priced
+        $priced.InputCost = [double]$priced.PlanNormalizedInputCost
+        $priced.CachedCost = [double]$priced.PlanNormalizedCachedCost
+        $priced.OutputCost = [double]$priced.PlanNormalizedOutputCost
+        $priced.TotalCost = [double]$priced.PlanNormalizedTotalCost
+        $priced.CacheCreationCost = 0.0
+        $priced.CostCoverage = 'plan_standard_api_reference'
+        $priced.LongContextExtraCost = [double]$priced.PlanNormalizedLongContextExtraCost
+        $priced.PricingComplete = [bool]$priced.PlanPricingComplete
+        $priced.CostComplete = [bool]$priced.PlanPricingComplete
+        $priced.QuotaEvidenceComplete = [bool]$priced.PlanPricingComplete -and [bool]$priced.ServiceTierComplete -and
+            ([bool]$priced.ModeEvidenceComplete -or [bool]$priced.ModeAssumptionApplied)
+        $priced.UnknownModels = @($priced.UnknownPlanModels)
+    }
     if ($null -ne $DiagnosticState) {
         $DiagnosticState.StartObservedAt=$startObservedAt; $DiagnosticState.EndObservedAt=$endObservedAt
         $DiagnosticState.StartUsedPercent=[double]$calibrationStart.UsedPercent; $DiagnosticState.EndUsedPercent=[double]$calibrationEnd.UsedPercent
-        $DiagnosticState.TotalCost=[double]$priced.TotalCost; $DiagnosticState.PricingComplete=[bool]$priced.PricingComplete
+        $DiagnosticState.TotalCost=[double]$priced.TotalCost; $DiagnosticState.ApiTotalCost=$apiTotalCost
+        $DiagnosticState.QuotaPricingBasis=$quotaPricingBasis; $DiagnosticState.PricingComplete=[bool]$priced.PricingComplete
         $DiagnosticState.AttributionComplete=[bool]$aggregate.AttributionComplete
         $DiagnosticState.UnattributedEvents=[long]$aggregate.UnattributedEvents
     }
@@ -4939,7 +5110,10 @@ function Get-TokenRaderQuotaWindowEvidence {
         Set-TokenRaderQuotaDiagnostic $DiagnosticState 'unknown_attribution' '校准区间存在无法确认额度周期归属的调用'
         return $null
     }
-    if (-not [bool]$priced.PricingComplete) { Set-TokenRaderQuotaDiagnostic $DiagnosticState 'pricing_incomplete' '校准区间价格不完整' }
+    if (-not [bool]$priced.PricingComplete) {
+        $pricingMessage = if ($quotaPricingBasis -eq 'plan_standard_api_reference') { '校准区间套餐折算参考价格不完整' } else { '校准区间价格不完整' }
+        Set-TokenRaderQuotaDiagnostic $DiagnosticState 'pricing_incomplete' $pricingMessage
+    }
     elseif ([double]$priced.TotalCost -le 0) { Set-TokenRaderQuotaDiagnostic $DiagnosticState 'zero_cost' '完整步长内没有可计价调用' }
     else { Set-TokenRaderQuotaDiagnostic $DiagnosticState 'ok' '本次更新' 'updated' }
     # PricingComplete intentionally retains its historical meaning: an
@@ -5015,6 +5189,8 @@ function Get-TokenRaderQuotaWindowEvidence {
         CachedCost = [double]$priced.CachedCost
         OutputCost = [double]$priced.OutputCost
         TotalCost = [double]$priced.TotalCost
+        ApiTotalCost = $apiTotalCost
+        QuotaPricingBasis = $quotaPricingBasis
         CacheCreationCost = [double]$priced.CacheCreationCost
         PricingComplete = [bool]$priced.PricingComplete
         CostComplete = [bool]$priced.CostComplete
@@ -5165,6 +5341,9 @@ function Get-TokenRaderIndexedIntervalResult {
         CachedCost = [double]$priced.CachedCost
         OutputCost = [double]$priced.OutputCost
         TotalCost = [double]$priced.TotalCost
+        PlanNormalizedTotalCost = $priced.PlanNormalizedTotalCost
+        PlanPricingComplete = [bool]$priced.PlanPricingComplete
+        QuotaPricingBasis = [string]$priced.QuotaPricingBasis
         PricingComplete = [bool]$priced.PricingComplete
         CostComplete = [bool]$priced.CostComplete
         ServiceTierComplete = [bool]$priced.ServiceTierComplete
@@ -5240,7 +5419,15 @@ function Get-TokenRaderPricingCacheKey {
     # Preserve the v6 prefix for callers that display/diagnose it, while
     # ensuring a transient manual mode selection cannot reuse a cached result
     # computed under another selection.
-    return (@('usage-history-v6', [string]$PricingDocument.verifiedAt, [string]$PricingDocument.unitTokens, ($modelParts -join ';'), ('manual:' + ($manualParts -join ','))) -join '|')
+    $legacyKey = (@('usage-history-v6', [string]$PricingDocument.verifiedAt, [string]$PricingDocument.unitTokens, ($modelParts -join ';'), ('manual:' + ($manualParts -join ','))) -join '|')
+    if ($null -eq $PricingDocument.PSObject.Properties['QuotaPricingBasis'] -or
+        [string]$PricingDocument.QuotaPricingBasis -ne 'plan_standard_api_reference') { return $legacyKey }
+    # Opt-in measurements have a distinct cache identity. Preserve the exact
+    # legacy key when absent so a running API-only history is unaffected.
+    $metadataText = if ($null -ne $PricingDocument.PSObject.Properties['subscriptionPricing']) {
+        ConvertTo-Json -InputObject $PricingDocument.subscriptionPricing -Depth 8 -Compress
+    } else { 'missing' }
+    return $legacyKey + '|quota-plan-standard-api-reference:' + $metadataText
 }
 
 function ConvertFrom-TokenRaderUsageHistorySnapshot {
@@ -5655,4 +5842,5 @@ function Remove-TokenRaderUsageHistory {
 }
 
 Export-ModuleMember -Function ConvertTo-TokenRaderServiceTier, Resolve-TokenRaderServiceTierPrice
+Export-ModuleMember -Function Get-TokenRaderPlanNormalizedCost
 Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderResetIdentity, Select-TokenRaderQuotaPlan, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision, Get-TokenRaderUsageHistoryWindow, Remove-TokenRaderUsageHistory, Get-TokenRaderToolBackfillStatus, Invoke-TokenRaderToolBackfill
