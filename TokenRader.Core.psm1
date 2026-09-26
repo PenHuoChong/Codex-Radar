@@ -171,6 +171,107 @@ function Get-TokenRaderFirstPresentInt64 {
     return [pscustomobject]@{ Found = $false; Value = 0L }
 }
 
+function Get-TokenRaderFirstNonNegativeIntegerInt64 {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+
+    foreach ($name in @($Names)) {
+        if ($null -eq $Object) { break }
+        $property = $Object.PSObject.Properties[$name]
+        if ($null -eq $property -or $null -eq $property.Value) { continue }
+        $value = $property.Value
+        try {
+            if ($value -is [string]) {
+                $text = $value.Trim()
+                if ([string]::IsNullOrWhiteSpace($text)) { continue }
+                [Int64]$parsed = 0
+                if ([Int64]::TryParse($text, [Globalization.NumberStyles]::Integer,
+                        [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -and $parsed -ge 0) {
+                    return [pscustomobject]@{ Found = $true; Value = $parsed }
+                }
+                continue
+            }
+            if ($value -is [bool] -or $value -is [DBNull]) { continue }
+            [Int64]$converted = 0
+            if ($value -is [decimal]) {
+                if ([decimal]::Truncate([decimal]$value) -ne [decimal]$value -or
+                    [decimal]$value -lt [decimal]0 -or [decimal]$value -gt [decimal][Int64]::MaxValue) { continue }
+                $converted = [Int64]$value
+            } elseif ($value -is [double] -or $value -is [single]) {
+                [double]$numeric = $value
+                # Double(long.MaxValue) is 2^63, so use an exclusive bound.
+                if ([double]::IsNaN($numeric) -or [double]::IsInfinity($numeric) -or
+                    $numeric -lt 0.0 -or $numeric -ge 9223372036854775808.0 -or
+                    [Math]::Truncate($numeric) -ne $numeric) { continue }
+                $converted = [Int64]$numeric
+            } elseif ($value -is [byte] -or $value -is [sbyte] -or
+                $value -is [int16] -or $value -is [uint16] -or
+                $value -is [int32] -or $value -is [uint32] -or
+                $value -is [int64]) {
+                $converted = [Int64]$value
+                if ($converted -lt 0) { continue }
+            } elseif ($value -is [uint64]) {
+                if ([UInt64]$value -gt [UInt64][Int64]::MaxValue) { continue }
+                $converted = [Int64]$value
+            } else {
+                continue
+            }
+            return [pscustomobject]@{ Found = $true; Value = $converted }
+        } catch {
+            # Invalid or non-finite values must not hide a later valid alias.
+        }
+    }
+    return [pscustomobject]@{ Found = $false; Value = 0L }
+}
+
+function ConvertTo-TokenRaderJsonIntegerLiteral {
+    param([Parameter(Mandatory = $true)][string]$NumberText)
+
+    # Parse JSON number syntax without accepting a regex prefix (for example,
+    # `1.5` must not turn into 1). This preserves exactness for integral
+    # decimals/exponents and avoids floating-point rounding near Int64 bounds.
+    $match = [regex]::Match($NumberText, '^(?<sign>-?)(?<whole>0|[1-9]\d*)(?:\.(?<fraction>\d+))?(?:[eE](?<exponent>[+-]?\d+))?$')
+    if (-not $match.Success) { return [pscustomobject]@{ Found = $false; Value = 0L } }
+
+    $digits = $match.Groups['whole'].Value + $match.Groups['fraction'].Value
+    $digits = $digits.TrimStart([char]'0')
+    if ([string]::IsNullOrEmpty($digits)) { return [pscustomobject]@{ Found = $true; Value = 0L } }
+    if ($match.Groups['sign'].Value -eq '-') { return [pscustomobject]@{ Found = $false; Value = 0L } }
+
+    [Int64]$exponent = 0
+    if ($match.Groups['exponent'].Success -and
+        -not [Int64]::TryParse($match.Groups['exponent'].Value, [Globalization.NumberStyles]::AllowLeadingSign,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$exponent)) {
+        return [pscustomobject]@{ Found = $false; Value = 0L }
+    }
+    $scale = $exponent - [Int64]$match.Groups['fraction'].Value.Length
+    if ($scale -ge 0) {
+        if ($scale -gt 19 -or $digits.Length + $scale -gt 19) { return [pscustomobject]@{ Found = $false; Value = 0L } }
+        if ($scale -gt 0) { $digits += ('0' * [int]$scale) }
+    } else {
+        $removeCount = -$scale
+        if ($removeCount -gt $digits.Length) { return [pscustomobject]@{ Found = $false; Value = 0L } }
+        $tail = $digits.Substring($digits.Length - [int]$removeCount)
+        if ($tail -match '[^0]') { return [pscustomobject]@{ Found = $false; Value = 0L } }
+        if ($removeCount -gt 0) { $digits = $digits.Substring(0, $digits.Length - [int]$removeCount) }
+        $digits = $digits.TrimStart([char]'0')
+        if ([string]::IsNullOrEmpty($digits)) { return [pscustomobject]@{ Found = $true; Value = 0L } }
+    }
+
+    if ($digits.Length -gt 19 -or ($digits.Length -eq 19 -and
+        [string]::CompareOrdinal($digits, '9223372036854775807') -gt 0)) {
+        return [pscustomobject]@{ Found = $false; Value = 0L }
+    }
+    [Int64]$parsed = 0
+    if ([Int64]::TryParse($digits, [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        return [pscustomobject]@{ Found = $true; Value = $parsed }
+    }
+    return [pscustomobject]@{ Found = $false; Value = 0L }
+}
+
 function Get-TokenRaderFirstFastInt64 {
     param(
         [Parameter(Mandatory = $true)][string]$InnerText,
@@ -179,9 +280,8 @@ function Get-TokenRaderFirstFastInt64 {
 
     foreach ($name in @($Names)) {
         $escapedName = [regex]::Escape($name)
-        # Keep the alias order explicit instead of letting JSON property order
-        # decide which cache-write spelling wins.  null/invalid values are
-        # skipped, while a valid numeric zero remains a real observation.
+        # Cache-write precedence remains unchanged: first non-null scalar that
+        # converts to a non-negative Int64 is observable, including zero.
         $match = [regex]::Match($InnerText, '"' + $escapedName + '"\s*:\s*(?:(?:"([^"]*)")|(-?\d+)|null)')
         if (-not $match.Success -or
             (-not $match.Groups[1].Success -and -not $match.Groups[2].Success)) { continue }
@@ -195,25 +295,56 @@ function Get-TokenRaderFirstFastInt64 {
     return [pscustomobject]@{ Found = $false; Value = 0L }
 }
 
+function Get-TokenRaderFirstFastNonNegativeIntegerInt64 {
+    param(
+        [Parameter(Mandatory = $true)][string]$InnerText,
+        [Parameter(Mandatory = $true)][string[]]$Names
+    )
+
+    foreach ($name in @($Names)) {
+        $escapedName = [regex]::Escape($name)
+        # Keep alias order explicit instead of letting JSON property order
+        # decide precedence. Match one complete JSON scalar so an invalid
+        # value or number prefix cannot mask a later valid alias.
+        $valueEnd = '(?=\s*(?:[,}]|$))'
+        $pattern = '"' + $escapedName + '"\s*:\s*(?<quoted>"(?:\\.|[^"\\])*")' + $valueEnd + '|"' + $escapedName +
+            '"\s*:\s*(?<number>-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)' + $valueEnd + '|"' +
+            $escapedName + '"\s*:\s*(?:null|true|false)' + $valueEnd
+        $match = [regex]::Match($InnerText, $pattern)
+        if (-not $match.Success) { continue }
+        if ($match.Groups['quoted'].Success) {
+            try { $value = ConvertFrom-Json -InputObject $match.Groups['quoted'].Value -ErrorAction Stop }
+            catch { continue }
+            $parsed = Get-TokenRaderFirstNonNegativeIntegerInt64 -Object ([pscustomobject]@{ Value = $value }) -Names @('Value')
+            if ($parsed.Found) { return $parsed }
+        } elseif ($match.Groups['number'].Success) {
+            $numberText = $match.Groups['number'].Value
+            [Int64]$integer = 0
+            if ([Int64]::TryParse($numberText, [Globalization.NumberStyles]::Integer,
+                    [Globalization.CultureInfo]::InvariantCulture, [ref]$integer)) {
+                if ($integer -ge 0) { return [pscustomobject]@{ Found = $true; Value = $integer } }
+                continue
+            }
+            $parsed = ConvertTo-TokenRaderJsonIntegerLiteral -NumberText $numberText
+            if ($parsed.Found) { return $parsed }
+        }
+    }
+    return [pscustomobject]@{ Found = $false; Value = 0L }
+}
+
 function ConvertTo-TokenRaderUsage {
     param([Parameter(Mandatory = $true)]$RawUsage)
 
     $reasoningRaw = Get-TokenRaderPropertyValue -Object $RawUsage -Name 'reasoning_output_tokens'
     $reasoning = if ($null -ne $reasoningRaw) { ConvertTo-TokenRaderSafeInt64 $reasoningRaw } else { 0L }
-    # Codex has used several names for the cache-read portion over time.  The
-    # canonical cached_input_tokens field wins, then the equivalent
-    # cache_read_tokens/cached_tokens aliases.  Missing cache fields mean zero,
-    # not a malformed usage record.
-    $cachedRaw = $null
-    foreach ($name in @('cached_input_tokens', 'cache_read_tokens', 'cached_tokens')) {
-        if ($null -ne $RawUsage.PSObject.Properties[$name]) {
-            $cachedRaw = $RawUsage.PSObject.Properties[$name].Value
-            break
-        }
-    }
+    # Codex has used several names for cache-read tokens. Select the first
+    # valid non-negative integer in canonical order; null, malformed, and
+    # negative values do not hide a usable legacy alias, while zero does.
+    $cached = Get-TokenRaderFirstNonNegativeIntegerInt64 -Object $RawUsage `
+        -Names @('cached_input_tokens', 'cache_read_tokens', 'cached_tokens')
     New-TokenRaderUsage `
         -InputTokens (ConvertTo-TokenRaderSafeInt64 (Get-TokenRaderPropertyValue -Object $RawUsage -Name 'input_tokens')) `
-        -CachedTokens $(if ($null -eq $cachedRaw) { 0L } else { ConvertTo-TokenRaderSafeInt64 $cachedRaw }) `
+        -CachedTokens $cached.Value `
         -OutputTokens (ConvertTo-TokenRaderSafeInt64 (Get-TokenRaderPropertyValue -Object $RawUsage -Name 'output_tokens')) `
         -ReasoningOutputTokens $reasoning
 }
@@ -380,13 +511,14 @@ function ConvertFrom-TokenRaderUsageTextFast {
     # function-call and [Math]::* overhead. Regex-extracted values are already
     # non-negative, so the original clamping rules reduce to a single check.
     $inputMatch = [regex]::Match($InnerText, '"input_tokens"\s*:\s*"?(\d+)"?')
-    $cachedMatch = [regex]::Match($InnerText, '"(?:cached_input_tokens|cache_read_tokens|cached_tokens)"\s*:\s*"?(\d+)"?')
+    $cachedMatch = Get-TokenRaderFirstFastNonNegativeIntegerInt64 -InnerText $InnerText `
+        -Names @('cached_input_tokens', 'cache_read_tokens', 'cached_tokens')
     $outputMatch = [regex]::Match($InnerText, '"output_tokens"\s*:\s*"?(\d+)"?')
     if (-not $inputMatch.Success -or -not $outputMatch.Success) { return $null }
     $reasoningMatch = [regex]::Match($InnerText, '"reasoning_output_tokens"\s*:\s*"?(\d+)"?')
 
     $inputTokens = [Int64]$inputMatch.Groups[1].Value
-    $cachedTokens = if ($cachedMatch.Success) { [Int64]$cachedMatch.Groups[1].Value } else { 0L }
+    $cachedTokens = if ($cachedMatch.Found) { [Int64]$cachedMatch.Value } else { 0L }
     $outputTokens = [Int64]$outputMatch.Groups[1].Value
     $reasoningTokens = if ($reasoningMatch.Success) { [Int64]$reasoningMatch.Groups[1].Value } else { 0 }
     if ($cachedTokens -gt $inputTokens) { $cachedTokens = $inputTokens }
@@ -3307,11 +3439,15 @@ function Get-TokenRaderIndexerDbPath {
 function Initialize-TokenRaderIndexer {
     $dllPath = Get-TokenRaderIndexerPath
     $sqlitePath = Join-Path $PSScriptRoot 'indexer\System.Data.SQLite.dll'
-    if (-not (Test-Path -LiteralPath $dllPath) -or -not (Test-Path -LiteralPath $sqlitePath)) { return $false }
+    $indexerLoaded = $null -ne ('TokenRaderIndexer' -as [type])
+    $sqliteLoaded = $null -ne ('System.Data.SQLite.SQLiteConnection' -as [type])
+    if ((-not $indexerLoaded -and -not (Test-Path -LiteralPath $dllPath)) -or
+        (-not $sqliteLoaded -and -not (Test-Path -LiteralPath $sqlitePath))) { return $false }
     try {
-        Add-Type -Path $sqlitePath -ErrorAction Stop
-        Add-Type -Path $dllPath -ErrorAction Stop
-        return $true
+        if (-not $sqliteLoaded) { Add-Type -Path $sqlitePath -ErrorAction Stop }
+        if (-not $indexerLoaded) { Add-Type -Path $dllPath -ErrorAction Stop }
+        return ($null -ne ('TokenRaderIndexer' -as [type]) -and
+            $null -ne ('System.Data.SQLite.SQLiteConnection' -as [type]))
     } catch { return $false }
 }
 

@@ -1937,6 +1937,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-ServiceTierTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IndexEvidenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-UsageCompatibilityTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-CacheReadAliasTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaEvidenceFixTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaCycleTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaScopeConflictTests.ps1')
@@ -1946,6 +1947,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-QuotaPlanUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-MeasurementPricingUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IntervalRecoveryTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-HistoryCallbackRecoveryTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ExplorerTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ExplorerBackfillTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ExplorerUiTests.ps1')
@@ -2162,7 +2164,7 @@ try {
     # the UI remains locked in Starting because completion is never observed.
     $pollerMatch = [regex]::Match($uiSource, '(?s)function Start-TokenRaderBackgroundPoller\b.*?(?=\r?\nfunction |\z)')
     if (-not $pollerMatch.Success) { throw 'UI CONTRACT FAILED: background completion poller was not found' }
-    foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Get-TokenRaderBackgroundErrorMessage', 'Invoke-TokenRaderBackgroundHandler',
+    foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Get-TokenRaderBackgroundErrorMessage', 'Resolve-TokenRaderBackgroundCallbackFailure', 'Invoke-TokenRaderBackgroundHandler',
             'Request-TokenRaderBackgroundStop', 'Start-TokenRaderBackgroundPoller', 'Start-TokenRaderBackgroundJob')) {
         $helperMatch = [regex]::Match($uiSource, ('(?s)function ' + [regex]::Escape($helperName) + '\b.*?(?=\r?\nfunction |\z)'))
         if (-not $helperMatch.Success) { throw ('UI CONTRACT FAILED: helper not found: ' + $helperName) }

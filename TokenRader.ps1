@@ -492,6 +492,26 @@ function Reset-TokenRaderBackgroundFailureState {
     try { Update-QuotaCards } catch { }
 }
 
+function Resolve-TokenRaderBackgroundCallbackFailure {
+    param([Parameter(Mandatory = $true)]$Job, [Parameter(Mandatory = $true)][string]$Message)
+    if ([string]$Job.Kind -ne 'UsageHistory') {
+        Reset-TokenRaderBackgroundFailureState -Message $Message
+        return
+    }
+    # The rolling-history card is auxiliary. Its callback cannot invalidate
+    # the measurement generation, baseline, frozen end or quota evidence.
+    if ($script:WindowClosing -or [Int64]$script:State.UsageHistoryRequestId -ne [Int64]$Job.RequestId) { return }
+    $stopPending = $null -ne $Job.PSObject.Properties['CallbackContext'] -and
+        [bool](Get-TokenRaderCallbackContextValue -Context $Job.CallbackContext -Name 'StopPending' -Default $false)
+    $script:State.UsageHistoryPending = $false
+    $script:State.UsageHistoryPendingRequest = $null
+    $script:State.UsageHistoryStopping = $stopPending
+    $script:State.UsageHistoryRefreshing = $stopPending
+    if (-not $stopPending) { $script:State.UsageHistoryRequestId = 0L }
+    try { $script:UsageHistoryStatusText.Text = $Message + ' 主测量不受影响，可重新查询周期用量。' } catch { }
+    try { Update-TokenRaderToolBackfillButton } catch { }
+}
+
 function Invoke-TokenRaderBackgroundHandler {
     param(
         [Parameter(Mandatory = $true)][string]$HandlerName,
@@ -519,7 +539,9 @@ function Request-TokenRaderBackgroundStop {
             [void]$script:State.BackgroundJobs.Remove([Int64]$Job.RequestId)
         }
         if (-not [string]::IsNullOrWhiteSpace([string]$Job.StopCompletionHandler)) {
-            try { Invoke-TokenRaderBackgroundHandler -HandlerName ([string]$Job.StopCompletionHandler) -Value $null -Job $Job } catch { }
+            if ($Job.CallbackContext -is [System.Collections.IDictionary]) { $Job.CallbackContext['StopPending'] = $false }
+            try { Invoke-TokenRaderBackgroundHandler -HandlerName ([string]$Job.StopCompletionHandler) -Value $null -Job $Job }
+            catch { Resolve-TokenRaderBackgroundCallbackFailure -Job $Job -Message ('后台停止回调失败：' + $_.Exception.Message) }
         }
     }
 }
@@ -547,11 +569,12 @@ function Start-TokenRaderBackgroundPoller {
                         try { $job.PowerShell.Dispose() } catch { }
                         try { if ($null -ne $job.CancellationSource) { $job.CancellationSource.Dispose() } } catch { }
                         [void]$script:State.BackgroundJobs.Remove($requestId)
+                        if ($job.CallbackContext -is [System.Collections.IDictionary]) { $job.CallbackContext['StopPending'] = $false }
                         if (-not [string]::IsNullOrWhiteSpace([string]$job.StopCompletionHandler)) {
                             try {
                                 Invoke-TokenRaderBackgroundHandler -HandlerName ([string]$job.StopCompletionHandler) -Value $null -Job $job
                             } catch {
-                                Reset-TokenRaderBackgroundFailureState -Message ('后台停止回调失败：' + $_.Exception.Message)
+                                Resolve-TokenRaderBackgroundCallbackFailure -Job $job -Message ('后台停止回调失败：' + $_.Exception.Message)
                             }
                         }
                     }
@@ -581,7 +604,7 @@ function Start-TokenRaderBackgroundPoller {
                                 Invoke-TokenRaderBackgroundHandler -HandlerName ([string]$job.FailureHandler) -Value $errorMessage -Job $job
                             }
                         } catch {
-                            Reset-TokenRaderBackgroundFailureState -Message ('后台任务回调失败：' + $_.Exception.Message)
+                            Resolve-TokenRaderBackgroundCallbackFailure -Job $job -Message ('后台任务回调失败：' + $_.Exception.Message)
                         }
                     }
                     continue
@@ -651,7 +674,7 @@ function Start-TokenRaderBackgroundPoller {
                     try {
                         Invoke-TokenRaderBackgroundHandler -HandlerName ([string]$job.FailureHandler) -Value $timeoutMessage -Job $job
                     } catch {
-                        Reset-TokenRaderBackgroundFailureState -Message ('后台任务超时处理失败：' + $_.Exception.Message)
+                        Resolve-TokenRaderBackgroundCallbackFailure -Job $job -Message ('后台任务超时处理失败：' + $_.Exception.Message)
                     }
                     Request-TokenRaderBackgroundStop -Job $job
                 }
@@ -721,7 +744,7 @@ function Start-TokenRaderBackgroundJob {
         try {
             Invoke-TokenRaderBackgroundHandler -HandlerName $FailureHandler -Value $_.Exception.Message -Job $failedJob
         } catch {
-            Reset-TokenRaderBackgroundFailureState -Message ('后台任务启动失败：' + $_.Exception.Message)
+            Resolve-TokenRaderBackgroundCallbackFailure -Job $failedJob -Message ('后台任务启动失败：' + $_.Exception.Message)
         }
         return $false
     }
@@ -881,21 +904,31 @@ function Start-TokenRaderPendingUsageHistory {
     $pending = $script:State.UsageHistoryPendingRequest
     $script:State.UsageHistoryPending = $false
     $script:State.UsageHistoryPendingRequest = $null
-    Start-TokenRaderUsageHistoryRefresh `
-        -DayOffset ([int]$pending.DayOffset) `
-        -ForceRefresh ([bool]$pending.ForceRefresh) `
-        -PurgeExpired ([bool]$pending.PurgeExpired)
+    try {
+        Start-TokenRaderUsageHistoryRefresh `
+            -DayOffset ([int]$pending.DayOffset) `
+            -ForceRefresh ([bool]$pending.ForceRefresh) `
+            -PurgeExpired ([bool]$pending.PurgeExpired)
+    } catch {
+        Resolve-TokenRaderBackgroundCallbackFailure -Job ([pscustomobject]@{
+            Kind = 'UsageHistory'; RequestId = [Int64]$script:State.UsageHistoryRequestId
+        }) -Message ('周期用量重试失败：' + $_.Exception.Message)
+        return $false
+    }
     return $true
 }
 
 function Complete-TokenRaderUsageHistoryJob {
     param($Payload, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
     if ($script:WindowClosing -or [Int64]$script:State.UsageHistoryRequestId -ne $RequestId) { return }
-    $script:State.UsageHistoryRequestId = 0L
+    if ($null -ne $Payload) { Show-TokenRaderUsageHistoryResult -Result $Payload }
+    # Preserve callback ownership until all potentially throwing UI work ends.
+    # The poller can then recover only this request if rendering fails.
+    if ($null -ne $Payload) { $script:State.UsageHistoryResult = $Payload }
     $script:State.UsageHistoryRefreshing = $false
     $script:State.UsageHistoryStopping = $false
-    if ($null -ne $Payload) { Show-TokenRaderUsageHistoryResult -Result $Payload }
     Update-TokenRaderToolBackfillButton
+    $script:State.UsageHistoryRequestId = 0L
     [void](Start-TokenRaderPendingUsageHistory)
 }
 
@@ -908,20 +941,20 @@ function Fail-TokenRaderUsageHistoryJob {
         $script:State.UsageHistoryStopping = $true
         return
     }
-    $script:State.UsageHistoryRequestId = 0L
     $script:State.UsageHistoryRefreshing = $false
     $script:State.UsageHistoryStopping = $false
     Update-TokenRaderToolBackfillButton
+    $script:State.UsageHistoryRequestId = 0L
     [void](Start-TokenRaderPendingUsageHistory)
 }
 
 function Complete-TokenRaderUsageHistoryStopJob {
     param($Payload, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
     if ($script:WindowClosing -or [Int64]$script:State.UsageHistoryRequestId -ne $RequestId) { return }
-    $script:State.UsageHistoryRequestId = 0L
     $script:State.UsageHistoryRefreshing = $false
     $script:State.UsageHistoryStopping = $false
     Update-TokenRaderToolBackfillButton
+    $script:State.UsageHistoryRequestId = 0L
     [void](Start-TokenRaderPendingUsageHistory)
 }
 
@@ -932,52 +965,68 @@ function Start-TokenRaderUsageHistoryRefresh {
         [bool]$PurgeExpired = $false
     )
     if ($script:WindowClosing -or -not [bool]$script:State.IndexCatalogAvailable) { return }
-    $selectedOffset = if ($DayOffset -ge 0) { $DayOffset } else { Get-SelectedUsageHistoryDayOffset }
-    if ([bool]$script:State.UsageHistoryRefreshing) {
-        $previous = $script:State.UsageHistoryPendingRequest
-        $script:State.UsageHistoryPending = $true
-        $script:State.UsageHistoryPendingRequest = [pscustomobject]@{
-            DayOffset = $selectedOffset
-            ForceRefresh = ($ForceRefresh -or ($null -ne $previous -and [bool]$previous.ForceRefresh))
-            PurgeExpired = ($PurgeExpired -or ($null -ne $previous -and [bool]$previous.PurgeExpired))
+    $ownedRequestId = 0L
+    try {
+        $selectedOffset = if ($DayOffset -ge 0) { $DayOffset } else { Get-SelectedUsageHistoryDayOffset }
+        if ([bool]$script:State.UsageHistoryRefreshing) {
+            $previous = $script:State.UsageHistoryPendingRequest
+            $pendingRequest = [pscustomobject]@{
+                DayOffset = $selectedOffset
+                ForceRefresh = ($ForceRefresh -or ($null -ne $previous -and [bool]$previous.ForceRefresh))
+                PurgeExpired = ($PurgeExpired -or ($null -ne $previous -and [bool]$previous.PurgeExpired))
+            }
+            $script:State.UsageHistoryPending = $true
+            $script:State.UsageHistoryPendingRequest = $pendingRequest
+            return
         }
-        return
-    }
 
-    $requestId = New-TokenRaderRequestId
-    $script:State.UsageHistoryRequestId = $requestId
-    $script:State.UsageHistoryRefreshing = $true
-    $script:State.UsageHistoryStopping = $false
-    $script:BackfillToolUsageButton.IsEnabled = $false
-    $script:UsageHistoryStatusText.Text = '正在读取磁盘汇总…'
-    $progressState = [hashtable]::Synchronized(@{
-        Stage = '打开24小时磁盘数据'
-        ProcessedRows = [Int64]0
-        LastProgressAt = [DateTimeOffset]::Now
-    })
-    $cancellationSource = [Threading.CancellationTokenSource]::new()
-    [void](Start-TokenRaderBackgroundJob `
-        -ScriptBlock $script:UsageHistoryScript `
-        -Parameters @{
-            SessionsRoot = $script:Paths.SessionsRoot
-            PricingPath = $script:Paths.PricingPath
-            ModulePath = (Join-Path $PSScriptRoot 'TokenRader.Core.psm1')
-            DayOffset = $selectedOffset
-            ForceRefresh = $ForceRefresh
-            PurgeExpired = $PurgeExpired
-            CancellationToken = $cancellationSource.Token
-            ProgressState = $progressState
-        } `
-        -Kind 'UsageHistory' `
-        -RequestId $requestId `
-        -CompletionHandler 'Complete-TokenRaderUsageHistoryJob' `
-        -FailureHandler 'Fail-TokenRaderUsageHistoryJob' `
-        -CallbackContext @{} `
-        -TimeoutSeconds 60 `
-        -SoftWarningSeconds 3 `
-        -ProgressState $progressState `
-        -CancellationSource $cancellationSource `
-        -StopCompletionHandler 'Complete-TokenRaderUsageHistoryStopJob')
+        $requestId = New-TokenRaderRequestId
+        $ownedRequestId = $requestId
+        $script:State.UsageHistoryRequestId = $requestId
+        $script:State.UsageHistoryRefreshing = $true
+        $script:State.UsageHistoryStopping = $false
+        $script:BackfillToolUsageButton.IsEnabled = $false
+        $script:UsageHistoryStatusText.Text = '正在读取磁盘汇总…'
+        $progressState = [hashtable]::Synchronized(@{
+            Stage = '打开24小时磁盘数据'
+            ProcessedRows = [Int64]0
+            LastProgressAt = [DateTimeOffset]::Now
+        })
+        $cancellationSource = [Threading.CancellationTokenSource]::new()
+        [void](Start-TokenRaderBackgroundJob `
+            -ScriptBlock $script:UsageHistoryScript `
+            -Parameters @{
+                SessionsRoot = $script:Paths.SessionsRoot
+                PricingPath = $script:Paths.PricingPath
+                ModulePath = (Join-Path $PSScriptRoot 'TokenRader.Core.psm1')
+                DayOffset = $selectedOffset
+                ForceRefresh = $ForceRefresh
+                PurgeExpired = $PurgeExpired
+                CancellationToken = $cancellationSource.Token
+                ProgressState = $progressState
+            } `
+            -Kind 'UsageHistory' `
+            -RequestId $requestId `
+            -CompletionHandler 'Complete-TokenRaderUsageHistoryJob' `
+            -FailureHandler 'Fail-TokenRaderUsageHistoryJob' `
+            -CallbackContext @{} `
+            -TimeoutSeconds 60 `
+            -SoftWarningSeconds 3 `
+            -ProgressState $progressState `
+            -CancellationSource $cancellationSource `
+            -StopCompletionHandler 'Complete-TokenRaderUsageHistoryStopJob')
+    } catch {
+        $message = '周期用量启动失败：' + $_.Exception.Message
+        if ($ownedRequestId -gt 0) {
+            Resolve-TokenRaderBackgroundCallbackFailure -Job ([pscustomobject]@{
+                Kind = 'UsageHistory'; RequestId = $ownedRequestId
+            }) -Message $message
+        } else {
+            # A selector/coalescing failure did not start a job. In particular,
+            # do not release another, still-running history request's slot.
+            try { $script:UsageHistoryStatusText.Text = $message } catch { }
+        }
+    }
 }
 
 function Update-TokenRaderToolBackfillButton {
@@ -1809,11 +1858,7 @@ function Update-TokenRaderWeeklyReferenceFromResult {
     param([Parameter(Mandatory = $true)]$Result)
     # This is a display-only 1% yardstick for the current measurement. It is
     # never placed in QuotaEstimates or used as a frozen calibration endpoint.
-    if ($null -eq $script:State.IntervalBaseline -or $null -eq $Result.PSObject.Properties['TotalCost'] -or
-        $null -eq $Result.TotalCost) { $script:State.WeeklyReferenceEstimate = $null; return }
-    try { $cost = [double]$Result.TotalCost } catch { $script:State.WeeklyReferenceEstimate = $null; return }
-    if ([double]::IsNaN($cost) -or [double]::IsInfinity($cost) -or $cost -le 0 -or
-        [double]::IsInfinity($cost * 100.0)) { $script:State.WeeklyReferenceEstimate = $null; return }
+    if ($null -eq $script:State.IntervalBaseline) { return }
     $currentAccount = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
     $baselineAccount = if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['AccountIdentity']) {
         [string]$script:State.IntervalBaseline.AccountIdentity
@@ -1824,6 +1869,14 @@ function Update-TokenRaderWeeklyReferenceFromResult {
                 [string]::IsNullOrWhiteSpace($currentAccount) -and [string]::IsNullOrWhiteSpace([string]$Result.AccountIdentity))) { return }
     } elseif (-not [string]::IsNullOrWhiteSpace($baselineAccount) -and
         -not [string]::Equals($baselineAccount, $currentAccount, [StringComparison]::Ordinal)) { return }
+
+    # Account ownership is checked before ANY mutation, including rejecting a
+    # zero/invalid cost. A late foreign result cannot erase the current value.
+    if ($null -eq $Result.PSObject.Properties['TotalCost'] -or
+        $null -eq $Result.TotalCost) { $script:State.WeeklyReferenceEstimate = $null; return }
+    try { $cost = [double]$Result.TotalCost } catch { $script:State.WeeklyReferenceEstimate = $null; return }
+    if ([double]::IsNaN($cost) -or [double]::IsInfinity($cost) -or $cost -le 0 -or
+        [double]::IsInfinity($cost * 100.0)) { $script:State.WeeklyReferenceEstimate = $null; return }
 
     $startLimits = if ($null -ne $Result.PSObject.Properties['StartRateLimits']) { $Result.StartRateLimits } elseif ($null -ne $script:State.IntervalBaseline.PSObject.Properties['RateLimits']) { $script:State.IntervalBaseline.RateLimits } else { $null }
     $endLimits = if ($null -ne $Result.PSObject.Properties['EndRateLimits']) { $Result.EndRateLimits } elseif ($null -ne $Result.PSObject.Properties['RateLimits']) { $Result.RateLimits } else { $null }

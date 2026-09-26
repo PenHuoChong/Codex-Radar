@@ -235,4 +235,18 @@ $currentReference=$script:State.WeeklyReferenceEstimate
 $referenceResult.AccountIdentity='old-account'
 Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
 Assert-UiPricing ([object]::ReferenceEquals($currentReference,$script:State.WeeklyReferenceEstimate)) 'late old-account result replaced the current reference'
+foreach ($invalidCost in @($null, 0, -1, [double]::NaN, [double]::PositiveInfinity, 'invalid')) {
+    $referenceResult.TotalCost = $invalidCost
+    Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+    Assert-UiPricing ([object]::ReferenceEquals($currentReference,$script:State.WeeklyReferenceEstimate)) 'late foreign invalid/zero cost erased the current reference'
+}
+$missingCostResult = [pscustomobject]@{ AccountIdentity = 'old-account' }
+Update-TokenRaderWeeklyReferenceFromResult -Result $missingCostResult
+Assert-UiPricing ([object]::ReferenceEquals($currentReference,$script:State.WeeklyReferenceEstimate)) 'late foreign missing cost erased the current reference'
+$script:State.IntervalBaseline.AccountIdentity = 'old-account'
+Update-TokenRaderWeeklyReferenceFromResult -Result ([pscustomobject]@{TotalCost=0})
+Assert-UiPricing ([object]::ReferenceEquals($currentReference,$script:State.WeeklyReferenceEstimate)) 'untagged old-baseline result erased current reference'
+$referenceResult.AccountIdentity = 'current-tag'; $referenceResult.TotalCost = 15
+Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+Assert-UiPricing ($script:State.WeeklyReferenceEstimate.TotalUsd -eq 1500) 'valid current result failed to update after rejecting late results'
 Write-Output 'MEASUREMENT_PRICING_UI_TESTS_PASSED'

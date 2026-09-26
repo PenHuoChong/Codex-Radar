@@ -6983,11 +6983,65 @@ public static class TokenRaderIndexer
         if (usage == null) return 0L;
         // cached_input_tokens is the current spelling.  Older/newer Codex
         // emitters have also used cache_read_tokens or cached_tokens for the
-        // same read portion; use the first field that is actually present.
-        object raw = usage.CachedInputTokens;
-        if (raw == null) raw = usage.CacheReadTokens;
-        if (raw == null) raw = usage.CachedTokens;
-        return GetInt64Value(raw);
+        // same read portion. Use the first valid non-negative integer in
+        // canonical order: explicit zero wins, while null/invalid values do
+        // not hide a usable alias.
+        foreach (object raw in new object[] { usage.CachedInputTokens, usage.CacheReadTokens, usage.CachedTokens })
+        {
+            long value;
+            if (TryGetNonNegativeIntegerInt64(raw, out value)) return value;
+        }
+        return 0L;
+    }
+
+    private static bool TryGetNonNegativeIntegerInt64(object raw, out long value)
+    {
+        value = 0L;
+        if (raw == null || raw == DBNull.Value || raw is bool) return false;
+
+        string text = raw as string;
+        if (text != null)
+        {
+            return long.TryParse(text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value) && value >= 0L;
+        }
+
+        try
+        {
+            if (raw is ulong)
+            {
+                ulong unsignedValue = (ulong)raw;
+                if (unsignedValue > (ulong)long.MaxValue) return false;
+                value = (long)unsignedValue;
+                return true;
+            }
+            if (raw is byte || raw is sbyte || raw is short || raw is ushort ||
+                raw is int || raw is uint || raw is long)
+            {
+                value = Convert.ToInt64(raw, CultureInfo.InvariantCulture);
+                return value >= 0L;
+            }
+            if (raw is decimal)
+            {
+                decimal number = (decimal)raw;
+                if (number < 0m || decimal.Truncate(number) != number || number > long.MaxValue) return false;
+                value = (long)number;
+                return true;
+            }
+            if (raw is double || raw is float)
+            {
+                double number = Convert.ToDouble(raw, CultureInfo.InvariantCulture);
+                // (double)long.MaxValue rounds up to 2^63, so use an exclusive bound.
+                if (double.IsNaN(number) || double.IsInfinity(number) || number < 0.0 ||
+                    number >= 9223372036854775808.0 || Math.Truncate(number) != number) return false;
+                value = (long)number;
+                return true;
+            }
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+        return false;
     }
 
     private static bool HasAnyUsageValue(TokenRaderJsonUsage usage)

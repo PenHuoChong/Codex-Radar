@@ -14,7 +14,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
 Assert-UiTest ($uiSource -notmatch 'GetNewClosure\s*\(') 'production lifecycle still contains GetNewClosure'
 
-foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Invoke-TokenRaderBackgroundHandler',
+foreach ($helperName in @('Get-TokenRaderCallbackContextValue', 'Resolve-TokenRaderBackgroundCallbackFailure', 'Invoke-TokenRaderBackgroundHandler',
         'Request-TokenRaderBackgroundStop', 'Start-TokenRaderBackgroundPoller', 'Start-TokenRaderBackgroundJob',
         'Complete-TokenRaderIndexSyncJob', 'Complete-TokenRaderMeasurementBaselineJob',
         'Complete-TokenRaderMeasurementBaseline', 'New-TokenRaderFinalRetryState',
