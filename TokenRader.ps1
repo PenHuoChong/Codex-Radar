@@ -1585,6 +1585,15 @@ function Set-QuotaWindowCard {
                 ' · 本次套餐折算消耗×100（按1%折算，非账单）'
         }
         if ([bool]$WeeklyReference.PricingIncomplete) { $referenceText += ' · 计价不完整（部分参考）' }
+        $referenceTimes = @('未提供','未提供')
+        $referenceTimeFields = @('MeasurementStartedAt','MeasurementEndedAt')
+        for ($i = 0; $i -lt 2; $i++) {
+            $field = $referenceTimeFields[$i]
+            if ($null -ne $WeeklyReference.PSObject.Properties[$field] -and $null -ne $WeeklyReference.$field) {
+                try { $referenceTimes[$i] = '{0:MM-dd HH:mm:ss}' -f ([DateTimeOffset]$WeeklyReference.$field).ToLocalTime() } catch { }
+            }
+        }
+        $referenceText += ' · 参考成本统计区间（本地时间） {0} → {1}' -f $referenceTimes[0], $referenceTimes[1]
         $preferReference = $null -ne $WeeklyReference.PSObject.Properties['ActualDeltaPercent'] -and
             $null -ne $WeeklyReference.ActualDeltaPercent -and [double]$WeeklyReference.ActualDeltaPercent -lt 1.0
     }
@@ -1652,9 +1661,21 @@ function Set-QuotaWindowCard {
             [string]$Estimate.QuotaPricingBasis -eq 'plan_standard_api_reference'
         if ($planReference) { $sourceLabel = '快照区间套餐折算成本/实际用量增量（非账单）' }
         $identityLabel = if ([bool]$Estimate.IdentityComplete) { '' } else { ' · 请求级去重不完整' }
-        $startLabel = if ($null -ne $Estimate.PSObject.Properties['StartUsedPercent']) {
-            ' · 从 {0:0.####}% 开始 · 校准增量 +{1:0.####}%' -f ([double]$Estimate.StartUsedPercent), ([double]$Estimate.EffectiveDeltaPercent)
-        } else { '' }
+        # This is the frozen calibration range, not the newer card percentage.
+        $calibrationPercents = @('未提供','未提供')
+        $calibrationPercentFields = @('StartUsedPercent','CalibrationEndUsedPercent')
+        for ($i = 0; $i -lt 2; $i++) {
+            $field = $calibrationPercentFields[$i]
+            if ($null -ne $Estimate.PSObject.Properties[$field] -and $null -ne $Estimate.$field) {
+                try {
+                    $value = [double]$Estimate.$field
+                    if (-not [double]::IsNaN($value) -and -not [double]::IsInfinity($value) -and $value -ge 0 -and $value -le 100) {
+                        $calibrationPercents[$i] = '{0:0.####}%' -f $value
+                    }
+                } catch { }
+            }
+        }
+        $startLabel = ' · 校准区间 {0} → {1} · 校准增量 +{2:0.####}%' -f $calibrationPercents[0], $calibrationPercents[1], ([double]$Estimate.EffectiveDeltaPercent)
         $historyLabel = if ($null -ne $Estimate.PSObject.Properties['HistoryLookbackApplied'] -and [bool]$Estimate.HistoryLookbackApplied) { ' · 已回查本窗口历史完整步长' } else { '' }
         if ($null -ne $Estimate.PSObject.Properties['ManualServiceTierApplied'] -and [bool]$Estimate.ManualServiceTierApplied) {
             $historyLabel += ' · 模式经人工确认'
@@ -1684,9 +1705,15 @@ function Set-QuotaWindowCard {
             ($identityLabel + $diagnosticLabel))
         if ($planReference) { $DollarText.Text = $DollarText.Text.Replace('反推总额度≈', '套餐折算总额度参考≈') }
         if ($usingPreviousSnapshot) { $DollarText.Text += ' · 沿用最近有效快照，正在更新' }
-        if ($null -ne $Estimate.PSObject.Properties['CalibrationEndObservedAt'] -and $null -ne $Estimate.CalibrationEndObservedAt) {
-            $DollarText.Text += ' · 校准截至 {0:MM-dd HH:mm:ss}' -f ([DateTimeOffset]$Estimate.CalibrationEndObservedAt).ToLocalTime()
+        $calibrationTimes = @('未提供','未提供')
+        $calibrationTimeFields = @('CalibrationStartObservedAt','CalibrationEndObservedAt')
+        for ($i = 0; $i -lt 2; $i++) {
+            $field = $calibrationTimeFields[$i]
+            if ($null -ne $Estimate.PSObject.Properties[$field] -and $null -ne $Estimate.$field) {
+                try { $calibrationTimes[$i] = '{0:MM-dd HH:mm:ss}' -f ([DateTimeOffset]$Estimate.$field).ToLocalTime() } catch { }
+            }
         }
+        $DollarText.Text += ' · 统计区间（本地时间，起点不含/终点包含） {0} → {1}' -f $calibrationTimes[0], $calibrationTimes[1]
         if ($null -ne $Window.PSObject.Properties['PlanSelectionApplied'] -and [bool]$Window.PlanSelectionApplied) {
             $DollarText.Text += ' · 已确认套餐：' + [string]$Window.PlanType
         }
@@ -1980,6 +2007,8 @@ function Update-TokenRaderWeeklyReferenceFromResult {
         PricingIncomplete = -not $pricingComplete
         AccountIdentity = $currentAccount
         QuotaPricingBasis = $quotaBasis
+        MeasurementStartedAt = if ($null -ne $Result.PSObject.Properties['StartedAt']) { $Result.StartedAt } elseif ($null -ne $script:State.IntervalBaseline.PSObject.Properties['StartedAt']) { $script:State.IntervalBaseline.StartedAt } else { $null }
+        MeasurementEndedAt = if ($null -ne $Result.PSObject.Properties['EndedAt']) { $Result.EndedAt } else { $null }
     }
 }
 
