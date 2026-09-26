@@ -827,9 +827,15 @@ function Fail-TokenRaderIndexSyncJob {
     if ($coldStart) { $script:State.IndexReady = $false }
     $script:State.PendingMeasurementStart = $false
     $script:State.BaselineRequestId = 0L
-    $script:State.QuotaEstimates = $null
     $script:State.QuotaCalibrationMessage = [string]$ErrorMessage
-    Set-TokenRaderUiState -NewState 'Error' -StatusMessage ('后台索引同步失败：' + [string]$ErrorMessage)
+    # Index availability does not invalidate already priced, frozen evidence.
+    # Reuse it only after the normal account/cycle validation.
+    Retain-TokenRaderQuotaEstimatesForCurrentWindow
+    Mark-TokenRaderQuotaEstimatesRetainedAfterFailure
+    $nextState = if ([string]$script:State.UiState -in @('Measuring','Stopping','ComputingFinal','Ready')) {
+        [string]$script:State.UiState
+    } else { 'Error' }
+    Set-TokenRaderUiState -NewState $nextState -StatusMessage ('后台索引同步失败：' + [string]$ErrorMessage)
     Update-QuotaCards
 }
 
@@ -2076,6 +2082,25 @@ function Retain-TokenRaderQuotaEstimatesForCurrentWindow {
         $script:State.QuotaEstimates
     } else { $null }
     if ($null -eq $estimates) { return }
+    if ($null -eq $estimates.FiveHour -and $null -eq $estimates.Weekly) {
+        # No dollars is precisely when the current result's diagnostic matters.
+        # QuotaEstimateAccountIdentity is empty when there is no estimate; it
+        # cannot be used as the owner of independent failure diagnostics.
+        $script:State.QuotaEstimates = $null
+        $script:State.QuotaEstimateAccountIdentity = ''
+        if ($script:State.ContainsKey('QuotaDiagnostics') -and $null -ne $script:State.QuotaDiagnostics) {
+            foreach ($kind in @('FiveHour','Weekly')) {
+                $diagnostic = Get-TokenRaderQuotaDiagnostic -Diagnostics $script:State.QuotaDiagnostics -WindowName $kind
+                $tag = [string](Get-TokenRaderQuotaDiagnosticValue -Diagnostic $diagnostic -Name 'AccountIdentity' -Default '')
+                if (-not [string]::IsNullOrWhiteSpace($tag) -and
+                    -not [string]::Equals($tag,$AccountIdentity,[StringComparison]::Ordinal)) {
+                    if ($script:State.QuotaDiagnostics -is [System.Collections.IDictionary]) { $script:State.QuotaDiagnostics[$kind]=$null }
+                    elseif ($null -ne $script:State.QuotaDiagnostics.PSObject.Properties[$kind]) { $script:State.QuotaDiagnostics.$kind=$null }
+                }
+            }
+        }
+        return
+    }
     $estimateAccount = if ($script:State -is [System.Collections.IDictionary] -and $script:State.ContainsKey('QuotaEstimateAccountIdentity')) {
         [string]$script:State['QuotaEstimateAccountIdentity']
     } elseif ($null -ne $script:State.PSObject.Properties['QuotaEstimateAccountIdentity']) {
@@ -2226,11 +2251,20 @@ function Update-QuotaEstimatesFromInterval {
     $diagnosticFiveAccount = Get-TokenRaderQuotaDiagnosticAccountIdentity -Diagnostic $diagnosticFive -Result $Result
     $diagnosticWeeklyAccount = Get-TokenRaderQuotaDiagnosticAccountIdentity -Diagnostic $diagnosticWeekly -Result $Result
     $diagnosticFiveAccountValid = [string]::IsNullOrWhiteSpace($diagnosticFiveAccount) -or
-        [string]::IsNullOrWhiteSpace($currentAccount) -or
         [string]::Equals($diagnosticFiveAccount, $currentAccount, [StringComparison]::Ordinal)
     $diagnosticWeeklyAccountValid = [string]::IsNullOrWhiteSpace($diagnosticWeeklyAccount) -or
-        [string]::IsNullOrWhiteSpace($currentAccount) -or
         [string]::Equals($diagnosticWeeklyAccount, $currentAccount, [StringComparison]::Ordinal)
+    if ($hasDiagnostics -and (-not $diagnosticFiveAccountValid -or -not $diagnosticWeeklyAccountValid)) {
+        # Keep an unrelated window's foreign diagnostic out of the current
+        # account UI without suppressing valid evidence for the other window.
+        if (-not $diagnosticFiveAccountValid) {
+            $diagnosticFive = [pscustomobject]@{Status='unavailable';ReasonCode='account_boundary';Message='5 小时诊断不属于当前账号';Retained=$false;AccountIdentity=$currentAccount}
+        }
+        if (-not $diagnosticWeeklyAccountValid) {
+            $diagnosticWeekly = [pscustomobject]@{Status='unavailable';ReasonCode='account_boundary';Message='周诊断不属于当前账号';Retained=$false;AccountIdentity=$currentAccount}
+        }
+        $resultDiagnostics = [pscustomobject]@{FiveHour=$diagnosticFive;Weekly=$diagnosticWeekly}
+    }
 
     # Diagnostics are status/reason metadata.  The estimate itself remains the
     # core's normal Get-TokenRaderQuotaEstimate result, which consumes the
@@ -2249,6 +2283,10 @@ function Update-QuotaEstimatesFromInterval {
     if ($null -eq $newEstimates) {
         $newEstimates = [pscustomobject]@{ FiveHour = $null; Weekly = $null }
     }
+    # A result may contain a current-account weekly window but a foreign
+    # five-hour diagnostic (or vice versa). Reject only that window's dollars.
+    if (-not $diagnosticFiveAccountValid) { $newEstimates.FiveHour = $null }
+    if (-not $diagnosticWeeklyAccountValid) { $newEstimates.Weekly = $null }
     $previousEstimates = $script:State.QuotaEstimates
     $validationRateLimits = if ($null -ne $script:State.RateLimits) { $script:State.RateLimits } else { $endRateLimits }
     # Do not rebind a computed cost to a newer display snapshot. Only estimates
@@ -2336,15 +2374,16 @@ function Update-QuotaEstimatesFromInterval {
     # estimate must not erase a valid estimate from the same account/window/
     # reset cycle.  Account switches and explicit boundary failures are the
     # exceptions: those old values are never retained.
-    $canRetainPrevious = $accountBoundaryValid -and $resultAccountMatchesCurrent -and
-        (-not $hasDiagnostics -or ($diagnosticFiveAccountValid -and $diagnosticWeeklyAccountValid))
-    if ($canRetainPrevious -and
+    $canRetainPrevious = $accountBoundaryValid -and $resultAccountMatchesCurrent
+    $canRetainFive = $canRetainPrevious -and (-not $hasDiagnostics -or $diagnosticFiveAccountValid)
+    $canRetainWeekly = $canRetainPrevious -and (-not $hasDiagnostics -or $diagnosticWeeklyAccountValid)
+    if (($canRetainFive -or $canRetainWeekly) -and
         [string]::Equals([string]$script:State.QuotaEstimateAccountIdentity,$currentAccount,[StringComparison]::Ordinal)) {
         foreach ($entry in @(
-                [pscustomobject]@{Kind='FiveHour'; Previous=$previousFive; Window=$validationFive; Diagnostic=$diagnosticFive},
-                [pscustomobject]@{Kind='Weekly'; Previous=$previousWeekly; Window=$validationWeekly; Diagnostic=$diagnosticWeekly})) {
+                [pscustomobject]@{Kind='FiveHour'; Previous=$previousFive; Window=$validationFive; Diagnostic=$diagnosticFive; CanRetain=$canRetainFive},
+                [pscustomobject]@{Kind='Weekly'; Previous=$previousWeekly; Window=$validationWeekly; Diagnostic=$diagnosticWeekly; CanRetain=$canRetainWeekly})) {
             $incoming = $newEstimates.($entry.Kind)
-            if ($null -eq $incoming -or $null -eq $entry.Previous -or
+            if (-not $entry.CanRetain -or $null -eq $incoming -or $null -eq $entry.Previous -or
                 $null -eq $incoming.PSObject.Properties['CalibrationEndObservedAt'] -or
                 $null -eq $entry.Previous.PSObject.Properties['CalibrationEndObservedAt'] -or
                 $null -eq $incoming.CalibrationEndObservedAt -or $null -eq $entry.Previous.CalibrationEndObservedAt -or
@@ -2363,18 +2402,16 @@ function Update-QuotaEstimatesFromInterval {
     }
     $retainedFive = $false
     $retainedWeekly = $false
-    if ($canRetainPrevious) {
-        $retainedFive = Test-TokenRaderSameQuotaEvidence -Previous $previousFive -Current $newEstimates.FiveHour
-        $retainedWeekly = Test-TokenRaderSameQuotaEvidence -Previous $previousWeekly -Current $newEstimates.Weekly
-    }
+    if ($canRetainFive) { $retainedFive = Test-TokenRaderSameQuotaEvidence -Previous $previousFive -Current $newEstimates.FiveHour }
+    if ($canRetainWeekly) { $retainedWeekly = Test-TokenRaderSameQuotaEvidence -Previous $previousWeekly -Current $newEstimates.Weekly }
     $effectiveFive = $newEstimates.FiveHour
-    if ($null -eq $effectiveFive -and $canRetainPrevious -and
+    if ($null -eq $effectiveFive -and $canRetainFive -and
         (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $previousFive -Window $validationFive)) {
         $effectiveFive = $previousFive
         $retainedFive = $true
     }
     $effectiveWeekly = $newEstimates.Weekly
-    if ($null -eq $effectiveWeekly -and $canRetainPrevious -and
+    if ($null -eq $effectiveWeekly -and $canRetainWeekly -and
         (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $previousWeekly -Window $validationWeekly)) {
         $effectiveWeekly = $previousWeekly
         $retainedWeekly = $true
@@ -3217,6 +3254,20 @@ function Set-MeasurementPricingConfirmation {
         if ($null -eq $basePrice) { continue }
         if ($null -eq (Resolve-TokenRaderServiceTierPrice -Price $basePrice -ServiceTier $tier)) { return $false }
         $clean[[string]$model] = $tier
+    }
+    $samePolicy = $script:State.ContainsKey('ManualServiceTiers') -and $null -ne $script:State.ManualServiceTiers -and
+        $script:State.ManualServiceTiers.Count -eq $clean.Count
+    if ($samePolicy) {
+        foreach ($id in $clean.Keys) {
+            if (-not $script:State.ManualServiceTiers.ContainsKey($id) -or
+                [string]$script:State.ManualServiceTiers[$id] -ne [string]$clean[$id]) { $samePolicy = $false; break }
+        }
+    }
+    if ($samePolicy) {
+        # Reconfirming identical pricing must not blank the quota while a
+        # redundant recomputation is pending (or later fails).
+        Update-QuotaCards
+        return $true
     }
     $script:State.ManualServiceTiers = $clean
     # Results priced under a different assumption cannot calibrate this one.

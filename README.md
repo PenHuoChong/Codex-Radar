@@ -412,6 +412,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Render-Prev
 
 刷新容错：旧账号的迟到结果（包括零值或无效成本）不会覆盖或清空当前周参考值。周期用量卡片发生启动、显示或回调异常时，仅报告该卡片错误，不中断主测量，也不改变已经冻结的结束边界；停止中的后台任务退出后方可重试。
 
+后台索引同步失败时保留同账号、同周期有效额度及主测量状态；5小时和周窗口独立校验诊断归属，不互相清空。重复确认相同计价模式不会清空金额或触发重算。尚未生成有效估算时，保留并显示具体的校准失败原因，避免被通用“尚无有效估算结果”覆盖；这不意味着在证据缺失时伪造金额或恢复已停用的1%兜底。
+
 #### 套餐自动识别与 5 小时窗口
 
 按 [OpenAI 官方套餐说明](https://learn.chatgpt.com/docs/pricing)（2026-09-24 核对），ChatGPT/Codex 有 **7 类套餐**：Free、Go、Plus、Pro、Business、Edu、Enterprise。Pro 再分 5x 与 20x，Business 也有不同用量档位；API Key 是独立按量付费方式，不算第八类订阅套餐。
