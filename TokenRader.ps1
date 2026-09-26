@@ -1582,7 +1582,30 @@ function Set-QuotaWindowCard {
     }
     $knownSubPercent = $null -ne $referenceDelta -and -not [double]::IsNaN($referenceDelta) -and
         -not [double]::IsInfinity($referenceDelta) -and $referenceDelta -ge 0 -and $referenceDelta -lt 1.0
-    if (-not $fullStepObserved -and $knownSubPercent -and $null -ne $WeeklyReference -and $null -ne $WeeklyReference.PSObject.Properties['TotalUsd'] -and
+    $assumedPercent = $null -ne $WeeklyReference -and
+        $null -ne $WeeklyReference.PSObject.Properties['ReferenceAssumptionApplied'] -and
+        [bool]$WeeklyReference.ReferenceAssumptionApplied -and $null -eq $referenceDelta
+    if ($assumedPercent) {
+        # A provisional reference belongs only to the accepted frozen cycle.
+        # Never let it survive a newer incompatible display window.
+        $referenceWindow = if ($null -ne $WeeklyReference.PSObject.Properties['CycleWindow']) { $WeeklyReference.CycleWindow } else { $null }
+        try {
+            $assumedPercent = $null -ne $Window -and $null -ne $referenceWindow -and
+                [DateTimeOffset]$referenceWindow.ResetsAt -gt [DateTimeOffset]::Now -and
+                [string]$WeeklyReference.AccountIdentity -eq [string]$script:State.AccountIdentity -and
+                $null -ne $Window.UsedPercent -and $Window.UsedPercent -isnot [bool] -and
+                -not [string]::IsNullOrWhiteSpace([string]$Window.UsedPercent) -and
+                -not [double]::IsNaN([double]$Window.UsedPercent) -and -not [double]::IsInfinity([double]$Window.UsedPercent) -and
+                [double]$Window.UsedPercent -ge [double]$referenceWindow.UsedPercent -and [double]$Window.UsedPercent -le 100 -and
+                [string]$referenceWindow.PlanType -eq [string]$Window.PlanType -and
+                [int]$referenceWindow.WindowMinutes -eq [int]$Window.WindowMinutes -and
+                [string]$referenceWindow.LimitId -eq [string]$Window.LimitId -and
+                (Get-TokenRaderResetIdentity -WindowMinutes $referenceWindow.WindowMinutes -ResetsAt $referenceWindow.ResetsAt) -eq
+                (Get-TokenRaderResetIdentity -WindowMinutes $Window.WindowMinutes -ResetsAt $Window.ResetsAt) -and
+                ($null -eq $Window.PSObject.Properties['ScopeConflict'] -or -not [bool]$Window.ScopeConflict)
+        } catch { $assumedPercent = $false }
+    }
+    if (-not $fullStepObserved -and ($knownSubPercent -or $assumedPercent) -and $null -ne $WeeklyReference -and $null -ne $WeeklyReference.PSObject.Properties['TotalUsd'] -and
         -not [double]::IsNaN([double]$WeeklyReference.TotalUsd) -and
         -not [double]::IsInfinity([double]$WeeklyReference.TotalUsd) -and [double]$WeeklyReference.TotalUsd -gt 0) {
         $referenceText = '周总额度参考≈' + (Format-TokenRaderUsd ([double]$WeeklyReference.TotalUsd)) +
@@ -1591,6 +1614,10 @@ function Set-QuotaWindowCard {
             [string]$WeeklyReference.QuotaPricingBasis -eq 'plan_standard_api_reference') {
             $referenceText = '周套餐折算总额度参考≈' + (Format-TokenRaderUsd ([double]$WeeklyReference.TotalUsd)) +
                 ' · 本次套餐折算消耗×100（按1%折算，非账单）'
+        }
+        if ($assumedPercent) {
+            $referenceText = $referenceText.Replace('总额度参考≈', '总额度假设参考≈').Replace('按1%折算', '假设1%折算') +
+                ' · 起点缺失，尚未校准；实际百分比增量未知'
         }
         if ([bool]$WeeklyReference.PricingIncomplete) { $referenceText += ' · 计价不完整（部分参考）' }
         $referenceTimes = @('未提供','未提供')
@@ -1934,6 +1961,8 @@ function Update-TokenRaderWeeklyReferenceFromResult {
     # never placed in QuotaEstimates or used as a frozen calibration endpoint.
     # Once a full step is observed, retain the delta for diagnostics, not a
     # fabricated 1% dollar value. Strict failure must not reopen that fallback.
+    # With explicit user approval, a missing START may show a labelled
+    # hypothesis, never a measured delta or a replacement for strict evidence.
     if ($null -eq $script:State.IntervalBaseline) { return }
     $currentAccount = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
     $baselineAccount = if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['AccountIdentity']) {
@@ -2044,8 +2073,27 @@ function Update-TokenRaderWeeklyReferenceFromResult {
             if ($null -eq $cycleWindow) { $cycleWindow = $priorWindow }
         }
     }
+    $referenceAssumptionApplied = $false
+    if (-not $fullStepObserved -and $null -eq $delta -and $null -eq $start -and $null -ne $end -and
+        [string]::Equals($baselineAccount,$currentAccount,[StringComparison]::Ordinal)) {
+        # Missing data is not contradictory data. Only a valid current regular
+        # window permits this hypothesis; never relax plan/pool/reset conflicts.
+        try {
+            $referenceAssumptionApplied = $null -ne $end.UsedPercent -and $end.UsedPercent -isnot [bool] -and
+                -not [string]::IsNullOrWhiteSpace([string]$end.UsedPercent) -and
+                -not [double]::IsNaN([double]$end.UsedPercent) -and -not [double]::IsInfinity([double]$end.UsedPercent) -and
+                [double]$end.UsedPercent -ge 0 -and [double]$end.UsedPercent -le 100 -and
+                [int]$end.WindowMinutes -ge 9000 -and [int]$end.WindowMinutes -le 11520 -and
+                -not [string]::IsNullOrWhiteSpace([string]$end.PlanType) -and [string]$end.LimitId -ieq 'codex' -and
+                $null -ne $end.ObservedAt -and $null -ne $end.ResetsAt -and
+                [DateTimeOffset]$end.ResetsAt -gt [DateTimeOffset]::Now -and
+                [DateTimeOffset]$end.ResetsAt -gt [DateTimeOffset]$end.ObservedAt -and
+                ($null -eq $end.PSObject.Properties['ScopeConflict'] -or -not [bool]$end.ScopeConflict)
+        } catch { $referenceAssumptionApplied = $false }
+    }
     $script:State.WeeklyReferenceEstimate = [pscustomobject]@{
-        TotalUsd = if ($fullStepObserved -or $null -eq $delta) { $null } else { $cost * 100.0 }
+        TotalUsd = if ($fullStepObserved -or ($null -eq $delta -and -not $referenceAssumptionApplied)) { $null } else { $cost * 100.0 }
+        ReferenceAssumptionApplied = $referenceAssumptionApplied
         ActualDeltaPercent = $delta
         MeasurementStartUsedPercent = if ($null -ne $delta) { $startPercent } else { $null }
         MeasurementEndUsedPercent = if ($null -ne $delta) { $endPercent } else { $null }

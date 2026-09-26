@@ -157,4 +157,137 @@ foreach ($invalidPercent in @('malformed', [double]::NaN, [double]::PositiveInfi
     Assert-WeeklyReferenceBoundary ($null -eq $reference.TotalUsd -and -not $dollar.Text.Contains((Format-TokenRaderUsd 5900.0))) "unknown delta fabricated 1% dollars for invalid percent '$invalidPercent'"
 }
 
+# An explicitly missing start snapshot may support only a clearly labelled
+# hypothetical 1% reference when the end window itself is valid. It is never
+# a strict calibrated estimate and must not be treated as a measured delta.
+$script:State.WeeklyReferenceEstimate = $null
+$script:State.IntervalBaseline.RateLimits = $null
+$missingStartEndWeek = [pscustomobject]@{
+    UsedPercent = 23.0
+    WindowMinutes = 10080
+    PlanType = 'synthetic-plan'
+    LimitId = 'codex'
+    ResetsAt = $reset
+    ObservedAt = $now
+}
+$result.AccountIdentity = 'synthetic-account'
+$result.StartRateLimits = $null
+$result.EndRateLimits = [pscustomobject]@{ Weekly = $missingStartEndWeek }
+$result.TotalCost = 47.2
+$result.PlanNormalizedTotalCost = 59.0
+$result.PlanPricingComplete = $true
+$result.QuotaPricingBasis = 'plan_standard_api_reference'
+Update-TokenRaderWeeklyReferenceFromResult -Result $result
+$missingStartReference = $script:State.WeeklyReferenceEstimate
+$assumptionProperty = if ($null -ne $missingStartReference) { $missingStartReference.PSObject.Properties['ReferenceAssumptionApplied'] } else { $null }
+Assert-WeeklyReferenceBoundary ($null -ne $missingStartReference -and $missingStartReference.TotalUsd -eq 5900.0 -and
+    $null -eq $missingStartReference.ActualDeltaPercent -and $null -ne $assumptionProperty -and
+    [bool]$assumptionProperty.Value -and -not [bool]$missingStartReference.FullStepObserved) 'valid end-only evidence did not create a non-strict hypothetical 1% reference'
+$onePercentAssumptionLabel = -join @([char]0x5047, [char]0x8BBE, '1%')
+$notCalibratedLabel = -join @([char]0x5C1A, [char]0x672A, [char]0x6821, [char]0x51C6)
+Set-QuotaWindowCard -Window $missingStartEndWeek -Estimate $null -WeeklyReference $missingStartReference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-WeeklyReferenceBoundary ($dollar.Text.Contains($onePercentAssumptionLabel) -and $dollar.Text.Contains($notCalibratedLabel) -and
+    $dollar.Text.Contains((Format-TokenRaderUsd 5900.0))) 'hypothetical 1% display was not labelled as assumed and not yet calibrated'
+
+# A real strict estimate continues to win over the hypothetical display value.
+$missingStartStrictEstimate = [pscustomobject]@{
+    TotalUsd = 1234.5
+    UsedUsd = 283.935
+    RemainingUsd = 950.565
+    WindowMinutes = 10080
+    PlanType = 'synthetic-plan'
+    ResetsAt = $reset
+    CurrentObservedAt = $now
+    EstimateSource = 'snapshot_delta_usd_estimate'
+    IdentityComplete = $true
+    StartUsedPercent = 21.0
+    EffectiveDeltaPercent = 2.0
+    QuotaPricingBasis = 'plan_standard_api_reference'
+}
+Set-QuotaWindowCard -Window $missingStartEndWeek -Estimate $missingStartStrictEstimate -WeeklyReference $missingStartReference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-WeeklyReferenceBoundary ($dollar.Text.Contains((Format-TokenRaderUsd 1234.5)) -and
+    -not $dollar.Text.Contains((Format-TokenRaderUsd 5900.0))) 'hypothetical 1% reference overrode a valid strict estimate'
+
+# Once valid frozen endpoints establish a full step, retain that latch and do
+# not fall back to 1%, including after a later result omits its start snapshot.
+$missingStartStartWeek = $missingStartEndWeek.PSObject.Copy()
+$missingStartStartWeek.UsedPercent = 21.0
+$missingStartStartWeek.ObservedAt = $now.AddMinutes(-1)
+$result.StartRateLimits = [pscustomobject]@{ Weekly = $missingStartStartWeek }
+Update-TokenRaderWeeklyReferenceFromResult -Result $result
+$fullStepReference = $script:State.WeeklyReferenceEstimate
+$assumptionProperty = $fullStepReference.PSObject.Properties['ReferenceAssumptionApplied']
+Assert-WeeklyReferenceBoundary ([bool]$fullStepReference.FullStepObserved -and
+    [Math]::Abs([double]$fullStepReference.ActualDeltaPercent - 2.0) -lt 0.000001 -and
+    $null -eq $fullStepReference.TotalUsd -and ($null -eq $assumptionProperty -or -not [bool]$assumptionProperty.Value)) 'valid +2% endpoints did not disable the hypothetical 1% reference'
+$result.StartRateLimits = $null
+Update-TokenRaderWeeklyReferenceFromResult -Result $result
+$missingStartAfterFullStep = $script:State.WeeklyReferenceEstimate
+$assumptionProperty = $missingStartAfterFullStep.PSObject.Properties['ReferenceAssumptionApplied']
+Assert-WeeklyReferenceBoundary ([bool]$missingStartAfterFullStep.FullStepObserved -and
+    $null -eq $missingStartAfterFullStep.TotalUsd -and ($null -eq $assumptionProperty -or -not [bool]$assumptionProperty.Value)) 'missing start reopened the hypothetical 1% reference after a full step'
+
+# Reject malformed end-window identity, foreign-account results, and
+# conflicting reset identities rather than turning any of them into 1% dollars.
+$script:State.WeeklyReferenceEstimate = $null
+$invalidEndWeek = $missingStartEndWeek.PSObject.Copy()
+$invalidEndWeek.LimitId = 'model-specific'
+$result.StartRateLimits = $null
+$result.EndRateLimits = [pscustomobject]@{ Weekly = $invalidEndWeek }
+Update-TokenRaderWeeklyReferenceFromResult -Result $result
+$invalidEndReference = $script:State.WeeklyReferenceEstimate
+Assert-WeeklyReferenceBoundary ($null -eq $invalidEndReference -or
+    ($null -eq $invalidEndReference.TotalUsd -and -not [bool]$invalidEndReference.PSObject.Properties['ReferenceAssumptionApplied'].Value)) 'invalid end-window identity received a hypothetical 1% reference'
+
+$script:State.WeeklyReferenceEstimate = $null
+$result.EndRateLimits = [pscustomobject]@{ Weekly = $missingStartEndWeek }
+$result.AccountIdentity = 'foreign-synthetic-account'
+Update-TokenRaderWeeklyReferenceFromResult -Result $result
+Assert-WeeklyReferenceBoundary ($null -eq $script:State.WeeklyReferenceEstimate) 'foreign-account result wrote a hypothetical weekly reference'
+
+$script:State.WeeklyReferenceEstimate = $null
+$result.AccountIdentity = 'synthetic-account'
+$conflictingStartWeek = $missingStartStartWeek.PSObject.Copy()
+$conflictingStartWeek.ResetsAt = $reset.AddDays(1)
+$result.StartRateLimits = [pscustomobject]@{ Weekly = $conflictingStartWeek }
+$result.EndRateLimits = [pscustomobject]@{ Weekly = $missingStartEndWeek }
+Update-TokenRaderWeeklyReferenceFromResult -Result $result
+$resetConflictReference = $script:State.WeeklyReferenceEstimate
+Assert-WeeklyReferenceBoundary ($null -eq $resetConflictReference -or
+    ($null -eq $resetConflictReference.TotalUsd -and -not [bool]$resetConflictReference.PSObject.Properties['ReferenceAssumptionApplied'].Value)) 'reset-conflicting endpoints received a hypothetical 1% reference'
+
+# The missing-start exception still requires a valid, current regular window.
+foreach ($guardCase in @('expired-reset','scope-conflict','nan-percent','missing-observed-at')) {
+    $script:State.WeeklyReferenceEstimate = $null
+    $result.AccountIdentity = 'synthetic-account'
+    $result.StartRateLimits = $null
+    $candidateEndWeek = $missingStartEndWeek.PSObject.Copy()
+    switch ($guardCase) {
+        'expired-reset' { $candidateEndWeek.ResetsAt = $now.AddMinutes(-1) }
+        'scope-conflict' { $candidateEndWeek | Add-Member -NotePropertyName ScopeConflict -NotePropertyValue $true -Force }
+        'nan-percent' { $candidateEndWeek.UsedPercent = [double]::NaN }
+        'missing-observed-at' { [void]$candidateEndWeek.PSObject.Properties.Remove('ObservedAt') }
+    }
+    $result.EndRateLimits = [pscustomobject]@{ Weekly = $candidateEndWeek }
+    Update-TokenRaderWeeklyReferenceFromResult -Result $result
+    $guardReference = $script:State.WeeklyReferenceEstimate
+    $guardAssumptionProperty = if ($null -ne $guardReference) { $guardReference.PSObject.Properties['ReferenceAssumptionApplied'] } else { $null }
+    Assert-WeeklyReferenceBoundary ($null -eq $guardReference -or
+        ($null -eq $guardReference.TotalUsd -and ($null -eq $guardAssumptionProperty -or -not [bool]$guardAssumptionProperty.Value))) "missing-start guard '$guardCase' produced a hypothetical 1% reference"
+}
+
+# A previously valid provisional reference must not leak onto a different reset
+# cycle or into a UI now bound to another account.
+$script:State.AccountIdentity = 'synthetic-account'
+$changedResetWindow = $missingStartEndWeek.PSObject.Copy()
+$changedResetWindow.ResetsAt = $reset.AddDays(1)
+Set-QuotaWindowCard -Window $changedResetWindow -Estimate $null -WeeklyReference $missingStartReference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-WeeklyReferenceBoundary (-not $dollar.Text.Contains($onePercentAssumptionLabel) -and
+    -not $dollar.Text.Contains((Format-TokenRaderUsd 5900.0))) 'prior hypothetical 1% reference appeared against a changed reset cycle'
+$script:State.AccountIdentity = 'foreign-synthetic-account'
+Set-QuotaWindowCard -Window $missingStartEndWeek -Estimate $null -WeeklyReference $missingStartReference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
+Assert-WeeklyReferenceBoundary (-not $dollar.Text.Contains($onePercentAssumptionLabel) -and
+    -not $dollar.Text.Contains((Format-TokenRaderUsd 5900.0))) 'prior hypothetical 1% reference appeared for a foreign current account'
+$script:State.AccountIdentity = 'synthetic-account'
+
 Write-Output 'Weekly reference boundary tests passed.'
