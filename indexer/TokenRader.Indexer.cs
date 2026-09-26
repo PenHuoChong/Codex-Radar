@@ -5004,10 +5004,28 @@ public static class TokenRaderIndexer
                 // Until a further real increase, retain the first full-step
                 // evidence. Thereafter the anchor never slides forward.
                 if (currentUsedPercent > anchor.UsedPercent + epsilon)
-                    foreach (QuotaSnapshotCandidate point in candidates)
-                        if (point.ObservedAt > anchor.ObservedAt &&
-                            Math.Abs(point.UsedPercent - currentUsedPercent) <= epsilon)
-                        { start = anchor; end = point; break; }
+                {
+                    if (string.Equals(windowKind, "Weekly", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Lag the weekly endpoint by one percentage point once
+                        // possible, but only select a real frozen snapshot.
+                        double ceiling = Math.Min(currentUsedPercent,
+                            Math.Max(anchor.UsedPercent + 1.0, currentUsedPercent - 1.0));
+                        QuotaSnapshotCandidate selected = null;
+                        foreach (QuotaSnapshotCandidate point in candidates)
+                            if (point.ObservedAt > anchor.ObservedAt &&
+                                point.UsedPercent > anchor.UsedPercent + epsilon &&
+                                point.UsedPercent <= ceiling + epsilon &&
+                                (selected == null || point.UsedPercent > selected.UsedPercent + epsilon))
+                                selected = point;
+                        if (selected != null) { start = anchor; end = selected; }
+                    }
+                    else
+                        foreach (QuotaSnapshotCandidate point in candidates)
+                            if (point.ObservedAt > anchor.ObservedAt &&
+                                Math.Abs(point.UsedPercent - currentUsedPercent) <= epsilon)
+                            { start = anchor; end = point; break; }
+                }
             }
         }
         if (start == null || end == null || end.UsedPercent <= start.UsedPercent + epsilon)

@@ -442,6 +442,107 @@ try {
     $db.Dispose()
 }
 
+# Weekly quota calibration uses a cumulative selector with a one-step lag.
+# From a 36% baseline it prices 36->37 first, then anchors at 37: at 38 it
+# prices 37->38, at 39 it keeps that completed pair, and at 40 it prices the
+# cumulative 37->39 span. All pairs must use real frozen snapshots.
+$db = New-QuotaCycleDb
+try {
+    $path = 'synthetic://quota-weekly-cumulative-calibration'
+    $weeklyReset = $reset + 1000L
+    $t36 = [DateTimeOffset]::Parse('2030-03-08T00:00:00Z')
+    $t37 = [DateTimeOffset]::Parse('2030-03-08T00:00:10Z')
+    $t375 = [DateTimeOffset]::Parse('2030-03-08T00:00:15Z')
+    $t38 = [DateTimeOffset]::Parse('2030-03-08T00:00:20Z')
+    $t385 = [DateTimeOffset]::Parse('2030-03-08T00:00:25Z')
+    $t3875 = [DateTimeOffset]::Parse('2030-03-08T00:00:27Z')
+    $t39 = [DateTimeOffset]::Parse('2030-03-08T00:00:30Z')
+    $t3925 = [DateTimeOffset]::Parse('2030-03-08T00:00:32Z')
+    $t40 = [DateTimeOffset]::Parse('2030-03-08T00:00:40Z')
+    Add-QuotaCycleRow $db 'weekly-session' $t36.ToString('o') $path 10 'weekly-36' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 36.0 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'weekly-session' $t37.ToString('o') $path 20 'weekly-37' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 37.0 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    # The two priced calls fall inside the selected 37% -> 39% cumulative
+    # interval. The latter deliberately lacks snapshot percentages.
+    Add-QuotaCycleRow $db 'weekly-session' $t375.ToString('o') $path 25 'weekly-call-37-38' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed $null -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 1000 -CallInput 1000 -TotalOutput 100 -CallOutput 100
+    Add-QuotaCycleRow $db 'weekly-session' $t38.ToString('o') $path 30 'weekly-38' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 38.0 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'weekly-session' $t385.ToString('o') $path 35 'weekly-38-5' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 38.5 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'weekly-session' $t3875.ToString('o') $path 37 'weekly-call-38-39' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed $null -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 800 -CallInput 800 -TotalOutput 80 -CallOutput 80
+    Add-QuotaCycleRow $db 'weekly-session' $t39.ToString('o') $path 40 'weekly-39-first' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 39.0 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'weekly-session' $t3925.ToString('o') $path 42 'weekly-39-plateau' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 39.0 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'weekly-session' $t40.ToString('o') $path 60 'weekly-40' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 40.0 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+
+    $frozenOffsets = @{ $path = 100L }
+    $weeklyBaselineAt = $t36
+    $weeklyBaselinePercent = 36.0
+    $selectWeekly = {
+        param($currentPercent, $currentAt)
+        [TokenRaderIndexer]::QueryQuotaMeasurementCalibrationPairWithDiagnostics(
+            $db, $frozenOffsets, 'Weekly', 10080, $weeklyReset, 'team', 'quota-synthetic',
+            [double]$currentPercent, [DateTimeOffset]$currentAt, $none,
+            [DateTimeOffset]$weeklyBaselineAt, [double]$weeklyBaselinePercent)
+    }
+    $assertWeeklyPair = {
+        param($selection, $label, $expectedStart, $expectedEnd, $expectedEndAt)
+        Assert-QuotaCycleEqual 'ok' $selection.ReasonCode ($label + ' did not return a calibration pair')
+        Assert-QuotaCycle ($selection.Rows.Rows.Count -eq 2) ($label + ' returned an unexpected row count')
+        $startRow = $selection.Rows.Rows[0]
+        $endRow = $selection.Rows.Rows[1]
+        Assert-QuotaCycle ([Math]::Abs([double]$startRow.weekly_used - [double]$expectedStart) -lt 0.000000001) ($label + ' selected the wrong start percentage')
+        Assert-QuotaCycle ([Math]::Abs([double]$endRow.weekly_used - [double]$expectedEnd) -lt 0.000000001) ($label + ' selected the wrong end percentage')
+        Assert-QuotaCycleEqual ([DateTimeOffset]$expectedEndAt).ToUniversalTime().ToString('o') ([DateTimeOffset]::Parse([string]$endRow.timestamp).ToUniversalTime().ToString('o')) ($label + ' selected the wrong real endpoint')
+    }
+
+    & $assertWeeklyPair (& $selectWeekly 37.0 $t37) 'weekly 37 percent first step' 36.0 37.0 $t37
+    & $assertWeeklyPair (& $selectWeekly 38.0 $t38) 'weekly 38 percent anchored step' 37.0 38.0 $t38
+    & $assertWeeklyPair (& $selectWeekly 39.0 $t39) 'weekly 39 percent retains completed step' 37.0 38.0 $t38
+    & $assertWeeklyPair (& $selectWeekly 40.0 $t40) 'weekly 40 percent cumulative step' 37.0 39.0 $t39
+
+    # The production wrapper must use the selected 37% -> 39% pair for both
+    # the cost window and its 2-point denominator, despite the 36% baseline.
+    $weeklyDiagnostic = @{}
+    $weeklyEvidence = & $coreModule {
+        param($start, $end, $connection, $offsets, $thresholds, $prices, $diag)
+        Get-TokenRaderQuotaWindowEvidence -StartWindow $start -EndWindow $end -MainLastCountedAt $null -WindowKind Weekly -RateLimitId 'quota-synthetic' -Connection $connection -EndOffsets $offsets -Thresholds $thresholds -PricingDocument $prices -CancellationToken ([Threading.CancellationToken]::None) -ProgressState @{} -Cache @{} -DiagnosticState $diag -AccountIdentity 'synthetic-account'
+    } (New-QuotaCycleWindow 36 $t36.ToString('o') $weeklyReset 'team' 'quota-synthetic' 10080) (New-QuotaCycleWindow 40 $t40.ToString('o') $weeklyReset 'team' 'quota-synthetic' 10080) $db $frozenOffsets $thresholds $pricing $weeklyDiagnostic
+    Assert-QuotaCycle ($null -ne $weeklyEvidence) 'weekly wrapper discarded the 37% -> 39% calibration pair'
+    Assert-QuotaCycle ([Math]::Abs([double]$weeklyEvidence.StartUsedPercent - 37.0) -lt 0.000000001) 'weekly wrapper used the 36% measurement baseline instead of the 37% anchor'
+    Assert-QuotaCycle ([Math]::Abs([double]$weeklyEvidence.CalibrationEndUsedPercent - 39.0) -lt 0.000000001) 'weekly wrapper selected the wrong cumulative endpoint'
+    Assert-QuotaCycle ([Math]::Abs([double]$weeklyEvidence.DeltaPercent - 2.0) -lt 0.000000001) 'weekly wrapper used a denominator other than the exact 2-point 37% -> 39% span'
+    Assert-QuotaCycle ([double]$weeklyEvidence.TotalCost -gt 0) 'weekly wrapper did not price the calls in the 37% -> 39% interval'
+    Assert-QuotaCycleEqual 1800 $weeklyEvidence.Usage.Input 'weekly selected span input'
+    Assert-QuotaCycleEqual 2 $weeklyEvidence.CountedEvents 'weekly selected span calls'
+    Assert-QuotaCycle ([Math]::Abs([double]$weeklyEvidence.EstimatedTotalUsd - [double]$weeklyEvidence.TotalCost / 0.02) -lt 0.000000001) 'weekly dollar result still used a fixed one-percent divisor'
+    $weeklyEstimate = Get-TokenRaderQuotaEstimate -StartRateLimits ([pscustomobject]@{FiveHour=$null;Weekly=(New-QuotaCycleWindow 36 $t36.ToString('o') $weeklyReset 'team' 'quota-synthetic' 10080)}) -EndRateLimits ([pscustomobject]@{FiveHour=$null;Weekly=(New-QuotaCycleWindow 40 $t40.ToString('o') $weeklyReset 'team' 'quota-synthetic' 10080)}) -IntervalCost 999 -QuotaEvidence ([pscustomobject]@{FiveHour=$null;Weekly=$weeklyEvidence})
+    Assert-QuotaCycle ($null -ne $weeklyEstimate.Weekly) 'public quota estimator rejected the lagged endpoint'
+    Assert-QuotaCycle ([Math]::Abs([double]$weeklyEstimate.Weekly.TotalUsd - [double]$weeklyEvidence.TotalCost / 0.02) -lt 0.000000001) 'public quota estimator did not use selected cost divided by two percent'
+
+    # A late-indexed 39% -> 40% call must not alter the already selected
+    # 37% -> 39% cost interval. Keeping the same frozen ceiling makes this a
+    # synthetic snapshot-append regression, not a live-log read.
+    $costBeforeLateCall = [double]$weeklyEvidence.TotalCost
+    Add-QuotaCycleRow $db 'weekly-session' ([DateTimeOffset]::Parse('2030-03-08T00:00:35Z')).ToString('o') $path 70 'weekly-call-39-40-late' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed $null -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 700 -CallInput 700 -TotalOutput 70 -CallOutput 70
+    $weeklyAfterAppend = & $coreModule {
+        param($start, $end, $connection, $offsets, $thresholds, $prices)
+        Get-TokenRaderQuotaWindowEvidence -StartWindow $start -EndWindow $end -MainLastCountedAt $null -WindowKind Weekly -RateLimitId 'quota-synthetic' -Connection $connection -EndOffsets $offsets -Thresholds $thresholds -PricingDocument $prices -CancellationToken ([Threading.CancellationToken]::None) -ProgressState @{} -Cache @{} -DiagnosticState @{} -AccountIdentity 'synthetic-account'
+    } (New-QuotaCycleWindow 36 $t36.ToString('o') $weeklyReset 'team' 'quota-synthetic' 10080) (New-QuotaCycleWindow 40 $t40.ToString('o') $weeklyReset 'team' 'quota-synthetic' 10080) $db $frozenOffsets $thresholds $pricing
+    Assert-QuotaCycle ($null -ne $weeklyAfterAppend) 'weekly wrapper lost its estimate after a later synthetic row was appended'
+    Assert-QuotaCycle ([Math]::Abs([double]$weeklyAfterAppend.TotalCost - $costBeforeLateCall) -lt 0.000000001) 'weekly wrapper included the 39% -> 40% late call in the 37% -> 39% calibration cost'
+    Assert-QuotaCycle ([Math]::Abs([double]$weeklyAfterAppend.DeltaPercent - 2.0) -lt 0.000000001) 'weekly appended-row recalculation changed the 2-point denominator'
+
+    # Decimal and missing boundaries use only observed percentages below the
+    # lagged ceiling, never an invented 38.75% snapshot.
+    $t395 = $t36.AddSeconds(34)
+    $t3975 = $t36.AddSeconds(36)
+    Add-QuotaCycleRow $db 'weekly-session' $t395.ToString('o') $path 45 'weekly-39-5' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 39.5 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    Add-QuotaCycleRow $db 'weekly-session' $t3975.ToString('o') $path 50 'weekly-39-75' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 39.75 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    & $assertWeeklyPair (& $selectWeekly 39.5 $t395) 'weekly decimal lagged ceiling' 37.0 38.5 $t385
+    & $assertWeeklyPair (& $selectWeekly 39.75 $t3975) 'weekly missing boundary not invented' 37.0 38.5 $t385
+    Add-QuotaCycleRow $db 'weekly-session' $t36.AddSeconds(26).ToString('o') $path 200 'weekly-outside-frozen' -PlanType 'team' -RateLimitId 'quota-synthetic' -WeeklyUsed 38.75 -WeeklyWindow 10080 -WeeklyReset $weeklyReset -TotalInput 0 -CallInput 0 -TotalOutput 0 -CallOutput 0
+    & $assertWeeklyPair (& $selectWeekly 39.75 $t3975) 'weekly frozen boundary excludes appended snapshot' 37.0 38.5 $t385
+} finally {
+    $db.Dispose()
+}
+
 # Dense split-window metadata must not cause a prefix replay for every call.
 $db = New-QuotaCycleDb
 try {
