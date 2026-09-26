@@ -196,8 +196,12 @@ foreach ($delta in @(0.0,0.1,0.99,1.0,2.0)) {
     $endWeek.UsedPercent=30.0+$delta
     Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
     $reference=$script:State.WeeklyReferenceEstimate
-    Assert-UiPricing ([Math]::Abs([double]$reference.TotalUsd-1250.0) -lt 0.000001 -and
-        [Math]::Abs([double]$reference.ActualDeltaPercent-$delta) -lt 0.000001) "wrong 1% reference at $delta percentage points"
+    Assert-UiPricing ([Math]::Abs([double]$reference.ActualDeltaPercent-$delta) -lt 0.000001) "wrong measured delta at $delta percentage points"
+    if ($delta -lt 1.0) {
+        Assert-UiPricing ([Math]::Abs([double]$reference.TotalUsd-1250.0) -lt 0.000001) "wrong 1% reference at $delta percentage points"
+    } else {
+        Assert-UiPricing ($null -eq $reference.TotalUsd) "full step still manufactured 1% dollars at $delta"
+    }
     Set-QuotaWindowCard -Window $endWeek -Estimate $estimate -WeeklyReference $reference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
     if ($delta -lt 1.0) {
         Assert-UiPricing ($dollar.Text.StartsWith('周总额度参考≈$1,250') -and $dollar.Text.Contains('本次API消耗×100') -and
@@ -209,7 +213,10 @@ foreach ($delta in @(0.0,0.1,0.99,1.0,2.0)) {
 $endWeek.UsedPercent=32.0
 Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
 Set-QuotaWindowCard -Window $endWeek -Estimate $null -WeeklyReference $script:State.WeeklyReferenceEstimate -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
-Assert-UiPricing ($dollar.Text.StartsWith('周总额度参考≈$1,250') -and $dollar.Text.Contains('严格校准：不可估')) 'unavailable strict calibration hid the 1% reference after a full step'
+Assert-UiPricing (-not $dollar.Text.Contains('$1,250') -and $dollar.Text.Contains('本次周增量已达 2%') -and $dollar.Text.Contains('等待同边界校准')) 'unavailable strict calibration reused 1% reference after a full step'
+# The following sub-percent cases are a separate measurement, not a rollback
+# that could reopen a reference after a complete step in the same cycle.
+$script:State.WeeklyReferenceEstimate=$null
 $endWeek.UsedPercent=30.0
 Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
 $reference=$script:State.WeeklyReferenceEstimate

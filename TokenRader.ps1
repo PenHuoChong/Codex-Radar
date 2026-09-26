@@ -1562,7 +1562,19 @@ function Set-QuotaWindowCard {
 
     $referenceText = ''
     $preferReference = $false
-    if ($null -ne $WeeklyReference -and $null -ne $WeeklyReference.PSObject.Properties['TotalUsd'] -and
+    # A failed strict calibration is not evidence that consumption was 1%.
+    # Defend at display time too, so an older cached reference cannot leak back.
+    $fullStepObserved = $null -ne $WeeklyReference -and
+        $null -ne $WeeklyReference.PSObject.Properties['FullStepObserved'] -and [bool]$WeeklyReference.FullStepObserved
+    $referenceDelta = $null
+    if ($null -ne $WeeklyReference -and $null -ne $WeeklyReference.PSObject.Properties['ActualDeltaPercent'] -and
+        $null -ne $WeeklyReference.ActualDeltaPercent) {
+        try {
+            $referenceDelta = [double]$WeeklyReference.ActualDeltaPercent
+            $fullStepObserved = $fullStepObserved -or (-not [double]::IsNaN($referenceDelta) -and -not [double]::IsInfinity($referenceDelta) -and $referenceDelta -ge 1.0)
+        } catch { }
+    }
+    if (-not $fullStepObserved -and $null -ne $WeeklyReference -and $null -ne $WeeklyReference.PSObject.Properties['TotalUsd'] -and
         -not [double]::IsNaN([double]$WeeklyReference.TotalUsd) -and
         -not [double]::IsInfinity([double]$WeeklyReference.TotalUsd) -and [double]$WeeklyReference.TotalUsd -gt 0) {
         $referenceText = '周总额度参考≈' + (Format-TokenRaderUsd ([double]$WeeklyReference.TotalUsd)) +
@@ -1683,6 +1695,10 @@ function Set-QuotaWindowCard {
             $DollarText.Text = $referenceText + ' · 本次周增量不足1个百分点；既有冻结校准未用于此参考'
         } else {
             $reason = Get-TokenRaderQuotaDiagnosticMessage -Diagnostic $Diagnostic -Fallback '尚无有效估算结果'
+            if ($fullStepObserved) {
+                $stepText = if ($null -ne $referenceDelta -and $referenceDelta -ge 1.0) { '本次周增量已达 {0:0.####}%' -f $referenceDelta } else { '本次已观察到完整周增量' }
+                $reason = $stepText + '；等待同边界校准，不再按1%折算 · ' + $reason
+            }
             $DollarText.Text = if ($referenceText) { $referenceText + ' · 严格校准：不可估 · ' + $reason } else { '美金额度：不可估 · ' + $reason }
         }
     }
@@ -1870,6 +1886,8 @@ function Update-TokenRaderWeeklyReferenceFromResult {
     param([Parameter(Mandatory = $true)]$Result)
     # This is a display-only 1% yardstick for the current measurement. It is
     # never placed in QuotaEstimates or used as a frozen calibration endpoint.
+    # Once a full step is observed, retain the delta for diagnostics, not a
+    # fabricated 1% dollar value. Strict failure must not reopen that fallback.
     if ($null -eq $script:State.IntervalBaseline) { return }
     $currentAccount = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
     $baselineAccount = if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['AccountIdentity']) {
@@ -1883,17 +1901,23 @@ function Update-TokenRaderWeeklyReferenceFromResult {
 
     # Account ownership is checked before ANY mutation, including rejecting a
     # zero/invalid cost. A late foreign result cannot erase the current value.
+    $priorFullStepReference = $null
+    if ($script:State.ContainsKey('WeeklyReferenceEstimate') -and $null -ne $script:State.WeeklyReferenceEstimate) {
+        $prior = $script:State.WeeklyReferenceEstimate
+        if ($null -ne $prior.PSObject.Properties['FullStepObserved'] -and [bool]$prior.FullStepObserved -and
+            [string]$prior.AccountIdentity -eq $currentAccount) { $priorFullStepReference = $prior }
+    }
     if ($null -eq $Result.PSObject.Properties['TotalCost'] -or
-        $null -eq $Result.TotalCost) { $script:State.WeeklyReferenceEstimate = $null; return }
-    try { $cost = [double]$Result.TotalCost } catch { $script:State.WeeklyReferenceEstimate = $null; return }
+        $null -eq $Result.TotalCost) { $script:State.WeeklyReferenceEstimate = $priorFullStepReference; return }
+    try { $cost = [double]$Result.TotalCost } catch { $script:State.WeeklyReferenceEstimate = $priorFullStepReference; return }
     $quotaBasis = if ($null -ne $Result.PSObject.Properties['QuotaPricingBasis']) { [string]$Result.QuotaPricingBasis } else { 'api_equivalent' }
     if ($quotaBasis -eq 'plan_standard_api_reference') {
         if ($null -eq $Result.PSObject.Properties['PlanNormalizedTotalCost'] -or
-            $null -eq $Result.PlanNormalizedTotalCost) { $script:State.WeeklyReferenceEstimate = $null; return }
-        try { $cost = [double]$Result.PlanNormalizedTotalCost } catch { $script:State.WeeklyReferenceEstimate = $null; return }
+            $null -eq $Result.PlanNormalizedTotalCost) { $script:State.WeeklyReferenceEstimate = $priorFullStepReference; return }
+        try { $cost = [double]$Result.PlanNormalizedTotalCost } catch { $script:State.WeeklyReferenceEstimate = $priorFullStepReference; return }
     }
     if ([double]::IsNaN($cost) -or [double]::IsInfinity($cost) -or $cost -le 0 -or
-        [double]::IsInfinity($cost * 100.0)) { $script:State.WeeklyReferenceEstimate = $null; return }
+        [double]::IsInfinity($cost * 100.0)) { $script:State.WeeklyReferenceEstimate = $priorFullStepReference; return }
 
     $startLimits = if ($null -ne $Result.PSObject.Properties['StartRateLimits']) { $Result.StartRateLimits } elseif ($null -ne $script:State.IntervalBaseline.PSObject.Properties['RateLimits']) { $script:State.IntervalBaseline.RateLimits } else { $null }
     $endLimits = if ($null -ne $Result.PSObject.Properties['EndRateLimits']) { $Result.EndRateLimits } elseif ($null -ne $Result.PSObject.Properties['RateLimits']) { $Result.RateLimits } else { $null }
@@ -1916,7 +1940,7 @@ function Update-TokenRaderWeeklyReferenceFromResult {
             $endPercent = [double]$end.UsedPercent
             if (-not [double]::IsNaN($startPercent) -and -not [double]::IsInfinity($startPercent) -and
                 -not [double]::IsNaN($endPercent) -and -not [double]::IsInfinity($endPercent) -and
-                $startPercent -ge 0 -and $endPercent -le 100 -and $endPercent -ge $startPercent) {
+                $startPercent -ge 0 -and $startPercent -le 100 -and $endPercent -ge 0 -and $endPercent -le 100 -and $endPercent -ge $startPercent) {
                 $delta = $endPercent - $startPercent
             }
         } catch { }
@@ -1925,9 +1949,34 @@ function Update-TokenRaderWeeklyReferenceFromResult {
     if ($quotaBasis -eq 'plan_standard_api_reference') {
         $pricingComplete = $null -ne $Result.PSObject.Properties['PlanPricingComplete'] -and [bool]$Result.PlanPricingComplete
     }
+    $fullStepObserved = $null -ne $delta -and $delta -ge 1.0
+    $previousReference = if ($script:State.ContainsKey('WeeklyReferenceEstimate')) { $script:State.WeeklyReferenceEstimate } else { $null }
+    # A transient omitted snapshot must not reopen the 1% fallback after a
+    # complete step. Only explicit cycle changes or a new measurement reset it.
+    $cycleWindow = $end
+    if ($null -ne $previousReference -and $null -ne $previousReference.PSObject.Properties['FullStepObserved'] -and
+        [bool]$previousReference.FullStepObserved -and [string]$previousReference.AccountIdentity -eq $currentAccount -and
+        [string]$previousReference.QuotaPricingBasis -eq $quotaBasis) {
+        $sameCycle = $true
+        $priorWindow = if ($null -ne $previousReference.PSObject.Properties['CycleWindow']) { $previousReference.CycleWindow } else { $null }
+        if ($null -ne $priorWindow -and $null -ne $end) {
+            foreach ($field in @('ResetsAt','PlanType','WindowMinutes','LimitId')) {
+                if ($null -ne $priorWindow.PSObject.Properties[$field] -and $null -ne $end.PSObject.Properties[$field] -and
+                    $null -ne $priorWindow.$field -and $null -ne $end.$field -and $priorWindow.$field -ne $end.$field) {
+                    $sameCycle = $false; break
+                }
+            }
+        }
+        if ($sameCycle) {
+            $fullStepObserved = $true
+            if ($null -eq $cycleWindow) { $cycleWindow = $priorWindow }
+        }
+    }
     $script:State.WeeklyReferenceEstimate = [pscustomobject]@{
-        TotalUsd = $cost * 100.0
+        TotalUsd = if ($fullStepObserved) { $null } else { $cost * 100.0 }
         ActualDeltaPercent = $delta
+        FullStepObserved = $fullStepObserved
+        CycleWindow = $cycleWindow
         PricingIncomplete = -not $pricingComplete
         AccountIdentity = $currentAccount
         QuotaPricingBasis = $quotaBasis
@@ -2184,6 +2233,60 @@ function Update-QuotaEstimatesFromInterval {
                 if ($null -ne $computedWindow.PSObject.Properties[$field] -and $null -ne $acceptedWindow.PSObject.Properties[$field] -and
                     $computedWindow.$field -ne $acceptedWindow.$field) { $endpointAccepted = $false; break }
             }
+            if (($null -ne $computedWindow.PSObject.Properties['ScopeConflict'] -and [bool]$computedWindow.ScopeConflict) -or
+                ($null -ne $acceptedWindow.PSObject.Properties['ScopeConflict'] -and [bool]$acceptedWindow.ScopeConflict)) {
+                $endpointAccepted = $false
+            }
+            if (-not $endpointAccepted -and $accountBoundaryValid -and $resultAccountMatchesCurrent) {
+                # A refresh may accept a later observation while this worker is
+                # pricing its frozen endpoint. Only carry forward the immutable
+                # calibration when both complete window identities match and
+                # the later observation is monotonic within that same cycle.
+                $completeIdentity = $true
+                foreach ($window in @($computedWindow, $acceptedWindow)) {
+                    foreach ($field in @('ObservedAt','UsedPercent','PlanType','WindowMinutes','ResetsAt','LimitId')) {
+                        if ($null -eq $window.PSObject.Properties[$field] -or $null -eq $window.$field) { $completeIdentity = $false; break }
+                    }
+                    if (-not $completeIdentity -or [string]::IsNullOrWhiteSpace([string]$window.PlanType) -or
+                        [string]::IsNullOrWhiteSpace([string]$window.LimitId) -or [int]$window.WindowMinutes -le 0 -or
+                        ($null -ne $window.PSObject.Properties['ScopeConflict'] -and [bool]$window.ScopeConflict)) {
+                        $completeIdentity = $false; break
+                    }
+                }
+                if ($completeIdentity) {
+                    try {
+                        [DateTimeOffset]$computedAt = [DateTimeOffset]$computedWindow.ObservedAt
+                        [DateTimeOffset]$acceptedAt = [DateTimeOffset]$acceptedWindow.ObservedAt
+                        [double]$computedPercent = [double]$computedWindow.UsedPercent
+                        [double]$acceptedPercent = [double]$acceptedWindow.UsedPercent
+                        $computedReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$computedWindow.WindowMinutes) -ResetsAt $computedWindow.ResetsAt
+                        $acceptedReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$acceptedWindow.WindowMinutes) -ResetsAt $acceptedWindow.ResetsAt
+                        $endpointAccepted = $acceptedAt -gt $computedAt -and
+                            [DateTimeOffset]$acceptedWindow.ResetsAt -gt $acceptedAt -and
+                            -not [double]::IsNaN($computedPercent) -and -not [double]::IsInfinity($computedPercent) -and
+                            -not [double]::IsNaN($acceptedPercent) -and -not [double]::IsInfinity($acceptedPercent) -and
+                            $computedPercent -ge 0 -and $acceptedPercent -le 100 -and $acceptedPercent -ge $computedPercent -and
+                            [int]$computedWindow.WindowMinutes -eq [int]$acceptedWindow.WindowMinutes -and
+                            [string]::Equals([string]$computedWindow.PlanType,[string]$acceptedWindow.PlanType,[StringComparison]::OrdinalIgnoreCase) -and
+                            [string]::Equals([string]$computedWindow.LimitId,[string]$acceptedWindow.LimitId,[StringComparison]::OrdinalIgnoreCase) -and
+                            [string]::Equals([string]$computedWindow.LimitId,'codex',[StringComparison]::OrdinalIgnoreCase) -and
+                            -not [string]::IsNullOrWhiteSpace($computedReset) -and $computedReset -eq $acceptedReset
+                    } catch { $endpointAccepted = $false }
+                    if ($endpointAccepted) {
+                        $diagnostic = if ($kind -eq 'FiveHour') { $diagnosticFive } else { $diagnosticWeekly }
+                        if ($null -ne $diagnostic) {
+                            $frozenAt = if ($null -ne $newEstimates.$kind.PSObject.Properties['CalibrationEndObservedAt']) {
+                                $newEstimates.$kind.CalibrationEndObservedAt
+                            } else { $computedWindow.ObservedAt }
+                            foreach ($entry in @(@('Status','updated'),@('ReasonCode','frozen_endpoint_waiting_refresh'),@('Retained',$false),
+                                    @('Message',('冻结校准截至 {0:MM-dd HH:mm:ss}；界面已有更新快照，等待新边界复核' -f ([DateTimeOffset]$frozenAt).ToLocalTime())))) {
+                                if ($diagnostic -is [System.Collections.IDictionary]) { $diagnostic[$entry[0]]=$entry[1] }
+                                else { Add-Member -InputObject $diagnostic -NotePropertyName $entry[0] -NotePropertyValue $entry[1] -Force }
+                            }
+                        }
+                    }
+                }
+            }
             if (-not $endpointAccepted) { $newEstimates.$kind = $null }
         }
     }
@@ -2206,6 +2309,29 @@ function Update-QuotaEstimatesFromInterval {
     # exceptions: those old values are never retained.
     $canRetainPrevious = $accountBoundaryValid -and $resultAccountMatchesCurrent -and
         (-not $hasDiagnostics -or ($diagnosticFiveAccountValid -and $diagnosticWeeklyAccountValid))
+    if ($canRetainPrevious -and
+        [string]::Equals([string]$script:State.QuotaEstimateAccountIdentity,$currentAccount,[StringComparison]::Ordinal)) {
+        foreach ($entry in @(
+                [pscustomobject]@{Kind='FiveHour'; Previous=$previousFive; Window=$validationFive; Diagnostic=$diagnosticFive},
+                [pscustomobject]@{Kind='Weekly'; Previous=$previousWeekly; Window=$validationWeekly; Diagnostic=$diagnosticWeekly})) {
+            $incoming = $newEstimates.($entry.Kind)
+            if ($null -eq $incoming -or $null -eq $entry.Previous -or
+                $null -eq $incoming.PSObject.Properties['CalibrationEndObservedAt'] -or
+                $null -eq $entry.Previous.PSObject.Properties['CalibrationEndObservedAt'] -or
+                $null -eq $incoming.CalibrationEndObservedAt -or $null -eq $entry.Previous.CalibrationEndObservedAt -or
+                -not (Test-TokenRaderQuotaEstimateMatchesWindow -Estimate $entry.Previous -Window $entry.Window)) { continue }
+            if ([DateTimeOffset]$entry.Previous.CalibrationEndObservedAt -gt [DateTimeOffset]$incoming.CalibrationEndObservedAt) {
+                $newEstimates.($entry.Kind) = $null
+                if ($null -ne $entry.Diagnostic) {
+                    foreach ($field in @(@('Status','retained'),@('ReasonCode','newer_calibration_retained'),
+                            @('Message','已有更新的同周期校准，沿用上次结果'))) {
+                        if ($entry.Diagnostic -is [System.Collections.IDictionary]) { $entry.Diagnostic[$field[0]]=$field[1] }
+                        else { Add-Member -InputObject $entry.Diagnostic -NotePropertyName $field[0] -NotePropertyValue $field[1] -Force }
+                    }
+                }
+            }
+        }
+    }
     $retainedFive = $false
     $retainedWeekly = $false
     if ($canRetainPrevious) {

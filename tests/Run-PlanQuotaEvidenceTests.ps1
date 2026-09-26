@@ -102,6 +102,20 @@ try {
     Assert-PlanEvidence ($null -ne $frozen) 'frozen evidence disappeared after append'
     Assert-PlanEvidenceNear $plan.TotalCost $frozen.TotalCost 'late row crossed frozen offset'
     Assert-PlanEvidence ($plan.StartObservedAt -eq $frozen.StartObservedAt -and $plan.EndObservedAt -eq $frozen.EndObservedAt) 'late row changed frozen boundaries'
+
+    # A complete five-point step uses 5%, never the UI's separate 1% yardstick.
+    # Change only synthetic in-memory quota metadata; frozen call costs remain $5.
+    $command = $db.CreateCommand()
+    try {
+        $command.CommandText = 'UPDATE token_records SET five_hour_used=31 WHERE source_offset_end=20'
+        [void]$command.ExecuteNonQuery()
+    } finally { $command.Dispose() }
+    $fivePointEnd = New-QuotaCycleWindow 31 $endAt.ToString('o') $reset 'team'
+    $fivePoint = & $coreModule $getEvidence $start $fivePointEnd $db $ends $thresholds $planPrices @{}
+    Assert-PlanEvidence ($null -ne $fivePoint) 'five-point strict plan evidence missing'
+    Assert-PlanEvidenceNear 5.0 $fivePoint.EffectiveDeltaPercent 'five-point denominator changed'
+    Assert-PlanEvidenceNear 5.0 $fivePoint.TotalCost 'five-point frozen costs changed'
+    Assert-PlanEvidenceNear 100.0 $fivePoint.EstimatedTotalUsd 'five-point strict cost was folded as 1%'
 } finally {
     $db.Dispose()
 }
