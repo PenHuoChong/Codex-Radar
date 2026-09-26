@@ -1580,7 +1580,9 @@ function Set-QuotaWindowCard {
             $fullStepObserved = $fullStepObserved -or (-not [double]::IsNaN($referenceDelta) -and -not [double]::IsInfinity($referenceDelta) -and $referenceDelta -ge 1.0)
         } catch { }
     }
-    if (-not $fullStepObserved -and $null -ne $WeeklyReference -and $null -ne $WeeklyReference.PSObject.Properties['TotalUsd'] -and
+    $knownSubPercent = $null -ne $referenceDelta -and -not [double]::IsNaN($referenceDelta) -and
+        -not [double]::IsInfinity($referenceDelta) -and $referenceDelta -ge 0 -and $referenceDelta -lt 1.0
+    if (-not $fullStepObserved -and $knownSubPercent -and $null -ne $WeeklyReference -and $null -ne $WeeklyReference.PSObject.Properties['TotalUsd'] -and
         -not [double]::IsNaN([double]$WeeklyReference.TotalUsd) -and
         -not [double]::IsInfinity([double]$WeeklyReference.TotalUsd) -and [double]$WeeklyReference.TotalUsd -gt 0) {
         $referenceText = '周总额度参考≈' + (Format-TokenRaderUsd ([double]$WeeklyReference.TotalUsd)) +
@@ -1602,6 +1604,16 @@ function Set-QuotaWindowCard {
         $referenceText += ' · 参考成本统计区间（本地时间） {0} → {1}' -f $referenceTimes[0], $referenceTimes[1]
         $preferReference = $null -ne $WeeklyReference.PSObject.Properties['ActualDeltaPercent'] -and
             $null -ne $WeeklyReference.ActualDeltaPercent -and [double]$WeeklyReference.ActualDeltaPercent -lt 1.0
+    }
+    $measurementRangeText = ''
+    if ($null -ne $WeeklyReference) {
+        $measurementRangeText = '本次用量区间：未提供有效起止快照'
+        if ($null -ne $referenceDelta -and -not [double]::IsNaN($referenceDelta) -and -not [double]::IsInfinity($referenceDelta) -and $referenceDelta -ge 0 -and
+            $null -ne $WeeklyReference.PSObject.Properties['MeasurementStartUsedPercent'] -and $null -ne $WeeklyReference.MeasurementStartUsedPercent -and
+            $null -ne $WeeklyReference.PSObject.Properties['MeasurementEndUsedPercent'] -and $null -ne $WeeklyReference.MeasurementEndUsedPercent) {
+            $measurementRangeText = '本次用量区间 {0:0.####}% → {1:0.####}% · 区间 {2:0.####}%' -f
+                ([double]$WeeklyReference.MeasurementStartUsedPercent), ([double]$WeeklyReference.MeasurementEndUsedPercent), $referenceDelta
+        }
     }
 
     if ($NotApplicable) {
@@ -1735,6 +1747,7 @@ function Set-QuotaWindowCard {
             $DollarText.Text = if ($referenceText) { $referenceText + ' · 严格校准：不可估 · ' + $reason } else { '美金额度：不可估 · ' + $reason }
         }
     }
+    if ($measurementRangeText) { $DollarText.Text += ' · ' + $measurementRangeText }
 }
 
 function Update-TokenRaderQuotaPlanLabel {
@@ -1952,23 +1965,49 @@ function Update-TokenRaderWeeklyReferenceFromResult {
     if ([double]::IsNaN($cost) -or [double]::IsInfinity($cost) -or $cost -le 0 -or
         [double]::IsInfinity($cost * 100.0)) { $script:State.WeeklyReferenceEstimate = $priorFullStepReference; return }
 
-    $startLimits = if ($null -ne $Result.PSObject.Properties['StartRateLimits']) { $Result.StartRateLimits } elseif ($null -ne $script:State.IntervalBaseline.PSObject.Properties['RateLimits']) { $script:State.IntervalBaseline.RateLimits } else { $null }
-    $endLimits = if ($null -ne $Result.PSObject.Properties['EndRateLimits']) { $Result.EndRateLimits } elseif ($null -ne $Result.PSObject.Properties['RateLimits']) { $Result.RateLimits } else { $null }
+    $startLimits = if ($null -ne $Result.PSObject.Properties['StartRateLimits']) { $Result.StartRateLimits } else { $null }
+    if ($null -eq $startLimits -and [string]::Equals($baselineAccount,$currentAccount,[StringComparison]::Ordinal)) {
+        # A present-but-null result property must not mask a frozen baseline.
+        # Do not substitute live UI snapshots or an explicitly rejected window.
+        $startLimits = if ($null -ne $script:State.IntervalBaseline.PSObject.Properties['StartRateLimits']) { $script:State.IntervalBaseline.StartRateLimits } else { $null }
+        if ($null -eq $startLimits -and $null -ne $script:State.IntervalBaseline.PSObject.Properties['RateLimits']) { $startLimits = $script:State.IntervalBaseline.RateLimits }
+    }
+    $endLimits = if ($null -ne $Result.PSObject.Properties['EndRateLimits']) { $Result.EndRateLimits } else { $null }
+    if ($null -eq $endLimits -and $null -ne $Result.PSObject.Properties['RateLimits']) { $endLimits = $Result.RateLimits }
     $start = if ($null -ne $startLimits -and $null -ne $startLimits.PSObject.Properties['Weekly']) { $startLimits.Weekly } else { $null }
     $end = if ($null -ne $endLimits -and $null -ne $endLimits.PSObject.Properties['Weekly']) { $endLimits.Weekly } else { $null }
     $delta = $null
+    $startPercent = $null
+    $endPercent = $null
+    $sameReset = $false
+    if ($null -ne $start -and $null -ne $end -and
+        $null -ne $start.PSObject.Properties['ResetsAt'] -and $null -ne $end.PSObject.Properties['ResetsAt'] -and
+        $null -ne $start.ResetsAt -and $null -ne $end.ResetsAt -and
+        $null -ne $start.PSObject.Properties['WindowMinutes'] -and $null -ne $end.PSObject.Properties['WindowMinutes']) {
+        try {
+            $startReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$start.WindowMinutes) -ResetsAt $start.ResetsAt
+            $endReset = Get-TokenRaderResetIdentity -WindowMinutes ([int]$end.WindowMinutes) -ResetsAt $end.ResetsAt
+            $sameReset = [int]$start.WindowMinutes -ge 9000 -and [int]$start.WindowMinutes -le 11520 -and [int]$end.WindowMinutes -eq [int]$start.WindowMinutes -and
+                -not [string]::IsNullOrWhiteSpace($startReset) -and $startReset -eq $endReset
+        } catch { }
+    }
     if ($null -ne $start -and $null -ne $end -and
         $null -ne $start.PSObject.Properties['UsedPercent'] -and $null -ne $end.PSObject.Properties['UsedPercent'] -and
         $null -ne $start.UsedPercent -and $null -ne $end.UsedPercent -and
         $null -ne $start.PSObject.Properties['ResetsAt'] -and $null -ne $end.PSObject.Properties['ResetsAt'] -and
         $null -ne $start.ResetsAt -and $null -ne $end.ResetsAt -and
-        [string]$start.ResetsAt -eq [string]$end.ResetsAt -and
-        ($null -eq $start.PSObject.Properties['PlanType'] -or $null -eq $end.PSObject.Properties['PlanType'] -or [string]$start.PlanType -eq [string]$end.PlanType) -and
+        $sameReset -and [string]::Equals($baselineAccount,$currentAccount,[StringComparison]::Ordinal) -and
+        ($null -ne $start.PSObject.Properties['PlanType'] -and $null -ne $end.PSObject.Properties['PlanType'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$start.PlanType) -and [string]$start.PlanType -eq [string]$end.PlanType) -and
         ($null -eq $start.PSObject.Properties['ScopeConflict'] -or -not [bool]$start.ScopeConflict) -and
         ($null -eq $end.PSObject.Properties['ScopeConflict'] -or -not [bool]$end.ScopeConflict) -and
         ($null -eq $start.PSObject.Properties['LimitId'] -or [string]::IsNullOrWhiteSpace([string]$start.LimitId) -or [string]$start.LimitId -ieq 'codex') -and
-        ($null -eq $end.PSObject.Properties['LimitId'] -or [string]::IsNullOrWhiteSpace([string]$end.LimitId) -or [string]$end.LimitId -ieq 'codex')) {
+        ($null -eq $end.PSObject.Properties['LimitId'] -or [string]::IsNullOrWhiteSpace([string]$end.LimitId) -or [string]$end.LimitId -ieq 'codex') -and
+        ($(if ($null -ne $start.PSObject.Properties['LimitId']) { [string]$start.LimitId } else { '' }) -eq
+            $(if ($null -ne $end.PSObject.Properties['LimitId']) { [string]$end.LimitId } else { '' }))) {
         try {
+            if ($start.UsedPercent -is [bool] -or $end.UsedPercent -is [bool] -or
+                [string]::IsNullOrWhiteSpace([string]$start.UsedPercent) -or [string]::IsNullOrWhiteSpace([string]$end.UsedPercent)) { throw 'Invalid percentage' }
             $startPercent = [double]$start.UsedPercent
             $endPercent = [double]$end.UsedPercent
             if (-not [double]::IsNaN($startPercent) -and -not [double]::IsInfinity($startPercent) -and
@@ -2006,8 +2045,10 @@ function Update-TokenRaderWeeklyReferenceFromResult {
         }
     }
     $script:State.WeeklyReferenceEstimate = [pscustomobject]@{
-        TotalUsd = if ($fullStepObserved) { $null } else { $cost * 100.0 }
+        TotalUsd = if ($fullStepObserved -or $null -eq $delta) { $null } else { $cost * 100.0 }
         ActualDeltaPercent = $delta
+        MeasurementStartUsedPercent = if ($null -ne $delta) { $startPercent } else { $null }
+        MeasurementEndUsedPercent = if ($null -ne $delta) { $endPercent } else { $null }
         FullStepObserved = $fullStepObserved
         CycleWindow = $cycleWindow
         PricingIncomplete = -not $pricingComplete

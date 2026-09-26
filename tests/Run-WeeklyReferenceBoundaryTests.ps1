@@ -140,11 +140,9 @@ Update-TokenRaderWeeklyReferenceFromResult -Result $result
 Assert-WeeklyReferenceBoundary (-not [bool]$script:State.WeeklyReferenceEstimate.FullStepObserved -and
     $script:State.WeeklyReferenceEstimate.TotalUsd -eq 5900.0) 'new reset cycle inherited the old full-step marker'
 
-# Unknown deltas keep legacy reference behavior, but malformed/non-finite
-# observations must remain unknown rather than becoming a fabricated delta.
+# Unknown deltas must not masquerade as a sub-1% observation.
 foreach ($invalidPercent in @('malformed', [double]::NaN, [double]::PositiveInfinity, [double]::NegativeInfinity)) {
-    # An unknown initial delta keeps legacy 1% display behavior. Reset the
-    # synthetic measurement so an earlier completed step cannot be inherited.
+    # Reset the measurement so an earlier completed step cannot be inherited.
     $script:State.WeeklyReferenceEstimate = $null
     $endWeek.UsedPercent = $invalidPercent
     Update-TokenRaderWeeklyReferenceFromResult -Result $result
@@ -156,7 +154,7 @@ foreach ($invalidPercent in @('malformed', [double]::NaN, [double]::PositiveInfi
     $displayWindow = $endWeek.PSObject.Copy()
     $displayWindow.UsedPercent = 35.0
     Set-QuotaWindowCard -Window $displayWindow -Estimate $null -WeeklyReference $reference -UsageText $usage -Progress $progress -DollarText $dollar -ResetText $resetText
-    Assert-WeeklyReferenceBoundary ($dollar.Text.Contains((Format-TokenRaderUsd 5900.0))) "unknown-delta compatibility changed for invalid percent '$invalidPercent'"
+    Assert-WeeklyReferenceBoundary ($null -eq $reference.TotalUsd -and -not $dollar.Text.Contains((Format-TokenRaderUsd 5900.0))) "unknown delta fabricated 1% dollars for invalid percent '$invalidPercent'"
 }
 
 Write-Output 'Weekly reference boundary tests passed.'

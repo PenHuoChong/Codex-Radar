@@ -1942,6 +1942,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-QuotaRangeDisplayTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaAvailabilityTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaWindowIsolationTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-WeeklyObservedRangeTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IndexEvidenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-UsageCompatibilityTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-CacheReadAliasTests.ps1')

@@ -255,12 +255,17 @@ Update-TokenRaderWeeklyReferenceFromResult -Result ([pscustomobject]@{TotalCost=
 Assert-UiPricing ([object]::ReferenceEquals($currentReference,$script:State.WeeklyReferenceEstimate)) 'untagged old-baseline result erased current reference'
 $referenceResult.AccountIdentity = 'current-tag'; $referenceResult.TotalCost = 15
 Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
+Assert-UiPricing ($null -eq $script:State.WeeklyReferenceEstimate.TotalUsd) 'current result combined an old-account baseline into a 1% reference'
+$script:State.IntervalBaseline.AccountIdentity = 'current-tag'
+Update-TokenRaderWeeklyReferenceFromResult -Result $referenceResult
 Assert-UiPricing ($script:State.WeeklyReferenceEstimate.TotalUsd -eq 1500) 'valid current result failed to update after rejecting late results'
 # Plan-normalized quota dollars are separate from the unchanged API card.
 $planResult = [pscustomobject]@{
     AccountIdentity='current-tag'; TotalCost=20.0; PricingComplete=$true
     PlanNormalizedTotalCost=25.0; PlanPricingComplete=$true
     QuotaPricingBasis='plan_standard_api_reference'
+    StartRateLimits=[pscustomobject]@{Weekly=$startWeek}
+    EndRateLimits=[pscustomobject]@{Weekly=$endWeek}
 }
 Update-TokenRaderWeeklyReferenceFromResult -Result $planResult
 Assert-UiPricing ($script:State.WeeklyReferenceEstimate.TotalUsd -eq 2500) 'plan reference reused API tier cost instead of plan valuation'
