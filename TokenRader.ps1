@@ -102,6 +102,7 @@ $script:IntervalComputeScript = {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
+    try {
     $prices = Get-TokenRaderPrices -PricingPath $PricingPath
     $prices | Add-Member -NotePropertyName ManualServiceTiers -NotePropertyValue $ManualServiceTiers -Force
     $prices | Add-Member -NotePropertyName QuotaPlanSelection -NotePropertyValue $QuotaPlanSelection -Force
@@ -144,6 +145,7 @@ $script:IntervalComputeScript = {
         Result = $result
         LatestRateLimits = $latest
     }
+    } finally { Close-TokenRaderIndex -KeepWatcher }
 }
 
 # Measurement setup/teardown runs in a dedicated worker and requires the
@@ -158,6 +160,7 @@ $script:MeasurementBaselineScript = {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
+    try {
     $prices = Get-TokenRaderPrices -PricingPath $PricingPath
     [void](Get-Command -Name CaptureMeasurementBaseline -ErrorAction Stop)
     $baseline = CaptureMeasurementBaseline -SessionsRoot $SessionsRoot -PricingDocument $prices -AccountIdentity $AccountIdentity
@@ -175,6 +178,7 @@ $script:MeasurementBaselineScript = {
         Add-Member -InputObject $baseline -NotePropertyName IndexRevision -NotePropertyValue ''
     }
     return $baseline
+    } finally { Close-TokenRaderIndex -KeepWatcher }
 }
 
 $script:MeasurementEndScript = {
@@ -186,6 +190,7 @@ $script:MeasurementEndScript = {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
+    try {
     [void](Get-Command -Name CaptureMeasurementEnd -ErrorAction Stop)
     $ending = CaptureMeasurementEnd -Baseline $Baseline
     if ($null -eq $ending) { throw '未能冻结时间段结束位置。' }
@@ -194,6 +199,7 @@ $script:MeasurementEndScript = {
         Add-Member -InputObject $ending -NotePropertyName EndRevision -NotePropertyValue ([DateTimeOffset]::Now)
     }
     return $ending
+    } finally { Close-TokenRaderIndex -KeepWatcher }
 }
 
 $script:IndexSyncScript = {
@@ -218,6 +224,7 @@ $script:IndexSyncScript = {
             Update-TokenRaderIndex -SessionsRoot $SessionsRoot -ProgressState $ProgressState | Out-Null
         }
         [pscustomobject]@{
+            SchemaInitialized = $true
             IndexRevision = [Int64](GetIndexRevision -SessionsRoot $SessionsRoot)
             LatestRateLimits = Get-TokenRaderIndexedLatestRateLimits -SessionsRoot $SessionsRoot
         }
@@ -425,24 +432,111 @@ function Get-TokenRaderCallbackContextValue {
 function Get-TokenRaderBackgroundErrorMessage {
     param($Worker, $Exception)
     $messages = New-Object System.Collections.Generic.List[string]
+    $pending = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object System.Collections.Generic.List[object]
+    $sawLockTimeout = $false
+    $sawAccessFailure = $false
+    $sawLockContext = $false
+
     if ($null -ne $Worker) {
-        foreach ($record in @($Worker.Streams.Error)) {
-            $candidate = if ($null -ne $record.ErrorDetails -and -not [string]::IsNullOrWhiteSpace([string]$record.ErrorDetails.Message)) {
-                [string]$record.ErrorDetails.Message
-            } elseif ($null -ne $record.Exception) { [string]$record.Exception.Message } else { [string]$record }
-            if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not $messages.Contains($candidate)) { [void]$messages.Add($candidate) }
+        try {
+            foreach ($record in @($Worker.Streams.Error)) {
+                if ($null -ne $record) { [void]$pending.Add($record) }
+            }
+        } catch {
+            # A worker can already be disposed while its completion is being
+            # reported. The exception passed by EndInvoke is still inspected.
         }
     }
-    $current = $Exception
-    while ($null -ne $current) {
-        $candidate = [string]$current.Message
-        if (-not [string]::IsNullOrWhiteSpace($candidate) -and
-            $candidate -notmatch 'EndInvoke' -and -not $messages.Contains($candidate)) {
-            [void]$messages.Add($candidate)
+
+    if ($null -ne $Exception) { [void]$pending.Add($Exception) }
+    $pendingIndex = 0
+    while ($pendingIndex -lt $pending.Count) {
+        $current = $pending[$pendingIndex]
+        $pendingIndex++
+        if ($null -eq $current) { continue }
+
+        $alreadySeen = $false
+        foreach ($seenItem in $seen) {
+            if ([object]::ReferenceEquals($seenItem, $current)) { $alreadySeen = $true; break }
         }
-        $current = $current.InnerException
+        if ($alreadySeen) { continue }
+        [void]$seen.Add($current)
+
+        if ($current -is [System.Management.Automation.ErrorRecord]) {
+            $candidate = $null
+            try {
+                if ($null -ne $current.ErrorDetails -and
+                    -not [string]::IsNullOrWhiteSpace([string]$current.ErrorDetails.Message)) {
+                    $candidate = [string]$current.ErrorDetails.Message
+                }
+            } catch { }
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                if ($candidate -match 'Timed out waiting for the Token Radar index lock') { $sawLockTimeout = $true }
+                if ($candidate -match 'Access.{0,80}denied|Permission.{0,80}denied|拒绝访问|权限不足') { $sawAccessFailure = $true }
+                if ($candidate -match 'Token Radar index lock|索引锁|\.lock\b') { $sawLockContext = $true }
+                if ($candidate -notmatch 'EndInvoke' -and -not $messages.Contains($candidate)) { [void]$messages.Add($candidate) }
+            }
+            try {
+                if ($null -ne $current.Exception) { [void]$pending.Add($current.Exception) }
+            } catch { }
+            continue
+        }
+
+        if ($current -is [System.Exception]) {
+            $candidate = [string]$current.Message
+            if ($current -is [System.TimeoutException] -and
+                $candidate -match 'Timed out waiting for the Token Radar index lock') {
+                $sawLockTimeout = $true
+            }
+            if ($current -is [System.UnauthorizedAccessException] -or
+                $candidate -match 'Access.{0,80}denied|Permission.{0,80}denied|拒绝访问|权限不足') {
+                $sawAccessFailure = $true
+            }
+            if ($candidate -match 'Token Radar index lock|索引锁|\.lock\b') { $sawLockContext = $true }
+            if (-not [string]::IsNullOrWhiteSpace($candidate) -and
+                $candidate -notmatch 'EndInvoke' -and -not $messages.Contains($candidate)) {
+                [void]$messages.Add($candidate)
+            }
+            try {
+                if ($null -ne $current.InnerException) { [void]$pending.Add($current.InnerException) }
+            } catch { }
+            # PowerShell RuntimeException can carry the originating ErrorRecord
+            # separately from InnerException. Inspect it without assuming every
+            # exception type exposes that property.
+            try {
+                $errorRecordProperty = $current.PSObject.Properties['ErrorRecord']
+                if ($null -ne $errorRecordProperty -and
+                    $errorRecordProperty.Value -is [System.Management.Automation.ErrorRecord]) {
+                    [void]$pending.Add($errorRecordProperty.Value)
+                }
+            } catch { }
+            continue
+        }
+
+        # Be tolerant of stream implementations that expose an ErrorRecord-like
+        # object rather than the concrete PowerShell type.
+        try {
+            $recordProperty = $current.PSObject.Properties['ErrorRecord']
+            if ($null -ne $recordProperty -and
+                $recordProperty.Value -is [System.Management.Automation.ErrorRecord]) {
+                [void]$pending.Add($recordProperty.Value)
+            }
+        } catch { }
     }
-    if ($messages.Count -eq 0 -and $null -ne $Exception) { return [string]$Exception.Message }
+
+    if ($sawLockTimeout -and $sawAccessFailure) {
+        return '等待 Token Radar 索引锁时权限被拒绝，无法访问锁文件。'
+    }
+    if ($sawLockContext -and $sawAccessFailure) {
+        return '无法访问 Token Radar 索引锁文件：权限不足。'
+    }
+    if ($sawAccessFailure) {
+        return '后台任务因权限不足，无法访问所需文件或目录。'
+    }
+    if ($sawLockTimeout) {
+        return '等待 Token Radar 索引锁超时；可能有另一个后台任务或程序实例正在使用索引。'
+    }
     if ($messages.Count -eq 0) { return '后台任务失败，但未返回详细错误。' }
     return ($messages -join '；')
 }
@@ -794,6 +888,11 @@ function Complete-TokenRaderIndexSyncJob {
     $startup = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'Startup' -Default $false)
     $script:State.IndexSyncing = $false
     $script:State.IndexSyncRequestId = 0L
+    # The worker has already created/migrated the schema. A UI connection must
+    # not reacquire its writer lock while another background task is running.
+    if ($null -ne $Payload -and $null -ne $Payload.PSObject.Properties['SchemaInitialized'] -and [bool]$Payload.SchemaInitialized) {
+        Open-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot -SchemaReady | Out-Null
+    }
     $script:State.IndexReady = $true
     $script:State.IndexCatalogAvailable = $true
     $script:State.ProjectCache = @{}
@@ -3742,9 +3841,10 @@ function Refresh-Application {
             $sessions = @(Get-TokenRaderIndexedSessionFiles -Days $historyDays -MaximumFiles 200)
             $projects = @(Get-TokenRaderIndexedProjects -Days $historyDays)
         } else {
-            # 索引组件不可用时保留直接读取日志的兼容路径。
-            $sessions = @(Get-TokenRaderSessionFiles -SessionsRoot $script:Paths.SessionsRoot)
-            $projects = @(Get-TokenRaderProjects -SessionsRoot $script:Paths.SessionsRoot)
+            # A lock/open failure must not turn into a recursive raw-log scan
+            # on the dispatcher. Wait for the background index and allow retry.
+            $sessions = @()
+            $projects = @()
         }
         $script:State.Projects = $projects
         $rangeLabel = if ($historyDays -eq 0) { '全部历史' } else { '最近 {0} 天' -f $historyDays }
@@ -3778,9 +3878,9 @@ function Refresh-Application {
             $script:UpdatedText.Text = '等待选择'
             Set-EmptyMetrics
         } else {
-            $script:SelectedSessionText.Text = '未找到 Codex 会话日志'
+            $script:SelectedSessionText.Text = if ($null -eq $index) { '等待后台索引，可稍后重试刷新' } else { '未找到 Codex 会话日志' }
             $script:UpdatedText.Text = [string]$script:Paths.SessionsRoot
-            Set-EmptyMetrics -Message '请确认 Codex 已生成本地日志'
+            Set-EmptyMetrics -Message $(if ($null -eq $index) { '索引尚未就绪；不会在界面线程扫描原始日志' } else { '请确认 Codex 已生成本地日志' })
         }
     } finally {
         $script:State.Refreshing = $false
@@ -3928,12 +4028,8 @@ $script:Window.Add_Closing({
 Set-PricingTable
 # 索引保存在项目 data/private 下。先立即显示已有结果，再在窗口出现后
 # 后台核对一次目录；此后刷新只消费文件变化队列。
-try {
-    $openedIndex = Open-TokenRaderIndex -SessionsRoot $script:Paths.SessionsRoot
-    if ($null -ne $openedIndex) {
-        $script:State.IndexCatalogAvailable = ([bool]$openedIndex.CatalogInitialized -and -not [bool]$openedIndex.IsNew)
-    }
-} catch { }
+# Opening/migrating SQLite may wait for another writer. It belongs entirely to
+# IndexSyncScript, after ShowDialog has made the dispatcher available.
 Refresh-Application
 $script:StartupIndexSyncScheduled = $false
 $script:Window.Add_ContentRendered({

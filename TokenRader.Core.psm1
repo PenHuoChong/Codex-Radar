@@ -3574,7 +3574,12 @@ function Close-TokenRaderIndex {
 }
 
 function Open-TokenRaderIndex {
-    param([Parameter(Mandatory = $true)][string]$SessionsRoot)
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        # Only used by the UI after a worker has successfully initialized this
+        # database. Never perform schema writes or wait for the writer on WPF.
+        [switch]$SchemaReady
+    )
 
     if (-not (Initialize-TokenRaderIndexer)) {
         throw 'C# Indexer DLL 不可用，请先运行 Build.ps1'
@@ -3589,20 +3594,25 @@ function Open-TokenRaderIndex {
 
     $dbPath = Get-TokenRaderIndexerDbPath
     $wasPresent = Test-Path -LiteralPath $dbPath
-    $schemaLock = [TokenRaderIndexer]::AcquireFileLock(($dbPath + '.lock'), 10000)
+    if ($SchemaReady -and -not $wasPresent) { throw '后台初始化的索引已不可用，请重新刷新。' }
+    $schemaLock = $null
     $conn = $null
     try {
-        $conn = New-Object System.Data.SQLite.SQLiteConnection ('Data Source=' + $dbPath + ';Version=3;Default Timeout=30;')
+        if (-not $SchemaReady) { $schemaLock = [TokenRaderIndexer]::AcquireFileLock(($dbPath + '.lock'), 10000) }
+        $connectionTimeout = if ($SchemaReady) { 0 } else { 30 }
+        $conn = New-Object System.Data.SQLite.SQLiteConnection ('Data Source=' + $dbPath + ';Version=3;Default Timeout=' + $connectionTimeout + ';')
         $conn.Open()
         $pragma = $conn.CreateCommand()
         try {
             # WAL lets readers retain a stable snapshot while another Radar
             # process commits an index batch; busy_timeout handles brief SQLite
             # lock hand-offs that occur before the explicit writer lock is held.
-            $pragma.CommandText = 'PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;'
+            $pragma.CommandText = if ($SchemaReady) { 'PRAGMA busy_timeout=0;' } else {
+                'PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;'
+            }
             [void]$pragma.ExecuteNonQuery()
         } finally { $pragma.Dispose() }
-        [TokenRaderIndexer]::CreateSchema($conn)
+        if (-not $SchemaReady) { [TokenRaderIndexer]::CreateSchema($conn) }
     } catch {
         if ($null -ne $conn) {
             try { $conn.Close(); $conn.Dispose() } catch { }
@@ -3613,7 +3623,6 @@ function Open-TokenRaderIndex {
         if ($null -ne $schemaLock) { $schemaLock.Dispose() }
     }
     try { [TokenRaderIndexer]::StartWatcher($canonicalRoot) } catch { }
-    $metadata = [TokenRaderIndexer]::GetFileMetadata($conn)
     $catalogInitialized = [string][TokenRaderIndexer]::GetSetting($conn, 'catalog_initialized') -eq '1'
     $indexedRoot = [string][TokenRaderIndexer]::GetSetting($conn, 'sessions_root')
     $rootMatches = -not [string]::IsNullOrWhiteSpace($indexedRoot) -and
@@ -3628,7 +3637,7 @@ function Open-TokenRaderIndex {
         CatalogInitialized = ($catalogInitialized -and $rootMatches)
         IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($conn)
         ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision($canonicalRoot)
-        IndexedFileCount = [int]$metadata.Rows.Count
+        IndexedFileCount = [int][TokenRaderIndexer]::GetFileCursorCount($conn)
         LastImportedFiles = 0
         LastImportedRecords = 0
         LastFailedFiles = @()
@@ -4051,7 +4060,7 @@ function New-TokenRaderIndex {
     }
     $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
     $result = Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile
-    $modelBackfill = [TokenRaderIndexer]::BackfillMissingTokenModels($result.Connection)
+    $modelBackfill = Complete-TokenRaderPendingModelBackfill -Index $result
     $result.IndexRevision = [Int64]$modelBackfill.IndexRevision
     if (-not [bool]$modelBackfill.Completed) {
         $result.SyncComplete = $false
@@ -4062,6 +4071,30 @@ function New-TokenRaderIndex {
         throw ('索引构建有 {0} 个日志暂时无法读取；已保留待重试路径，未将不完整索引视为成功。' -f @($result.LastFailedFiles).Count)
     }
     return $result
+}
+
+function Complete-TokenRaderPendingModelBackfill {
+    param([Parameter(Mandatory = $true)]$Index)
+    # Once complete, normal appends must not recount missing models across the
+    # entire token table. Relationship changes already invalidate this marker.
+    $conn = $Index.Connection
+    if ([string][TokenRaderIndexer]::GetSetting($conn, 'missing_model_backfill_version') -eq '1') {
+        return [pscustomobject]@{
+            Completed = $true
+            IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($conn)
+        }
+    }
+    $lease = [TokenRaderIndexer]::AcquireFileLock(([string]$Index.DbPath + '.lock'), 10000)
+    try {
+        # Another worker may have completed it while we waited.
+        if ([string][TokenRaderIndexer]::GetSetting($conn, 'missing_model_backfill_version') -eq '1') {
+            return [pscustomobject]@{
+                Completed = $true
+                IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($conn)
+            }
+        }
+        return [TokenRaderIndexer]::BackfillMissingTokenModels($conn)
+    } finally { $lease.Dispose() }
 }
 
 <#
@@ -4110,7 +4143,7 @@ function Update-TokenRaderIndex {
             $index
         }
     }
-    $modelBackfill = [TokenRaderIndexer]::BackfillMissingTokenModels($result.Connection)
+    $modelBackfill = Complete-TokenRaderPendingModelBackfill -Index $result
     $result.IndexRevision = [Int64]$modelBackfill.IndexRevision
     if (-not [bool]$modelBackfill.Completed) {
         $result.SyncComplete = $false
@@ -5573,13 +5606,22 @@ function Get-TokenRaderUsageHistoryWindow {
         -SessionsRoot $SessionsRoot `
         -ProgressState $ProgressState `
         -TimeoutSeconds 25
-    $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+    $crossProcessLock = $null
+    $readSnapshot = $null
     try {
-        $revision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
         if ($PurgeExpired) {
-            $cutoffTicks = [Int64][DateTimeOffset]::Now.AddDays(-7).UtcDateTime.Ticks
-            [void][TokenRaderIndexer]::PurgeUsageHistory($index.Connection, $cutoffTicks)
+            $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+            try {
+                $cutoffTicks = [Int64][DateTimeOffset]::Now.AddDays(-7).UtcDateTime.Ticks
+                [void][TokenRaderIndexer]::PurgeUsageHistory($index.Connection, $cutoffTicks)
+            } finally { $crossProcessLock.Dispose(); $crossProcessLock = $null }
         }
+        # Deferred read transaction preserves one revision across tokens and
+        # tools. WAL permits concurrent measurement writes; never hold the
+        # cross-process writer lock during aggregation or PowerShell pricing.
+        $CancellationToken.ThrowIfCancellationRequested()
+        $readSnapshot = $index.Connection.BeginTransaction([Data.IsolationLevel]::Serializable, $true)
+        $revision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
         if (-not $ForceRefresh) {
             $cached = [TokenRaderIndexer]::GetUsageHistorySnapshot(
                 $index.Connection, $startTicks, $endTicks, $revision, $pricingKey)
@@ -5760,10 +5802,24 @@ function Get-TokenRaderUsageHistoryWindow {
             $modelSnapshot
         }
         $snapshot.ModelBreakdown = [TokenRaderUsageHistoryModelSnapshot[]]@($modelSnapshots)
-        [TokenRaderIndexer]::SaveUsageHistorySnapshot($index.Connection, $snapshot)
         $freshResult = ConvertFrom-TokenRaderUsageHistorySnapshot -Snapshot $snapshot -FromCache $false
-        return Add-TokenRaderToolUsageToHistoryResult -Result $freshResult -Connection $index.Connection
+        $freshResult = Add-TokenRaderToolUsageToHistoryResult -Result $freshResult -Connection $index.Connection
+        $readSnapshot.Commit()
+        $readSnapshot.Dispose()
+        $readSnapshot = $null
+        $CancellationToken.ThrowIfCancellationRequested()
+        # Persisting a derived cache is optional. A busy writer must not make
+        # a successfully computed history result fail or delay Start.
+        try { $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 0) }
+        catch { $crossProcessLock = $null }
+        if ($null -ne $crossProcessLock) {
+            if ([Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection) -eq $revision) {
+                [TokenRaderIndexer]::SaveUsageHistorySnapshot($index.Connection, $snapshot)
+            }
+        }
+        return $freshResult
     } finally {
+        if ($null -ne $readSnapshot) { $readSnapshot.Dispose() }
         if ($null -ne $crossProcessLock) { $crossProcessLock.Dispose() }
     }
 }
