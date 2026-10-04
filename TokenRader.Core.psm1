@@ -407,7 +407,17 @@ function Get-TokenRaderSessionMetadata {
             [System.IO.FileAccess]::Read,
             ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
         )
-        $reader = New-Object System.IO.StreamReader($stream, [Text.Encoding]::UTF8, $true, 65536)
+        # Session metadata is at the head. Bound the sample before ReadLine:
+        # a single enormous dialogue line must not allocate its full body.
+        $sample = New-Object byte[] ([int][Math]::Min(262144L, $stream.Length))
+        $sampleCount = 0
+        while ($sampleCount -lt $sample.Length) {
+            $read = $stream.Read($sample, $sampleCount, $sample.Length - $sampleCount)
+            if ($read -le 0) { break }
+            $sampleCount += $read
+        }
+        $sampleStream = [IO.MemoryStream]::new($sample, 0, $sampleCount, $false)
+        $reader = New-Object System.IO.StreamReader($sampleStream, [Text.Encoding]::UTF8, $true, 65536)
         for ($i = 0; $i -lt 64 -and -not $reader.EndOfStream; $i++) {
             $line = $reader.ReadLine()
             if ($line.IndexOf('session_meta', [System.StringComparison]::Ordinal) -lt 0) { continue }
@@ -434,7 +444,7 @@ function Get-TokenRaderSessionMetadata {
         return $fallback
     } finally {
         if ($null -ne $reader) { $reader.Dispose() }
-        elseif ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
     }
     return $fallback
 }
@@ -3296,7 +3306,7 @@ function Get-TokenRaderProjectResult {
             $indexedResult | Add-Member -NotePropertyName ProjectPath -NotePropertyValue ([string]$Project.ProjectPath)
             $indexedResult | Add-Member -NotePropertyName ProjectName -NotePropertyValue ([string]$Project.ProjectName)
             $indexedResult | Add-Member -NotePropertyName ProjectSessionCount -NotePropertyValue $filePaths.Count
-            return $indexedResult
+            return Add-TokenRaderHistoryCoverage -Result $indexedResult -Connection $index.Connection
         }
     }
     $baseline = [pscustomobject]@{
@@ -3669,7 +3679,8 @@ function Get-TokenRaderIndexRetentionCutoff {
 }
 
 function Get-TokenRaderCompleteJsonlOffset {
-    param([Parameter(Mandatory = $true)][string]$FilePath)
+    param([Parameter(Mandatory = $true)][string]$FilePath, [long]$MinimumOffset = 0,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None)
 
     $stream = $null
     try {
@@ -3681,10 +3692,13 @@ function Get-TokenRaderCompleteJsonlOffset {
         )
         $length = [Int64]$stream.Length
         if ($length -le 0) { return 0L }
+        if ($MinimumOffset -gt $length) { $MinimumOffset = 0L }
+        $floor = [Math]::Max($MinimumOffset, $length - 1048576L)
         $bufferSize = 65536
         $end = $length
-        while ($end -gt 0) {
-            $start = [Math]::Max([Int64]0, $end - $bufferSize)
+        while ($end -gt $floor) {
+            $CancellationToken.ThrowIfCancellationRequested()
+            $start = [Math]::Max($floor, $end - $bufferSize)
             $count = [int]($end - $start)
             $buffer = New-Object byte[] $count
             [void]$stream.Seek($start, [IO.SeekOrigin]::Begin)
@@ -3694,7 +3708,9 @@ function Get-TokenRaderCompleteJsonlOffset {
             }
             $end = $start
         }
-        return 0L
+        # No new complete line in a bounded tail. Keep the previous cursor;
+        # wait for the writer to finish instead of scanning gigabytes backward.
+        return $MinimumOffset
     } finally {
         if ($null -ne $stream) { $stream.Dispose() }
     }
@@ -3706,7 +3722,8 @@ function Sync-TokenRaderIndexFiles {
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
         [AllowNull()][string[]]$CandidateFiles,
         [switch]$FullReconcile,
-        [hashtable]$ProgressState
+        [hashtable]$ProgressState,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
     )
 
     $crossProcessLock = $null
@@ -3757,6 +3774,7 @@ function Sync-TokenRaderIndexFiles {
     $workItems = New-Object System.Collections.ArrayList
     $catalogProcessed = 0
     foreach ($file in $files) {
+        $CancellationToken.ThrowIfCancellationRequested()
         $catalogProcessed++
         if ($null -ne $ProgressState -and ($catalogProcessed -eq 1 -or $catalogProcessed % 25 -eq 0)) {
             $ProgressState.ProcessedFiles = $catalogProcessed
@@ -3870,6 +3888,7 @@ function Sync-TokenRaderIndexFiles {
     if ($rootBackfilledRows -gt 0) { $changed = $true }
     $workProcessed = 0
     foreach ($work in @($workItems)) {
+        $CancellationToken.ThrowIfCancellationRequested()
         $workProcessed++
         if ($null -ne $ProgressState) {
             $ProgressState.ProcessedFiles = $workProcessed
@@ -3891,7 +3910,7 @@ function Sync-TokenRaderIndexFiles {
         if ($null -eq $knownRow -and $retentionCutoff -gt 0 -and $lastWrite -lt $retentionCutoff) { $catalogOnly = $true }
 
         try {
-            $completeOffset = Get-TokenRaderCompleteJsonlOffset -FilePath $canonical
+            $completeOffset = Get-TokenRaderCompleteJsonlOffset -FilePath $canonical -MinimumOffset $startOffset -CancellationToken $CancellationToken
             if ($catalogOnly) {
                 # Preserve only enough information to detect a later append.
                 # This direct parameterized update intentionally keeps
@@ -3920,6 +3939,14 @@ function Sync-TokenRaderIndexFiles {
                 ($lastWrite -ne [Int64]$knownRow['last_write_ticks'] -and $length -le [Int64]$knownRow['length'])
             )
             if ($requiresReplacement) {
+                $replacementCheck = $conn.CreateCommand()
+                try {
+                    $replacementCheck.CommandText = "SELECT COUNT(*) FROM history_gaps WHERE path=@path AND blocked_reason='source_replaced'"
+                    [void]$replacementCheck.Parameters.AddWithValue('@path', $canonical)
+                    if ([long]$replacementCheck.ExecuteScalar() -gt 0) {
+                        throw '源日志已被替换，已保留旧索引记录；不能将不同来源内容混合导入。'
+                    }
+                } finally { $replacementCheck.Dispose() }
                 if ([string]::IsNullOrWhiteSpace($knownSessionId)) { $knownSessionId = [string]$metadata.SessionId }
                 [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $knownSessionId)
                 [void][TokenRaderIndexer]::DeleteToolRecordsBySourcePath($conn, $canonical)
@@ -3931,17 +3958,20 @@ function Sync-TokenRaderIndexFiles {
                     [string]$metadata.ParentThreadId
                 } else { [string]$metadata.ForkedFromId }
                 [TokenRaderIndexer]::ImportFile($conn, $canonical, $startOffset, $completeOffset,
-                    [string]$rootSessionId, $directParentId, $nextRevision)
+                    [string]$rootSessionId, $directParentId, $nextRevision, $ProgressState, $CancellationToken)
             } else { 0 }
-            $fresh = Get-Item -LiteralPath $canonical -ErrorAction Stop
+            # Keep the catalog observation that selected this import. Recording
+            # a later EOF here can falsely mark bytes appended during parsing
+            # as already synchronized while parsed_offset still precedes them.
             [TokenRaderIndexer]::UpdateFileMetadata(
-                $conn, $canonical, [Int64]$fresh.Length, [Int64]$fresh.LastWriteTimeUtc.Ticks,
+                $conn, $canonical, $length, $lastWrite,
                 [Int64]$completeOffset, [string]$metadata.SessionId, [string]$metadata.Cwd,
                 [string]$metadata.ParentThreadId, [string]$metadata.ForkedFromId, [string]$rootSessionId)
             $importedFiles++
             $importedRecords += [int]$count
             $changed = $true
         } catch {
+            $CancellationToken.ThrowIfCancellationRequested()
             # The watcher notification was already drained before this import.
             # Put the path back so a transient lock or replacement can never
             # silently disappear from the next synchronization attempt.
@@ -4073,11 +4103,94 @@ function New-TokenRaderIndex {
     return $result
 }
 
+function Get-TokenRaderHistoryCoverage {
+    param([Parameter(Mandatory = $true)]$Connection)
+    $enabled = [string][TokenRaderIndexer]::GetSetting($Connection, 'fast_start_mode') -eq '1'
+    $status = if ($enabled) { [TokenRaderIndexer]::GetHistoryBackfillStatus($Connection) } else { $null }
+    $start = $null
+    $rawStart = [string][TokenRaderIndexer]::GetSetting($Connection, 'history_coverage_start')
+    $parsedStart = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($rawStart, [ref]$parsedStart)) { $start = $parsedStart }
+    [pscustomobject]@{
+        HistoryComplete = $null -eq $status -or [bool]$status.Completed
+        CoverageStart = $start
+        RemainingFiles = if ($null -eq $status) { 0 } else { [int]$status.RemainingFiles }
+        RemainingBytes = if ($null -eq $status) { 0L } else { [long]$status.RemainingBytes }
+    }
+}
+
+function Add-TokenRaderHistoryCoverage {
+    param([Parameter(Mandatory = $true)]$Result, [Parameter(Mandatory = $true)]$Connection)
+    $coverage = Get-TokenRaderHistoryCoverage -Connection $Connection
+    $Result | Add-Member -NotePropertyName HistoryComplete -NotePropertyValue ([bool]$coverage.HistoryComplete) -Force
+    $Result | Add-Member -NotePropertyName CoverageStart -NotePropertyValue $coverage.CoverageStart -Force
+    $Result | Add-Member -NotePropertyName HistoryRemainingFiles -NotePropertyValue ([int]$coverage.RemainingFiles) -Force
+    $Result | Add-Member -NotePropertyName HistoryRemainingBytes -NotePropertyValue ([long]$coverage.RemainingBytes) -Force
+    return $Result
+}
+
+function Initialize-TokenRaderIndexFromNow {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [hashtable]$ProgressState,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
+    )
+    $CancellationToken.ThrowIfCancellationRequested()
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    $lease = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+    try {
+        $result = [TokenRaderIndexer]::InitializeFromNow($index.Connection, $SessionsRoot, $ProgressState, $CancellationToken)
+        $index.IsNew = $false
+        $index.CatalogInitialized = $true
+        $index.IndexRevision = [long]$result.IndexRevision
+        $index.ChangeRevision = [long][TokenRaderIndexer]::GetChangeRevision($SessionsRoot)
+        $index.LastSync = [DateTimeOffset]::Now
+        $index.LastFullReconcile = $index.LastSync
+        $index.IndexedFileCount = [int][TokenRaderIndexer]::GetFileCursorCount($index.Connection)
+        $index.LastImportedFiles = 0
+        $index.LastImportedRecords = 0
+        $index.LastFailedFiles = @()
+        $index.LastFailureMessages = @()
+        $index.SyncComplete = $true
+        return Add-TokenRaderHistoryCoverage -Result $index -Connection $index.Connection
+    } finally { $lease.Dispose() }
+}
+
+function Invoke-TokenRaderHistoryBackfillBatch {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [ValidateRange(65536, 67108864)][long]$MaxBytes = 8388608,
+        [ValidateRange(50, 10000)][int]$MaxMilliseconds = 2000,
+        [switch]$RetryBlocked,
+        [hashtable]$ProgressState,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
+    )
+    $CancellationToken.ThrowIfCancellationRequested()
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    $lease = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+    try {
+        if ($RetryBlocked) {
+            # Retry transient file access failures only on an explicit new
+            # user action, never reset source-replacement/oversized protections.
+            [void][TokenRaderIndexer]::ResetHistoryBackfillRetries($index.Connection)
+        }
+        $result = [TokenRaderIndexer]::BackfillHistoryBatch($index.Connection, $MaxBytes, $MaxMilliseconds, $ProgressState, $CancellationToken)
+        $index.IndexRevision = [long]$result.IndexRevision
+        return $result
+    } finally { $lease.Dispose() }
+}
+
 function Complete-TokenRaderPendingModelBackfill {
     param([Parameter(Mandatory = $true)]$Index)
     # Once complete, normal appends must not recount missing models across the
     # entire token table. Relationship changes already invalidate this marker.
     $conn = $Index.Connection
+    # A fast-start catalog deliberately contains historical gaps. Do not
+    # silently turn an ordinary refresh into a whole-history model scan.
+    # Newly appended records still resolve models during incremental import.
+    if ([string][TokenRaderIndexer]::GetSetting($conn, 'fast_start_mode') -eq '1') {
+        return [pscustomobject]@{ Completed = $true; Deferred = $true; IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($conn) }
+    }
     if ([string][TokenRaderIndexer]::GetSetting($conn, 'missing_model_backfill_version') -eq '1') {
         return [pscustomobject]@{
             Completed = $true
@@ -4107,7 +4220,8 @@ function Update-TokenRaderIndex {
         [AllowNull()][string[]]$CandidateFiles,
         [switch]$FullReconcile,
         [switch]$AllowIncomplete,
-        [hashtable]$ProgressState
+        [hashtable]$ProgressState,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
     )
 
     $index = $script:TokenRaderIndex
@@ -4117,14 +4231,14 @@ function Update-TokenRaderIndex {
     $watcherWasActive = [TokenRaderIndexer]::IsWatcherActive($SessionsRoot)
     if (-not $watcherWasActive) { [TokenRaderIndexer]::StartWatcher($SessionsRoot) }
     $result = if ($PSBoundParameters.ContainsKey('CandidateFiles')) {
-        Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $CandidateFiles -ProgressState $ProgressState
+        Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $CandidateFiles -ProgressState $ProgressState -CancellationToken $CancellationToken
     } elseif ($FullReconcile -or [bool]$index.IsNew -or (-not $watcherWasActive -and (Test-Path -LiteralPath $SessionsRoot)) -or
         [TokenRaderIndexer]::ConsumeWatcherOverflow($SessionsRoot)) {
-        Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile -ProgressState $ProgressState
+        Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -FullReconcile -ProgressState $ProgressState -CancellationToken $CancellationToken
     } else {
         $changedPaths = @([TokenRaderIndexer]::DrainChangedPaths($SessionsRoot))
         if ($changedPaths.Count -gt 0) {
-            Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $changedPaths -ProgressState $ProgressState
+            Sync-TokenRaderIndexFiles -Index $index -SessionsRoot $SessionsRoot -CandidateFiles $changedPaths -ProgressState $ProgressState -CancellationToken $CancellationToken
         } else {
             $index.IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
             $index.ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot)
@@ -4587,7 +4701,8 @@ function Sync-TokenRaderMeasurementBoundary {
     param(
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
         [hashtable]$ProgressState = $null,
-        [ValidateRange(1, 120)][int]$TimeoutSeconds = 25
+        [ValidateRange(1, 120)][int]$TimeoutSeconds = 25,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
     )
 
     $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
@@ -4598,6 +4713,7 @@ function Sync-TokenRaderMeasurementBoundary {
     $totalRootBackfills = 0
     $lastSyncError = ''
     do {
+        $CancellationToken.ThrowIfCancellationRequested()
         $attempt++
         if ($null -ne $ProgressState) {
             $ProgressState.Stage = '核对全部日志边界'
@@ -4627,13 +4743,14 @@ function Sync-TokenRaderMeasurementBoundary {
         }
         try {
             $index = if ($indexWasNew) {
-                Update-TokenRaderIndex -SessionsRoot $SessionsRoot -FullReconcile -AllowIncomplete -ProgressState $ProgressState
+                Update-TokenRaderIndex -SessionsRoot $SessionsRoot -FullReconcile -AllowIncomplete -ProgressState $ProgressState -CancellationToken $CancellationToken
             } elseif ($changedFiles.Count -gt 0) {
-                Update-TokenRaderIndex -SessionsRoot $SessionsRoot -CandidateFiles $changedFiles -AllowIncomplete -ProgressState $ProgressState
+                Update-TokenRaderIndex -SessionsRoot $SessionsRoot -CandidateFiles $changedFiles -AllowIncomplete -ProgressState $ProgressState -CancellationToken $CancellationToken
             } else {
-                Update-TokenRaderIndex -SessionsRoot $SessionsRoot -AllowIncomplete -ProgressState $ProgressState
+                Update-TokenRaderIndex -SessionsRoot $SessionsRoot -AllowIncomplete -ProgressState $ProgressState -CancellationToken $CancellationToken
             }
         } catch {
+            $CancellationToken.ThrowIfCancellationRequested()
             # A competing Radar process, file replacement, or brief SQLite
             # hand-off can fail before a per-file incomplete result exists.
             # Sync-TokenRaderIndexFiles has already requeued the candidates;
@@ -4696,12 +4813,14 @@ function CaptureMeasurementBaseline {
     param(
         [Parameter(Mandatory = $true)][string]$SessionsRoot,
         $PricingDocument = $null,
-        [string]$AccountIdentity = ''
+        [string]$AccountIdentity = '',
+        [hashtable]$ProgressState,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
     )
     $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
     $gate = [TokenRaderIndexer]::AcquireIndexGate($SessionsRoot)
     try {
-        $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $SessionsRoot
+        $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $SessionsRoot -ProgressState $ProgressState -CancellationToken $CancellationToken
         $startOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
         $startRateLimits = Get-TokenRaderIndexedRateLimitsAtOffsets -Connection $index.Connection -EndOffsets $startOffsets
         $files = foreach ($path in @($startOffsets.Keys)) {
@@ -4738,13 +4857,14 @@ function CaptureMeasurementEnd {
     param(
         [Parameter(Mandatory = $true)]$Baseline,
         [switch]$IncludeRateLimits,
-        [hashtable]$ProgressState
+        [hashtable]$ProgressState,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
     )
     $sessionsRoot = [string]$Baseline.SessionsRoot
     $index = Open-TokenRaderIndex -SessionsRoot $sessionsRoot
     $gate = [TokenRaderIndexer]::AcquireIndexGate($sessionsRoot)
     try {
-        $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $sessionsRoot -ProgressState $ProgressState
+        $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $sessionsRoot -ProgressState $ProgressState -CancellationToken $CancellationToken
         $endOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
         # The UI only needs immutable offsets/revision to finish Stopping.
         # Quota lookup is intentionally deferred to interval settlement, where
@@ -5036,6 +5156,8 @@ function Get-TokenRaderQuotaWindowEvidence {
     }
     $baselineAt = [DateTimeOffset]::MinValue
     $baselinePercent = [double]::NaN
+    $historyCoverage = Get-TokenRaderHistoryCoverage -Connection $Connection
+    $coverageNotBefore = if (-not $historyCoverage.HistoryComplete) { $historyCoverage.CoverageStart } else { $null }
     if ($null -ne $StartWindow -and $null -ne $StartWindow.ObservedAt -and
         $null -ne $StartWindow.ResetsAt -and
         [int]$StartWindow.WindowMinutes -eq [int]$EndWindow.WindowMinutes -and
@@ -5049,6 +5171,10 @@ function Get-TokenRaderQuotaWindowEvidence {
         $baselineAt = [DateTimeOffset]$QuotaNotBefore
         $baselinePercent = [double]::NaN
     }
+    if ($null -ne $coverageNotBefore -and $baselineAt -lt [DateTimeOffset]$coverageNotBefore) {
+        $baselineAt = [DateTimeOffset]$coverageNotBefore
+        $baselinePercent = [double]::NaN
+    }
     $selection = [TokenRaderIndexer]::QueryQuotaMeasurementCalibrationPairWithDiagnostics(
         $Connection, $EndOffsets, $WindowKind, [int]$EndWindow.WindowMinutes,
         ([DateTimeOffset]$EndWindow.ResetsAt).ToUniversalTime().ToUnixTimeSeconds(),
@@ -5058,6 +5184,10 @@ function Get-TokenRaderQuotaWindowEvidence {
     if ($null -eq $historyRows -or $historyRows.Rows.Count -ne 2) {
         $code=[string]$selection.ReasonCode
         $message=if ($code -eq 'stale_snapshot') { '当前快照百分比低于本周期已观察值，等待有效快照' } else { '当前周期缺少两个可用快照组成的完整百分比步长' }
+        if (-not $historyCoverage.HistoryComplete -and $code -ne 'stale_snapshot') {
+            $code = 'history_gap'
+            $message = '历史日志尚未补齐；等待启动后的完整校准步长或手动补齐历史日志'
+        }
         Set-TokenRaderQuotaDiagnostic $DiagnosticState $code $message
         return $null
     }
@@ -5078,6 +5208,10 @@ function Get-TokenRaderQuotaWindowEvidence {
 
     [DateTimeOffset]$startObservedAt = [DateTimeOffset]$calibrationStart.ObservedAt
     [DateTimeOffset]$endObservedAt = [DateTimeOffset]$calibrationEnd.ObservedAt
+    if (-not $historyCoverage.HistoryComplete -and ($null -eq $coverageNotBefore -or $startObservedAt -lt [DateTimeOffset]$coverageNotBefore)) {
+        Set-TokenRaderQuotaDiagnostic $DiagnosticState 'history_gap' '校准区间历史日志尚未补齐；等待新完整步长或手动补齐历史日志'
+        return $null
+    }
     if ($null -ne $QuotaNotBefore -and $startObservedAt -lt [DateTimeOffset]$QuotaNotBefore) {
         Set-TokenRaderQuotaDiagnostic $DiagnosticState 'account_boundary' '账号标签切换后尚未形成完整校准步长'
         return $null
@@ -5282,7 +5416,7 @@ function Get-TokenRaderIndexedIntervalResult {
     if ([string]::IsNullOrWhiteSpace($SessionsRoot)) { $SessionsRoot = [string]$Baseline.SessionsRoot }
     $ending = $null
     if ($null -eq $EndOffsets) {
-        $ending = CaptureMeasurementEnd -Baseline $Baseline -ProgressState $ProgressState
+        $ending = CaptureMeasurementEnd -Baseline $Baseline -ProgressState $ProgressState -CancellationToken $CancellationToken
         $EndOffsets = $ending.EndOffsets
         $EndRevision = $ending.EndRevision
     }
@@ -5605,6 +5739,7 @@ function Get-TokenRaderUsageHistoryWindow {
     $index = Sync-TokenRaderMeasurementBoundary `
         -SessionsRoot $SessionsRoot `
         -ProgressState $ProgressState `
+        -CancellationToken $CancellationToken `
         -TimeoutSeconds 25
     $crossProcessLock = $null
     $readSnapshot = $null
@@ -5627,7 +5762,8 @@ function Get-TokenRaderUsageHistoryWindow {
                 $index.Connection, $startTicks, $endTicks, $revision, $pricingKey)
             if ($null -ne $cached) {
                 $cachedResult = ConvertFrom-TokenRaderUsageHistorySnapshot -Snapshot $cached -FromCache $true
-                return Add-TokenRaderToolUsageToHistoryResult -Result $cachedResult -Connection $index.Connection
+                $cachedResult = Add-TokenRaderToolUsageToHistoryResult -Result $cachedResult -Connection $index.Connection
+                return Add-TokenRaderHistoryCoverage -Result $cachedResult -Connection $index.Connection
             }
         }
 
@@ -5817,7 +5953,7 @@ function Get-TokenRaderUsageHistoryWindow {
                 [TokenRaderIndexer]::SaveUsageHistorySnapshot($index.Connection, $snapshot)
             }
         }
-        return $freshResult
+        return Add-TokenRaderHistoryCoverage -Result $freshResult -Connection $index.Connection
     } finally {
         if ($null -ne $readSnapshot) { $readSnapshot.Dispose() }
         if ($null -ne $crossProcessLock) { $crossProcessLock.Dispose() }
@@ -5844,7 +5980,7 @@ function Invoke-TokenRaderToolBackfill {
         [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None,
         [hashtable]$ProgressState = $null
     )
-    $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $SessionsRoot -ProgressState $ProgressState -TimeoutSeconds 25
+    $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $SessionsRoot -ProgressState $ProgressState -TimeoutSeconds 25 -CancellationToken $CancellationToken
     $crossProcessLock = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
     try {
         $currentVersion = [string][TokenRaderIndexer]::GetSetting($index.Connection, 'tool_metadata_backfill_version')
@@ -5899,4 +6035,5 @@ function Remove-TokenRaderUsageHistory {
 
 Export-ModuleMember -Function ConvertTo-TokenRaderServiceTier, Resolve-TokenRaderServiceTierPrice
 Export-ModuleMember -Function Get-TokenRaderPlanNormalizedCost
+Export-ModuleMember -Function Initialize-TokenRaderIndexFromNow, Invoke-TokenRaderHistoryBackfillBatch, Get-TokenRaderHistoryCoverage
 Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderResetIdentity, Select-TokenRaderQuotaPlan, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision, Get-TokenRaderUsageHistoryWindow, Remove-TokenRaderUsageHistory, Get-TokenRaderToolBackfillStatus, Invoke-TokenRaderToolBackfill

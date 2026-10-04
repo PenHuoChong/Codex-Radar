@@ -353,6 +353,20 @@ public sealed class TokenRaderModelBackfillResult
     }
 }
 
+/// <summary>Compact, body-free progress for explicit historical indexing.</summary>
+public sealed class TokenRaderHistoryBackfillResult
+{
+    public bool Completed { get; set; }
+    public int RemainingFiles { get; set; }
+    public long RemainingBytes { get; set; }
+    public long ProcessedBytes { get; set; }
+    public long ImportedRecords { get; set; }
+    public long IndexRevision { get; set; }
+    public int BlockedFiles { get; set; }
+    public int AttemptedFiles { get; set; }
+    public int EligibleFiles { get; set; }
+}
+
 /// <summary>
 /// 磁盘 SQLite 索引引擎。将 Codex 会话日志（JSONL）中的 token 记录解析后
 /// 写入项目 data/private/index/index.db，后续所有查询走 SQL，
@@ -939,6 +953,13 @@ public static class TokenRaderIndexer
             EnsureFileMetadataColumn(db, "turn_context_model_source", "TEXT NOT NULL DEFAULT ''");
             EnsureFileMetadataColumn(db, "turn_context_model_timestamp", "TEXT NOT NULL DEFAULT ''");
             EnsureFileMetadataColumn(db, "turn_context_model_timestamp_ticks", "INTEGER NOT NULL DEFAULT 0");
+            EnsureFileMetadataColumn(db, "fast_baseline_offset", "INTEGER NOT NULL DEFAULT 0");
+            EnsureFileMetadataColumn(db, "fast_baseline_input", "INTEGER");
+            EnsureFileMetadataColumn(db, "fast_baseline_cached", "INTEGER");
+            EnsureFileMetadataColumn(db, "fast_baseline_output", "INTEGER");
+            EnsureFileMetadataColumn(db, "fast_baseline_reasoning", "INTEGER");
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS history_gaps (path TEXT NOT NULL, start_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL, cursor_offset INTEGER NOT NULL, discard_line INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', model_source TEXT NOT NULL DEFAULT '', model_timestamp TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', service_tier_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', PRIMARY KEY(path,start_offset,end_offset))";
+            cmd.ExecuteNonQuery();
 
             cmd.CommandText = "CREATE TABLE IF NOT EXISTS token_records (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', total_input INTEGER NOT NULL, total_cached INTEGER NOT NULL, total_output INTEGER NOT NULL, total_reasoning INTEGER NOT NULL DEFAULT 0, call_input INTEGER NOT NULL, call_cached INTEGER NOT NULL, call_output INTEGER NOT NULL, call_reasoning INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '', five_hour_used REAL, five_hour_window INTEGER, five_hour_resets INTEGER, weekly_used REAL, weekly_window INTEGER, weekly_resets INTEGER, plan_type TEXT NOT NULL DEFAULT '', source_path TEXT NOT NULL DEFAULT '', source_offset_end INTEGER NOT NULL DEFAULT 0, root_session_id TEXT NOT NULL DEFAULT '', index_revision INTEGER NOT NULL DEFAULT 0, model_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', request_id TEXT NOT NULL DEFAULT '', response_id TEXT NOT NULL DEFAULT '', identity_source TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', service_tier_source TEXT NOT NULL DEFAULT '', turn_context_service_tier TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', rate_limit_id TEXT NOT NULL DEFAULT '', rate_limit_name TEXT NOT NULL DEFAULT '', credits_balance REAL, credits_has INTEGER, credits_unlimited INTEGER, five_hour_used_tokens INTEGER, five_hour_remaining_tokens INTEGER, five_hour_limit_tokens INTEGER, weekly_used_tokens INTEGER, weekly_remaining_tokens INTEGER, weekly_limit_tokens INTEGER, rate_limit_individual INTEGER, rate_limit_reached_type TEXT NOT NULL DEFAULT '', spend_control_reached INTEGER, model_context_window INTEGER, long_context_threshold INTEGER, long_context_applied INTEGER NOT NULL DEFAULT 0, long_context_source TEXT NOT NULL DEFAULT '', cache_creation_tokens INTEGER NOT NULL DEFAULT 0, cache_write_observable INTEGER NOT NULL DEFAULT 0, timestamp_ticks INTEGER NOT NULL DEFAULT 0)";
             cmd.ExecuteNonQuery();
@@ -1710,6 +1731,379 @@ public static class TokenRaderIndexer
     [ThreadStatic]
     private static DataContractJsonSerializer _jsonSerializer;
 
+    private sealed class HistoryGapState
+    {
+        public string Path, Session, Root, Parent, Model, ModelSource, ModelTimestamp,
+            Tier, TierSource, TurnId, ReasoningEffort, BlockedReason;
+        public long Start, End, Cursor;
+        public bool Discard;
+    }
+
+    private static void ReportIndexProgress(IDictionary progress, string phase,
+        string path, long bytes, long records, long cursor)
+    {
+        if (progress == null) return;
+        progress["Phase"] = phase; progress["Stage"] = phase; progress["LastProgressAt"] = DateTimeOffset.Now;
+        progress["CurrentPath"] = path ?? "";
+        progress["ProcessedBytes"] = bytes; progress["ImportedRecords"] = records;
+        progress["CurrentOffset"] = cursor;
+    }
+
+    public static TokenRaderHistoryBackfillResult GetHistoryBackfillStatus(SQLiteConnection db)
+    {
+        var result = new TokenRaderHistoryBackfillResult();
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(DISTINCT CASE WHEN cursor_offset<end_offset OR blocked_reason<>'' THEN path END),COALESCE(SUM(MAX(0,end_offset-cursor_offset)),0),COUNT(DISTINCT CASE WHEN blocked_reason<>'' THEN path END),COUNT(DISTINCT CASE WHEN cursor_offset<end_offset AND blocked_reason IN ('','oversized_line','fast_start_boundary_unknown') THEN path END) FROM history_gaps";
+            using (var reader = cmd.ExecuteReader())
+            {
+                if (reader.Read())
+                {
+                    result.RemainingFiles = (int)ReadReaderInt64(reader, 0);
+                    result.RemainingBytes = ReadReaderInt64(reader, 1);
+                    result.BlockedFiles = (int)ReadReaderInt64(reader, 2);
+                    result.EligibleFiles = (int)ReadReaderInt64(reader, 3);
+                }
+            }
+        }
+        result.Completed = result.RemainingFiles == 0;
+        result.IndexRevision = GetIndexRevision(db);
+        return result;
+    }
+
+    /// <summary>
+    /// Catalogues existing files without importing historical bodies. Reads at
+    /// most 256 KiB per file (128 KiB header plus 128 KiB tail), freezes complete
+    /// line boundaries, and keeps all previously retained token/tool rows.
+    /// </summary>
+    public static TokenRaderHistoryBackfillResult InitializeFromNow(
+        SQLiteConnection db, string sessionsRoot, IDictionary progress, CancellationToken cancel)
+    {
+        if (db == null) throw new ArgumentNullException("db");
+        if (string.IsNullOrWhiteSpace(sessionsRoot)) throw new ArgumentNullException("sessionsRoot");
+        cancel.ThrowIfCancellationRequested();
+        CreateSchema(db);
+        long processed = 0L;
+        using (var tx = db.BeginTransaction())
+        {
+            foreach (string filePath in EnumerateHistoryFiles(sessionsRoot, cancel))
+            {
+                cancel.ThrowIfCancellationRequested();
+                string path = GetCanonicalPath(filePath);
+                long oldOffset = 0L, oldLength = -1L, oldWrite = 0L, oldRetained = 1L;
+                string oldSession = "", oldCwd = "", oldParent = "", oldFork = "";
+                using (var old = db.CreateCommand())
+                {
+                    old.Transaction = tx; old.CommandText = "SELECT parsed_offset,length,last_write_ticks,session_id,cwd,parent_thread_id,forked_from_id,content_retained FROM file_metadata WHERE path=@path";
+                    old.Parameters.AddWithValue("@path", path);
+                    using (var reader = old.ExecuteReader())
+                        if (reader.Read())
+                        {
+                            oldOffset = Math.Max(0L, ReadReaderInt64(reader, 0)); oldLength = ReadReaderInt64(reader, 1); oldWrite = ReadReaderInt64(reader, 2);
+                            oldSession = ReadReaderString(reader, 3); oldCwd = ReadReaderString(reader, 4);
+                            oldParent = ReadReaderString(reader, 5); oldFork = ReadReaderString(reader, 6);
+                            oldRetained = ReadReaderInt64(reader, 7);
+                        }
+                }
+                var info = new FileInfo(path);
+                if (oldLength == info.Length && oldWrite == info.LastWriteTimeUtc.Ticks && oldRetained != 0L)
+                { ReportIndexProgress(progress, "FastStart", path, processed, 0L, oldOffset); continue; }
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    long length = fs.Length;
+                    bool replaced = oldLength >= 0L && (length < oldLength || (length == oldLength && oldWrite != info.LastWriteTimeUtc.Ticks));
+                    int headerLength = oldLength < 0L ? (int)Math.Min(128L * 1024L, length) : 0;
+                    byte[] header = ReadBoundedBytes(fs, 0L, headerLength, cancel);
+                    long tailStart = Math.Max((long)header.Length, length - 128L * 1024L);
+                    byte[] tail = ReadBoundedBytes(fs, tailStart, (int)(length - tailStart), cancel);
+                    processed += header.Length + tail.Length;
+                    long completeEnd = 0L;
+                    for (int i = tail.Length - 1; i >= 0; i--)
+                        if (tail[i] == 10 || tail[i] == 13) { completeEnd = tailStart + i + 1L; break; }
+                    if (completeEnd == 0L && tailStart <= header.Length)
+                        for (int i = header.Length - 1; i >= 0; i--)
+                            if (header[i] == 10 || header[i] == 13) { completeEnd = i + 1L; break; }
+                    // If the final complete boundary is outside the bounded
+                    // sample, conservatively freeze EOF and mark lost coverage.
+                    bool boundaryUnknown = completeEnd == 0L && length > 0L && tailStart > header.Length;
+                    if (boundaryUnknown) completeEnd = length;
+                    // Freeze the actual EOF, including an in-flight fragment.
+                    // Its eventual completion belongs to the pre-start gap,
+                    // and live imports skip that fragment rather than billing
+                    // an old call as newly appended work.
+                    long cursor = length;
+                    string session = !string.IsNullOrWhiteSpace(oldSession) ? oldSession : ExtractSessionId(path), cwd = oldCwd, parent = oldParent, fork = oldFork;
+                    string model = "", modelSource = "", modelTimestamp = "", tier = "", tierSource = "";
+                    TokenRaderJsonUsage baseline = null;
+                    bool baselineTrusted = false;
+                    ScanFastSample(header, 0L, false, cancel, ref session, ref cwd, ref parent, ref fork,
+                        ref model, ref modelSource, ref modelTimestamp, ref tier, ref tierSource, ref baseline, ref baselineTrusted);
+                    if (tailStart > header.Length)
+                    {
+                        // An unsampled middle may contain newer context/totals.
+                        model = ""; modelSource = "fast_sample_unknown"; modelTimestamp = "";
+                        tier = ""; tierSource = "fast_sample_unknown"; baseline = null; baselineTrusted = false;
+                    }
+                    if (tail.Length > 0) ScanFastSample(tail, tailStart, tailStart > 0L, cancel, ref session, ref cwd, ref parent, ref fork,
+                        ref model, ref modelSource, ref modelTimestamp, ref tier, ref tierSource, ref baseline, ref baselineTrusted);
+                    if (completeEnd != length || boundaryUnknown)
+                    {
+                        // A skipped unfinished record could be a new turn
+                        // context. Do not price later calls with stale mode.
+                        model = ""; modelSource = "fast_sample_incomplete"; modelTimestamp = "";
+                        tier = ""; tierSource = "fast_sample_incomplete";
+                    }
+                    string root = !string.IsNullOrWhiteSpace(parent) ? parent : (!string.IsNullOrWhiteSpace(fork) ? fork : session);
+                    using (var metadata = db.CreateCommand())
+                    {
+                        metadata.Transaction = tx;
+                        metadata.CommandText = "INSERT OR IGNORE INTO file_metadata(path,length,last_write_ticks,parsed_offset,session_id,cwd,parent_thread_id,forked_from_id,root_session_id,content_retained) VALUES(@path,@length,@write,@cursor,@session,@cwd,@parent,@fork,@root,1); UPDATE file_metadata SET length=@length,last_write_ticks=@write,parsed_offset=CASE WHEN @replaced=1 THEN @cursor ELSE MAX(parsed_offset,@cursor) END,session_id=CASE WHEN @session<>'' THEN @session ELSE session_id END,cwd=CASE WHEN @cwd<>'' THEN @cwd ELSE cwd END,parent_thread_id=CASE WHEN @parent<>'' THEN @parent ELSE parent_thread_id END,forked_from_id=CASE WHEN @fork<>'' THEN @fork ELSE forked_from_id END,root_session_id=CASE WHEN root_session_id='' OR root_session_id=session_id THEN @root ELSE root_session_id END,turn_context_model=CASE WHEN @modelSource<>'' THEN @model ELSE turn_context_model END,turn_context_model_source=CASE WHEN @modelSource<>'' THEN @modelSource ELSE turn_context_model_source END,turn_context_model_timestamp=CASE WHEN @modelSource<>'' THEN @modelTimestamp ELSE turn_context_model_timestamp END,turn_context_service_tier=CASE WHEN @tierSource<>'' THEN @tier ELSE turn_context_service_tier END,turn_context_service_tier_source=CASE WHEN @tierSource<>'' THEN @tierSource ELSE turn_context_service_tier_source END,fast_baseline_offset=@cursor,fast_baseline_input=@input,fast_baseline_cached=@cached,fast_baseline_output=@output,fast_baseline_reasoning=@reasoning WHERE path=@path";
+                        metadata.Parameters.AddWithValue("@replaced", replaced ? 1 : 0);
+                        metadata.Parameters.AddWithValue("@path", path); metadata.Parameters.AddWithValue("@length", length);
+                        metadata.Parameters.AddWithValue("@write", File.GetLastWriteTimeUtc(path).Ticks); metadata.Parameters.AddWithValue("@cursor", cursor);
+                        metadata.Parameters.AddWithValue("@session", session); metadata.Parameters.AddWithValue("@cwd", cwd);
+                        metadata.Parameters.AddWithValue("@parent", parent); metadata.Parameters.AddWithValue("@fork", fork); metadata.Parameters.AddWithValue("@root", root);
+                        metadata.Parameters.AddWithValue("@model", model); metadata.Parameters.AddWithValue("@modelSource", modelSource); metadata.Parameters.AddWithValue("@modelTimestamp", modelTimestamp);
+                        DateTimeOffset modelAt;
+                        metadata.Parameters.AddWithValue("@modelTicks", TryParseTimestamp(modelTimestamp, out modelAt) ? modelAt.UtcDateTime.Ticks : 0L);
+                        metadata.CommandText += "; UPDATE file_metadata SET turn_context_model_timestamp_ticks=@modelTicks WHERE path=@path AND @modelSource<>''";
+                        metadata.Parameters.AddWithValue("@tier", tier); metadata.Parameters.AddWithValue("@tierSource", tierSource);
+                        bool validBaseline = baselineTrusted && !boundaryUnknown && !replaced && completeEnd == length && baseline != null && tailStart <= completeEnd;
+                        metadata.Parameters.AddWithValue("@input", validBaseline ? (object)GetInt64Value(baseline.InputTokens) : DBNull.Value);
+                        metadata.Parameters.AddWithValue("@cached", validBaseline ? (object)GetCachedTokenValue(baseline) : DBNull.Value);
+                        metadata.Parameters.AddWithValue("@output", validBaseline ? (object)GetInt64Value(baseline.OutputTokens) : DBNull.Value);
+                        metadata.Parameters.AddWithValue("@reasoning", validBaseline ? (object)GetInt64Value(baseline.ReasoningOutputTokens) : DBNull.Value);
+                        metadata.ExecuteNonQuery();
+                    }
+                    if (oldOffset < length || replaced || oldRetained == 0L)
+                    using (var gap = db.CreateCommand())
+                    {
+                        gap.Transaction = tx;
+                        gap.CommandText = "INSERT OR IGNORE INTO history_gaps(path,start_offset,end_offset,cursor_offset,blocked_reason) VALUES(@path,@start,@end,@start,@blocked)";
+                        gap.Parameters.AddWithValue("@path", path); gap.Parameters.AddWithValue("@start", replaced || oldRetained == 0L ? 0L : oldOffset);
+                        gap.Parameters.AddWithValue("@end", length); gap.Parameters.AddWithValue("@blocked", replaced ? "source_replaced" : (boundaryUnknown ? "fast_start_boundary_unknown" : ""));
+                        gap.ExecuteNonQuery();
+                    }
+                    if (replaced)
+                    using (var blocked = db.CreateCommand())
+                    {
+                        blocked.Transaction = tx; blocked.CommandText = "UPDATE history_gaps SET blocked_reason='source_replaced' WHERE path=@path";
+                        blocked.Parameters.AddWithValue("@path", path); blocked.ExecuteNonQuery();
+                    }
+                    ReportIndexProgress(progress, "FastStart", path, processed, 0L, cursor);
+                }
+            }
+            cancel.ThrowIfCancellationRequested();
+            ResolveCatalogRoots(db, tx, cancel);
+            SetSettingInTransaction(db, tx, "history_coverage_start", DateTimeOffset.UtcNow.ToString("o", CultureInfo.InvariantCulture));
+            SetSettingInTransaction(db, tx, "fast_start_mode", "1");
+            SetSettingInTransaction(db, tx, "catalog_initialized", "1");
+            SetSettingInTransaction(db, tx, "sessions_root", GetCanonicalPath(sessionsRoot));
+            AdvanceRevisionInTransaction(db, tx);
+            tx.Commit();
+        }
+        var result = GetHistoryBackfillStatus(db); result.ProcessedBytes = processed; return result;
+    }
+
+    private static IEnumerable<string> EnumerateHistoryFiles(string root, CancellationToken cancel)
+    {
+        var pending = new Stack<string>(); pending.Push(GetCanonicalPath(root));
+        while (pending.Count > 0)
+        {
+            cancel.ThrowIfCancellationRequested();
+            string directory = pending.Pop();
+            if (!Directory.Exists(directory)) continue;
+            foreach (FileSystemInfo entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
+            {
+                cancel.ThrowIfCancellationRequested();
+                // Never follow junctions/symlinks into an unrelated data root.
+                if ((entry.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                DirectoryInfo child = entry as DirectoryInfo;
+                if (child != null) pending.Push(child.FullName);
+                else if (entry.Extension.Equals(".jsonl", StringComparison.OrdinalIgnoreCase)) yield return entry.FullName;
+            }
+        }
+    }
+
+    private static byte[] ReadBoundedBytes(Stream stream, long offset, int count, CancellationToken cancel)
+    {
+        byte[] bytes = new byte[count]; stream.Seek(offset, SeekOrigin.Begin); int read = 0;
+        while (read < count)
+        {
+            cancel.ThrowIfCancellationRequested();
+            int got = stream.Read(bytes, read, Math.Min(16 * 1024, count - read));
+            if (got == 0) throw new IOException("File shrank while capturing fast-start metadata.");
+            read += got;
+        }
+        return bytes;
+    }
+
+    private static void ResolveCatalogRoots(SQLiteConnection db, SQLiteTransaction tx, CancellationToken cancel)
+    {
+        var parents = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var entries = new List<KeyValuePair<string, string>>();
+        var knownSessions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var previousRoots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "SELECT path,session_id,COALESCE(NULLIF(parent_thread_id,''),NULLIF(forked_from_id,''),''),root_session_id FROM file_metadata WHERE session_id<>''";
+            using (var reader = cmd.ExecuteReader())
+                while (reader.Read())
+                {
+                    cancel.ThrowIfCancellationRequested();
+                    string session = ReadReaderString(reader, 1), parent = ReadReaderString(reader, 2);
+                    string path = ReadReaderString(reader, 0);
+                    entries.Add(new KeyValuePair<string, string>(path, session));
+                    knownSessions.Add(session); previousRoots[path] = ReadReaderString(reader, 3);
+                    if (!string.IsNullOrWhiteSpace(parent)) parents[session] = parent;
+                }
+        }
+        foreach (var entry in entries)
+        {
+            cancel.ThrowIfCancellationRequested();
+            string root = entry.Value, next; bool cycle = false;
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (parents.TryGetValue(root, out next) && !string.IsNullOrWhiteSpace(next))
+            {
+                if (!seen.Add(root)) { cycle = true; break; }
+                root = next;
+            }
+            if (cycle) continue;
+            // A missing ancestor is not evidence that its child is the root.
+            // Keep a previously resolved root rather than downgrade lineage.
+            if (!knownSessions.Contains(root) && !string.IsNullOrWhiteSpace(previousRoots[entry.Key]))
+                root = previousRoots[entry.Key];
+            using (var cmd = db.CreateCommand())
+            {
+                cmd.Transaction = tx; cmd.CommandText = "UPDATE file_metadata SET root_session_id=@root WHERE path=@path AND root_session_id<>@root";
+                cmd.Parameters.AddWithValue("@path", entry.Key); cmd.Parameters.AddWithValue("@root", root); cmd.ExecuteNonQuery();
+            }
+        }
+    }
+
+    private static void ScanFastSample(byte[] sample, long sourceStart, bool skipFirst,
+        CancellationToken cancel, ref string session, ref string cwd, ref string parent, ref string fork,
+        ref string model, ref string modelSource, ref string modelTimestamp, ref string tier, ref string tierSource,
+        ref TokenRaderJsonUsage baseline, ref bool baselineTrusted)
+    {
+        using (var stream = new MemoryStream(sample, false))
+        using (var reader = new Utf8JsonlLineReader(stream, 0L, sample.Length, cancel, null, null, null, false))
+        {
+            string line; long end; bool terminated;
+            if (skipFirst) reader.ReadLine(out line, out end, out terminated);
+            while (reader.ReadLine(out line, out end, out terminated))
+            {
+                if (!terminated) break;
+                TokenRaderJsonRecord record;
+                if (!TryDeserializeMetadataRecord(line, out record) || record == null) continue;
+                if (string.Equals(record.Type, "session_meta", StringComparison.OrdinalIgnoreCase))
+                {
+                    string value; bool present;
+                    if (TryGetMetadataString(line, new[] { "payload", "id" }, out value, out present) && !string.IsNullOrWhiteSpace(value)) session = value;
+                    if (TryGetMetadataString(line, new[] { "payload", "cwd" }, out value, out present) && present) cwd = value ?? "";
+                    if (TryGetMetadataString(line, new[] { "payload", "parent_thread_id" }, out value, out present) && present) parent = value ?? "";
+                    if (TryGetMetadataString(line, new[] { "payload", "forked_from_id" }, out value, out present) && present) fork = value ?? "";
+                }
+                if (string.Equals(record.Type, "turn_context", StringComparison.OrdinalIgnoreCase))
+                {
+                    bool present;
+                    if (TryGetTurnContextModel(line, out model, out present)) modelSource = present && !string.IsNullOrWhiteSpace(model) ? "turn_context" : "turn_context_missing";
+                    else { model = ""; modelSource = "turn_context_missing"; }
+                    DateTimeOffset at; modelTimestamp = TryParseTimestamp(record.Timestamp, out at) ? at.ToString("o", CultureInfo.InvariantCulture) : "";
+                    bool observable;
+                    if (!TryExtractTurnContextServiceTier(line, out tier, out observable, out tierSource)) { tier = ""; tierSource = "turn_context_missing"; }
+                }
+                if (record.Payload != null && record.Payload.Info != null &&
+                    (record.Type == "token_count" || (record.Type == "event_msg" && record.Payload.Type == "token_count")))
+                {
+                    baseline = record.Payload.Info.TotalTokenUsage;
+                    baselineTrusted = HasAnyUsageValue(baseline);
+                }
+            }
+        }
+    }
+
+    private static void SetSettingInTransaction(SQLiteConnection db, SQLiteTransaction tx, string key, string value)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.Transaction = tx; cmd.CommandText = "INSERT OR REPLACE INTO index_settings(key,value) VALUES(@key,@value)";
+            cmd.Parameters.AddWithValue("@key", key); cmd.Parameters.AddWithValue("@value", value); cmd.ExecuteNonQuery();
+        }
+    }
+
+    private static long AdvanceRevisionInTransaction(SQLiteConnection db, SQLiteTransaction tx)
+    {
+        long revision = GetIndexRevision(db) + 1L;
+        SetSettingInTransaction(db, tx, "IndexRevision", revision.ToString(CultureInfo.InvariantCulture)); return revision;
+    }
+
+    public static TokenRaderHistoryBackfillResult BackfillHistoryBatch(SQLiteConnection db,
+        long maxBytes, int maxMilliseconds, IDictionary progress, CancellationToken cancel)
+    {
+        if (maxBytes <= 0L) throw new ArgumentOutOfRangeException("maxBytes");
+        if (maxMilliseconds <= 0) throw new ArgumentOutOfRangeException("maxMilliseconds");
+        cancel.ThrowIfCancellationRequested();
+        int attempted = 0;
+        var deadline = Stopwatch.StartNew();
+        while (attempted < 16 && deadline.ElapsedMilliseconds < maxMilliseconds)
+        {
+        HistoryGapState state = null;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT g.path,g.start_offset,g.end_offset,g.cursor_offset,g.discard_line,g.blocked_reason,g.model,g.model_source,g.model_timestamp,g.service_tier,g.service_tier_source,g.turn_id,g.reasoning_effort,COALESCE(f.session_id,''),COALESCE(f.root_session_id,''),COALESCE(NULLIF(f.parent_thread_id,''),f.forked_from_id,'') FROM history_gaps g LEFT JOIN file_metadata f ON f.path=g.path WHERE g.cursor_offset<g.end_offset AND g.blocked_reason IN ('','oversized_line','fast_start_boundary_unknown') ORDER BY g.path,g.start_offset LIMIT 1";
+            using (var reader = cmd.ExecuteReader())
+                if (reader.Read()) state = new HistoryGapState {
+                    Path = ReadReaderString(reader, 0), Start = ReadReaderInt64(reader, 1), End = ReadReaderInt64(reader, 2), Cursor = ReadReaderInt64(reader, 3),
+                    Discard = ReadReaderInt64(reader, 4) != 0L,
+                    BlockedReason = ReadReaderString(reader, 5), Model = ReadReaderString(reader, 6), ModelSource = ReadReaderString(reader, 7), ModelTimestamp = ReadReaderString(reader, 8),
+                    Tier = ReadReaderString(reader, 9), TierSource = ReadReaderString(reader, 10), TurnId = ReadReaderString(reader, 11), ReasoningEffort = ReadReaderString(reader, 12),
+                    Session = ReadReaderString(reader, 13), Root = ReadReaderString(reader, 14), Parent = ReadReaderString(reader, 15) };
+        }
+        if (state == null) { var empty = GetHistoryBackfillStatus(db); empty.AttemptedFiles = attempted; return empty; }
+        attempted++;
+        long original = state.Cursor;
+        long end = state.Cursor + Math.Min(maxBytes, state.End - state.Cursor);
+        int imported;
+        try
+        {
+            imported = ImportFile(db, state.Path, state.Cursor, end, state.Root, state.Parent,
+                (long?)(GetIndexRevision(db) + 1L), progress, cancel, state, deadline, maxMilliseconds);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (IOException) { BlockHistoryIoFailure(db, state, cancel); continue; }
+        catch (UnauthorizedAccessException) { BlockHistoryIoFailure(db, state, cancel); continue; }
+        var result = GetHistoryBackfillStatus(db);
+        result.ProcessedBytes = state.Cursor - original; result.ImportedRecords = imported; result.AttemptedFiles = attempted;
+        ReportIndexProgress(progress, "HistoryBackfill", state.Path, result.ProcessedBytes, imported, state.Cursor);
+        return result;
+        }
+        var stopped = GetHistoryBackfillStatus(db); stopped.AttemptedFiles = attempted; return stopped;
+    }
+
+    /// <summary>Retry only transient I/O failures; safety blocks stay intact.</summary>
+    public static int ResetHistoryBackfillRetries(SQLiteConnection db)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "UPDATE history_gaps SET blocked_reason=CASE WHEN blocked_reason='io_unavailable' THEN '' ELSE substr(blocked_reason,16) END WHERE blocked_reason='io_unavailable' OR blocked_reason LIKE 'io_unavailable:%'";
+            return cmd.ExecuteNonQuery();
+        }
+    }
+
+    private static void BlockHistoryIoFailure(SQLiteConnection db, HistoryGapState state, CancellationToken cancel)
+    {
+        cancel.ThrowIfCancellationRequested();
+        using (var tx = db.BeginTransaction())
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.Transaction = tx; cmd.CommandText = "UPDATE history_gaps SET blocked_reason='io_unavailable:' || blocked_reason WHERE path=@path AND start_offset=@start AND end_offset=@end AND blocked_reason IN ('','fast_start_boundary_unknown','oversized_line')";
+            cmd.Parameters.AddWithValue("@path", state.Path); cmd.Parameters.AddWithValue("@start", state.Start); cmd.Parameters.AddWithValue("@end", state.End);
+            cmd.ExecuteNonQuery(); AdvanceRevisionInTransaction(db, tx); cancel.ThrowIfCancellationRequested(); tx.Commit();
+        }
+    }
+
     /// <summary>增量解析一个 JSONL 文件，插入 SQLite，返回新记录数。</summary>
     public static int ImportFile(SQLiteConnection db, string filePath, long startOffset)
     {
@@ -1750,6 +2144,13 @@ public static class TokenRaderIndexer
         return ImportFile(db, filePath, startOffset, endOffset, rootSessionId, parentSessionId, (long?)indexRevision);
     }
 
+    public static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset,
+        string rootSessionId, string parentSessionId, long indexRevision, IDictionary progress, CancellationToken cancel)
+    {
+        return ImportFile(db, filePath, startOffset, endOffset, rootSessionId, parentSessionId,
+            (long?)indexRevision, progress, cancel, null, null, 0);
+    }
+
     /// <summary>
     /// Returns the latest trustworthy cumulative usage for an incremental
     /// session import. If the latest row has no total usage, its stored zero
@@ -1773,19 +2174,34 @@ public static class TokenRaderIndexer
         if (db == null || string.IsNullOrWhiteSpace(sessionId) ||
             string.IsNullOrWhiteSpace(sourcePath) || sourceOffsetEnd <= 0L) return false;
 
+        long gapBoundary = 0L;
+        using (var gap = db.CreateCommand())
+        {
+            gap.CommandText = "SELECT COALESCE(MAX(end_offset),0) FROM history_gaps WHERE path=@path AND end_offset<=@offset AND (cursor_offset<end_offset OR blocked_reason<>'')";
+            gap.Parameters.AddWithValue("@path", sourcePath); gap.Parameters.AddWithValue("@offset", sourceOffsetEnd);
+            gapBoundary = Convert.ToInt64(gap.ExecuteScalar(), CultureInfo.InvariantCulture);
+        }
+
         using (var cmd = db.CreateCommand())
         {
             cmd.CommandText =
                 "SELECT total_input,total_cached,total_output,total_reasoning,identity_source " +
                 "FROM token_records WHERE session_id=@session AND source_path=@path " +
-                "AND source_offset_end>0 AND source_offset_end<=@offset " +
+                "AND source_offset_end>@gap AND source_offset_end<=@offset " +
                 "ORDER BY source_offset_end DESC,id DESC LIMIT 1";
             cmd.Parameters.AddWithValue("@session", sessionId);
             cmd.Parameters.AddWithValue("@path", sourcePath);
             cmd.Parameters.AddWithValue("@offset", sourceOffsetEnd);
+            cmd.Parameters.AddWithValue("@gap", gapBoundary);
             using (var reader = cmd.ExecuteReader())
             {
-                if (!reader.Read()) return false;
+                if (!reader.Read())
+                {
+                    // A fast-start baseline is metadata only. It is usable
+                    // solely at/after its frozen boundary, never for history.
+                }
+                else
+                {
                 // A last-only row is billable on its own but does not prove
                 // where the cumulative stream ended. Do not let a later
                 // total-only delta charge that same call a second time.
@@ -1796,6 +2212,19 @@ public static class TokenRaderIndexer
                 totalOutput = ReadReaderInt64(reader, 2);
                 totalReasoning = ReadReaderInt64(reader, 3);
                 return true;
+                }
+            }
+        }
+        if (gapBoundary <= 0L) return false;
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "SELECT fast_baseline_input,fast_baseline_cached,fast_baseline_output,fast_baseline_reasoning FROM file_metadata WHERE path=@path AND fast_baseline_offset>=@gap AND fast_baseline_offset<=@offset AND fast_baseline_input IS NOT NULL";
+            cmd.Parameters.AddWithValue("@path", sourcePath); cmd.Parameters.AddWithValue("@gap", gapBoundary); cmd.Parameters.AddWithValue("@offset", sourceOffsetEnd);
+            using (var reader = cmd.ExecuteReader())
+            {
+                if (!reader.Read()) return false;
+                totalInput = ReadReaderInt64(reader, 0); totalCached = ReadReaderInt64(reader, 1);
+                totalOutput = ReadReaderInt64(reader, 2); totalReasoning = ReadReaderInt64(reader, 3); return true;
             }
         }
     }
@@ -1803,10 +2232,29 @@ public static class TokenRaderIndexer
     private static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset,
         string rootSessionId, string parentSessionId, long? explicitIndexRevision)
     {
+        return ImportFile(db, filePath, startOffset, endOffset, rootSessionId, parentSessionId,
+            explicitIndexRevision, null, CancellationToken.None, null, null, 0);
+    }
+
+    private static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset,
+        string rootSessionId, string parentSessionId, long? explicitIndexRevision,
+        IDictionary progress, CancellationToken cancel, HistoryGapState history,
+        Stopwatch deadline, int maxMilliseconds)
+    {
+        cancel.ThrowIfCancellationRequested();
         int count = 0;
-        string sessionId = ExtractSessionId(filePath);
+        string sessionId = history != null && !string.IsNullOrWhiteSpace(history.Session)
+            ? history.Session : ExtractSessionId(filePath);
         string effectiveRootSessionId = string.IsNullOrWhiteSpace(rootSessionId) ? sessionId : rootSessionId;
         string sourcePath = GetCanonicalPath(filePath);
+        if (history == null)
+        using (var blocked = db.CreateCommand())
+        {
+            blocked.CommandText = "SELECT COUNT(*) FROM history_gaps WHERE path=@path AND blocked_reason='source_replaced'";
+            blocked.Parameters.AddWithValue("@path", sourcePath);
+            if (Convert.ToInt64(blocked.ExecuteScalar(), CultureInfo.InvariantCulture) > 0L)
+                throw new IOException("Source was replaced/truncated; retained history cannot be mixed with its new incarnation.");
+        }
         long indexRevision = explicitIndexRevision.HasValue
             ? Math.Max(0L, explicitIndexRevision.Value)
             : GetIndexRevision(db);
@@ -1817,8 +2265,9 @@ public static class TokenRaderIndexer
         // parent/root model fallback is bounded by the first event in this
         // source segment rather than blindly using the parent's latest row.
         DateTimeOffset firstImportedEventAt;
-        bool hasFirstImportedEventAt = TryReadFirstEventTimestamp(
-            filePath, startOffset, endOffset, out firstImportedEventAt);
+        firstImportedEventAt = default(DateTimeOffset);
+        bool hasFirstImportedEventAt = history == null && TryReadFirstEventTimestamp(
+            filePath, startOffset, endOffset, cancel, out firstImportedEventAt);
         DateTimeOffset? inheritedModelCutoff = hasFirstImportedEventAt
             ? (DateTimeOffset?)firstImportedEventAt : null;
         string persistedFileModel = GetLatestFileTextColumnIncludingEmpty(
@@ -1896,6 +2345,13 @@ public static class TokenRaderIndexer
             TryGetLatestSessionCumulativeBaseline(db, sessionId, sourcePath, startOffset,
                 out previousTotalInput, out previousTotalCached,
                 out previousTotalOutput, out previousTotalReasoning);
+        if (history != null)
+        {
+            inheritedModel = history.Model ?? ""; inheritedModelSource = history.ModelSource ?? "";
+            persistedFileModelTimestamp = history.ModelTimestamp ?? "";
+            inheritedServiceTier = history.Tier ?? ""; inheritedServiceTierSource = history.TierSource ?? "";
+            inheritedTurnId = history.TurnId ?? ""; inheritedReasoningEffort = history.ReasoningEffort ?? "";
+        }
         bool insertedUnresolvedModel = false;
 
         using (var tx = db.BeginTransaction())
@@ -1903,6 +2359,10 @@ public static class TokenRaderIndexer
         {
             cmd.Transaction = tx;
             cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision, model_source, turn_id, request_id, response_id, identity_source, service_tier, service_tier_source, turn_context_service_tier, reasoning_effort, rate_limit_id, rate_limit_name, credits_balance, credits_has, credits_unlimited, five_hour_used_tokens, five_hour_remaining_tokens, five_hour_limit_tokens, weekly_used_tokens, weekly_remaining_tokens, weekly_limit_tokens, rate_limit_individual, rate_limit_reached_type, spend_control_reached, model_context_window, long_context_threshold, long_context_applied, long_context_source, cache_creation_tokens, cache_write_observable) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23,@p24,@p25,@p26,@p27,@p28,@p29,@p30,@p31,@p32,@p33,@p34,@p35,@p36,@p37,@p38,@p39,@p40,@p41,@p42,@p43,@p44,@p45,@p46,@p47,@p48,@p49,@p50,@p51,@p52)";
+            // Replaying a committed segment after a cancelled caller must not
+            // duplicate source events, even on legacy indexes without a unique
+            // source-position constraint. Preserve pre-existing duplicate rows.
+            cmd.CommandText = cmd.CommandText.Replace(" VALUES (", " SELECT ").Replace("@p52)", "@p52 WHERE NOT EXISTS (SELECT 1 FROM token_records WHERE source_path=@p20 AND source_offset_end=@p21 AND source_offset_end>0)");
             var p = new SQLiteParameter[52];
             for (int i = 0; i < p.Length; i++)
             {
@@ -1917,7 +2377,9 @@ public static class TokenRaderIndexer
                 long safeStart = Math.Max(0L, startOffset);
                 long requestedEnd = endOffset < 0L ? 0L : endOffset;
                 long effectiveEnd = Math.Min(fs.Length, requestedEnd);
-                if (safeStart >= effectiveEnd) { tx.Commit(); return 0; }
+                if (history != null && effectiveEnd < history.End && fs.Length < history.End)
+                    throw new IOException("Historical source shrank before its frozen EOF; gap retained.");
+                if (safeStart >= effectiveEnd) { cancel.ThrowIfCancellationRequested(); tx.Commit(); return 0; }
 
                 string currentModel = inheritedModel;
                 string currentModelSource = inheritedModelSource;
@@ -1934,7 +2396,7 @@ public static class TokenRaderIndexer
                 bool currentHasPreviousTotal = hasPreviousTotal;
 
                 bool skipPartialLine = false;
-                if (safeStart > 0L)
+                if (safeStart > 0L && (history == null || !history.Discard))
                 {
                     fs.Seek(safeStart - 1L, SeekOrigin.Begin);
                     int previousByte = fs.ReadByte();
@@ -1945,7 +2407,8 @@ public static class TokenRaderIndexer
                 // so its BaseStream.Position cannot identify a JSONL line end.
                 // The byte reader below reports the exact UTF-8 end offset,
                 // including the newline, for every inserted token record.
-                using (var lineReader = new Utf8JsonlLineReader(fs, safeStart, effectiveEnd))
+                using (var lineReader = new Utf8JsonlLineReader(fs, safeStart, effectiveEnd, cancel,
+                    progress, deadline, null, history != null && history.Discard, maxMilliseconds))
                 {
                     if (skipPartialLine)
                     {
@@ -1960,6 +2423,9 @@ public static class TokenRaderIndexer
                     string line; long lineEndOffset; bool lineTerminated;
                     while (lineReader.ReadLine(out line, out lineEndOffset, out lineTerminated))
                     {
+                        cancel.ThrowIfCancellationRequested();
+                        ReportIndexProgress(progress, history == null ? "Import" : "HistoryBackfill", sourcePath,
+                            lineReader.Position - safeStart, count, lineReader.Position);
                         // Match the previous importer: an unterminated final line
                         // is a still-growing JSON record and must wait for the next
                         // refresh before it can enter the index.
@@ -2072,6 +2538,15 @@ public static class TokenRaderIndexer
                             bool isTokenRecord = type == "token_count" ||
                                 (type == "event_msg" && string.Equals(payload.Type, "token_count", StringComparison.Ordinal));
                             if (!isTokenRecord) continue;
+                            if (history != null && string.IsNullOrWhiteSpace(currentModelSource))
+                            {
+                                // Resolve at this historical event, never at the
+                                // live catalog's newer trailing model snapshot.
+                                DateTimeOffset eventAt;
+                                if (TryParseTimestamp(record.Timestamp, out eventAt))
+                                    currentModel = ResolveInheritedModel(db, sessionId, parentSessionId,
+                                        effectiveRootSessionId, eventAt, safeStart > 0L, out currentModelSource);
+                            }
                             var info = payload.Info;
                             if (info == null) continue;
                             var total = info.TotalTokenUsage;
@@ -2311,7 +2786,7 @@ public static class TokenRaderIndexer
                             p[49].Value = longContextSource;
                             p[50].Value = cacheCreationTokens;
                             p[51].Value = cacheWriteObservable ? 1 : 0;
-                            cmd.ExecuteNonQuery();
+                            int inserted = cmd.ExecuteNonQuery();
                             if (hasTotalUsage)
                             {
                                 // Only a real cumulative snapshot advances
@@ -2333,22 +2808,70 @@ public static class TokenRaderIndexer
                                 currentHasPreviousTotal = false;
                             }
                             if (string.IsNullOrWhiteSpace(currentModel)) insertedUnresolvedModel = true;
-                            count++;
+                            count += inserted;
                         }
+                        catch (OperationCanceledException) { throw; }
                         catch { continue; }
                     }
+                    if (history != null)
+                    {
+                        history.Cursor = lineReader.Position;
+                        history.Discard = lineReader.Discarding;
+                        if (lineReader.IncompleteStart >= safeStart && !lineReader.Discarding)
+                        {
+                            if (lineReader.IncompleteStart > safeStart) history.Cursor = lineReader.IncompleteStart;
+                            else
+                            {
+                                history.Discard = true;
+                                history.BlockedReason = effectiveEnd == history.End ? "incomplete_frozen_line" : "oversized_line";
+                            }
+                        }
+                        if (lineReader.SkippedOversizedLine) history.BlockedReason = "oversized_line";
+                        history.Model = currentModel; history.ModelSource = currentModelSource;
+                        history.ModelTimestamp = currentModelContextTimestamp;
+                        history.Tier = currentServiceTier; history.TierSource = currentServiceTierSource;
+                        history.TurnId = currentTurnId; history.ReasoningEffort = currentReasoningEffort;
+                        SaveHistoryGapState(db, tx, history);
+                        AdvanceRevisionInTransaction(db, tx);
+                    }
+                    else if (lineReader.SkippedOversizedLine && lineReader.OversizedPotentialUsage)
+                        throw new IOException("Oversized usage/context line cannot be safely indexed; import rolled back and cursor retained.");
                 }
-                UpsertFileContextTier(db, tx, sourcePath, sessionId,
+                if (history == null) UpsertFileContextTier(db, tx, sourcePath, sessionId,
                     effectiveRootSessionId, effectiveEnd, currentServiceTier,
                     currentServiceTierSource);
-                UpsertFileContextModel(db, tx, sourcePath, sessionId,
+                if (history == null) UpsertFileContextModel(db, tx, sourcePath, sessionId,
                     effectiveRootSessionId, effectiveEnd, currentModel,
                     currentModelSource, currentModelContextTimestamp);
             }
+            cancel.ThrowIfCancellationRequested();
+            if (insertedUnresolvedModel) SetSettingInTransaction(db, tx, "missing_model_backfill_version", "0");
             tx.Commit();
         }
-        if (insertedUnresolvedModel) SetSetting(db, "missing_model_backfill_version", "0");
         return count;
+    }
+
+    private static void SaveHistoryGapState(SQLiteConnection db, SQLiteTransaction tx, HistoryGapState history)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "UPDATE history_gaps SET cursor_offset=MAX(cursor_offset,@cursor),discard_line=@discard,blocked_reason=@blocked,model=@model,model_source=@modelSource,model_timestamp=@modelTimestamp,service_tier=@tier,service_tier_source=@tierSource,turn_id=@turn,reasoning_effort=@reasoning WHERE path=@path AND start_offset=@start AND end_offset=@end";
+            cmd.Parameters.AddWithValue("@path", history.Path); cmd.Parameters.AddWithValue("@start", history.Start); cmd.Parameters.AddWithValue("@end", history.End);
+            cmd.Parameters.AddWithValue("@cursor", history.Cursor);
+            cmd.Parameters.AddWithValue("@discard", history.Discard ? 1 : 0); cmd.Parameters.AddWithValue("@blocked", history.BlockedReason ?? "");
+            cmd.Parameters.AddWithValue("@model", history.Model ?? ""); cmd.Parameters.AddWithValue("@modelSource", history.ModelSource ?? ""); cmd.Parameters.AddWithValue("@modelTimestamp", history.ModelTimestamp ?? "");
+            cmd.Parameters.AddWithValue("@tier", history.Tier ?? ""); cmd.Parameters.AddWithValue("@tierSource", history.TierSource ?? "");
+            cmd.Parameters.AddWithValue("@turn", history.TurnId ?? ""); cmd.Parameters.AddWithValue("@reasoning", history.ReasoningEffort ?? "");
+            cmd.ExecuteNonQuery();
+        }
+        if (history.Cursor >= history.End && string.IsNullOrWhiteSpace(history.BlockedReason))
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.Transaction = tx;
+            cmd.CommandText = "UPDATE file_metadata SET content_retained=1 WHERE path=@path AND NOT EXISTS(SELECT 1 FROM history_gaps WHERE path=@path AND (cursor_offset<end_offset OR blocked_reason<>''))";
+            cmd.Parameters.AddWithValue("@path", history.Path); cmd.ExecuteNonQuery();
+        }
     }
 
     private static bool MightContainToolMetadata(string line)
@@ -6191,8 +6714,24 @@ public static class TokenRaderIndexer
         private int _bufferIndex;
         private int _bufferCount;
         private long _position;
+        private readonly CancellationToken _cancel;
+        private readonly IDictionary _progress;
+        private readonly Stopwatch _deadline;
+        private readonly int _maxMilliseconds;
+        private bool _discarding;
+        public long Position { get { return _position; } }
+        public long IncompleteStart { get; private set; }
+        public bool Discarding { get { return _discarding; } }
+        public bool SkippedOversizedLine { get; private set; }
+        public bool OversizedPotentialUsage { get; private set; }
 
         public Utf8JsonlLineReader(Stream stream, long startOffset, long endOffset)
+            : this(stream, startOffset, endOffset, CancellationToken.None, null, null, null, false, 0)
+        { }
+
+        public Utf8JsonlLineReader(Stream stream, long startOffset, long endOffset,
+            CancellationToken cancel, IDictionary progress, Stopwatch deadline,
+            byte[] unusedPending, bool discard, int maxMilliseconds = 0)
         {
             _stream = stream;
             _position = Math.Max(0L, startOffset);
@@ -6200,6 +6739,8 @@ public static class TokenRaderIndexer
             _stream.Seek(_position, SeekOrigin.Begin);
             _bufferIndex = 0;
             _bufferCount = 0;
+            _cancel = cancel; _progress = progress; _deadline = deadline; _maxMilliseconds = maxMilliseconds;
+            _discarding = discard; IncompleteStart = -1L;
         }
 
         public bool ReadLine(out string line, out long lineEndOffset, out bool terminated)
@@ -6207,6 +6748,9 @@ public static class TokenRaderIndexer
             line = null;
             lineEndOffset = _position;
             terminated = false;
+            _cancel.ThrowIfCancellationRequested();
+            if (_deadline != null && _maxMilliseconds > 0 && _deadline.ElapsedMilliseconds >= _maxMilliseconds) return false;
+            long lineStart = _position;
 
             using (var bytes = new MemoryStream())
             {
@@ -6226,13 +6770,30 @@ public static class TokenRaderIndexer
                         terminated = true;
                         break;
                     }
-                    bytes.WriteByte((byte)value);
+                    if (!_discarding)
+                    {
+                        if (bytes.Length < 1024L * 1024L) bytes.WriteByte((byte)value);
+                        else
+                        {
+                            string prefix = Encoding.UTF8.GetString(bytes.ToArray());
+                            string topType; bool isNull;
+                            bool provenBody = TryGetJsonStringOrNullAtPath(prefix, new[] { "type" }, out topType, out isNull) &&
+                                !isNull && string.Equals(topType, "response_item", StringComparison.OrdinalIgnoreCase);
+                            if (!provenBody) OversizedPotentialUsage = true;
+                            _discarding = true; SkippedOversizedLine = true; bytes.SetLength(0L);
+                        }
+                    }
                 }
 
                 lineEndOffset = _position;
                 if (bytes.Length == 0 && !terminated && _position >= _endOffset)
+                {
+                    if (_position > lineStart) IncompleteStart = lineStart;
                     return false;
-                line = Encoding.UTF8.GetString(bytes.ToArray());
+                }
+                if (!terminated) IncompleteStart = lineStart;
+                line = _discarding ? "" : Encoding.UTF8.GetString(bytes.ToArray());
+                if (terminated) _discarding = false;
                 return true;
             }
         }
@@ -6256,11 +6817,17 @@ public static class TokenRaderIndexer
         private bool FillBuffer()
         {
             if (_bufferIndex < _bufferCount) return true;
+            _cancel.ThrowIfCancellationRequested();
             long remaining = _endOffset - _position;
             if (remaining <= 0L) return false;
             int requested = (int)Math.Min((long)_buffer.Length, remaining);
             _bufferIndex = 0;
             _bufferCount = _stream.Read(_buffer, 0, requested);
+            if (_bufferCount > 0 && _progress != null)
+            {
+                _progress["LastProgressAt"] = DateTimeOffset.Now;
+                _progress["CurrentOffset"] = _position + _bufferCount;
+            }
             return _bufferCount > 0;
         }
 
@@ -6713,6 +7280,16 @@ public static class TokenRaderIndexer
         long endOffset,
         out DateTimeOffset timestamp)
     {
+        return TryReadFirstEventTimestamp(filePath, startOffset, endOffset, CancellationToken.None, out timestamp);
+    }
+
+    private static bool TryReadFirstEventTimestamp(
+        string filePath,
+        long startOffset,
+        long endOffset,
+        CancellationToken cancel,
+        out DateTimeOffset timestamp)
+    {
         timestamp = default(DateTimeOffset);
         if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath)) return false;
         try
@@ -6731,7 +7308,7 @@ public static class TokenRaderIndexer
                     int previousByte = fs.ReadByte();
                     skipPartialLine = previousByte != '\n' && previousByte != '\r';
                 }
-                using (var lineReader = new Utf8JsonlLineReader(fs, safeStart, effectiveEnd))
+                using (var lineReader = new Utf8JsonlLineReader(fs, safeStart, effectiveEnd, cancel, null, null, null, false))
                 {
                     if (skipPartialLine)
                     {

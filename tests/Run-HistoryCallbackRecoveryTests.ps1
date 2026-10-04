@@ -31,7 +31,10 @@ foreach ($helperName in @(
 # Verify that every dispatcher/worker exception path routes through the scoped
 # resolver. Non-history jobs still take the global failure path inside it.
 $resolverCalls = [regex]::Matches($source, 'Resolve-TokenRaderBackgroundCallbackFailure\s+-Job')
-Assert-HistoryCallbackRecovery ($resolverCalls.Count -ge 7) 'background completion, failure, stop, timeout, or startup catch bypasses the scoped resolver'
+Assert-HistoryCallbackRecovery ($resolverCalls.Count -ge 6) 'background completion, failure, stop, timeout, or startup catch bypasses the scoped resolver'
+$stopMatch = [regex]::Match($source, '(?s)function Request-TokenRaderBackgroundStop\b.*?(?=\r?\nfunction |\z)')
+Assert-HistoryCallbackRecovery ($stopMatch.Success -and $stopMatch.Value -match '\$Job\.StopAsyncResult = \$Job\.AsyncResult') 'BeginStop failure must retain the old invocation until it exits'
+Assert-HistoryCallbackRecovery ($stopMatch.Value -notmatch '\.Dispose\(|BackgroundJobs\.Remove') 'BeginStop failure must not dispose or unlock a still-running worker'
 $globalResetCalls = [regex]::Matches($source, 'Reset-TokenRaderBackgroundFailureState\s+-Message')
 Assert-HistoryCallbackRecovery ($globalResetCalls.Count -eq 1) 'global failure reset is called outside the scoped resolver'
 

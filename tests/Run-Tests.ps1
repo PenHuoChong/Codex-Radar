@@ -1921,6 +1921,21 @@ try {
                 if ($computeP95 -gt [double]$profile.ComputeTargetMs * 1.5) { throw "PERFORMANCE FAILED: $($profile.Name) compute P95=$computeP95 ms" }
                 Write-Output ('PERF_INDEXED name={0} files={1} changed={2} coldCatalogMs={3:0.0} toolBackfillMs={4:0.0} warmStartP95Ms={5:0.0} viewP95Ms={6:0.0} endMs={7:0.0} computeP95Ms={8:0.0} bytesRead={9}' -f
                     $profile.Name, $profile.Files, $profile.Changed, $coldWatch.Elapsed.TotalMilliseconds, $backfillWatch.Elapsed.TotalMilliseconds, $startP95, $viewP95, $endWatch.Elapsed.TotalMilliseconds, $computeP95, [Int64]$result.BytesRead)
+                # Reopening must not parse a large offline backlog. Only one
+                # synthetic file changes among the existing 2k/5k cursors.
+                $padding = '{"type":"response_item","payload":{"synthetic":"' + ('x' * (2 * 1024 * 1024)) + '"}}' + "`n"
+                for ($pad = 0; $pad -lt 8; $pad++) {
+                    [IO.File]::AppendAllText([string]$changedPaths[0], $padding, [Text.UTF8Encoding]::new($false))
+                }
+                $quickProgress = [hashtable]::Synchronized(@{})
+                $quickWatch = [Diagnostics.Stopwatch]::StartNew()
+                $quick = Initialize-TokenRaderIndexFromNow -SessionsRoot $profileRoot -ProgressState $quickProgress
+                $quickWatch.Stop()
+                Assert-Equal $false ([bool]$quick.HistoryComplete) ($profile.Name + ' offline backlog remains manual history work')
+                if ([long]$quickProgress.ProcessedBytes -gt 262144L) { throw 'PERFORMANCE FAILED: quick startup read beyond bounded changed-file samples' }
+                if ($quickWatch.Elapsed.TotalMilliseconds -gt [double]$profile.StartTargetMs * 1.5) { throw ('PERFORMANCE FAILED: fast startup {0:0.0} ms' -f $quickWatch.Elapsed.TotalMilliseconds) }
+                Write-Output ('PERF_FAST_START name={0} files={1} backlogMiB=16 elapsedMs={2:0.0} sampledBytes={3}' -f
+                    $profile.Name, $profile.Files, $quickWatch.Elapsed.TotalMilliseconds, [long]$quickProgress.ProcessedBytes)
                 Close-TokenRaderIndex
             }
         } finally {
@@ -1956,7 +1971,10 @@ try {
     & (Join-Path $PSScriptRoot 'Run-MeasurementPricingUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IntervalRecoveryTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-HistoryCallbackRecoveryTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-BoundedHistoryUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IndexLockResponsivenessTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-FastStartCoreTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-FastStartIndexerTests.ps1')
     & (Join-Path $PSScriptRoot 'Test-BackgroundErrorDetails.ps1')
     & (Join-Path $PSScriptRoot 'Run-ExplorerTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ExplorerBackfillTests.ps1')
@@ -2092,8 +2110,8 @@ try {
     if ($uiSource -notmatch '未单独计价：工具 \{0:N0\} 次 · 输入图片 \{1:N0\} 张 · 生成图片 \{2:N0\} 张') {
         throw 'UI CONTRACT FAILED: runtime unpriced tool/image summary text is missing'
     }
-    if ($uiSource -notmatch 'HistoryRangeComboBox\.IsEnabled\s*=\s*\(\$NewState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)\)' -or
-        $uiSource -notmatch 'UsageHistoryRangeComboBox\.IsEnabled\s*=\s*\(\$NewState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)\)' -or
+    if ($uiSource -notmatch 'HistoryRangeComboBox\.IsEnabled\s*=\s*\(\$NewState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)(?:\s+-and\s+-not\s+\$historyBusy)?\)' -or
+        $uiSource -notmatch 'UsageHistoryRangeComboBox\.IsEnabled\s*=\s*\(\$NewState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)(?:\s+-and\s+-not\s+\$historyBusy)?\)' -or
         $uiSource -notmatch 'State\.UiState\s+-in\s+@\(''Idle'',\s*''Measuring'',\s*''Ready'',\s*''Error''\)') {
         throw 'UI CONTRACT FAILED: history range must remain selectable while measuring'
     }

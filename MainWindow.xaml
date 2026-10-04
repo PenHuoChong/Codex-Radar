@@ -263,6 +263,9 @@
                             <StackPanel>
                                 <TextBlock Text="本地会话" FontSize="16" FontWeight="SemiBold"/>
                                 <TextBlock x:Name="SessionCountText" Text="0 个日志" Foreground="{StaticResource MutedBrush}" FontSize="10"/>
+                                <TextBlock x:Name="HistoryCoverageText" Text="历史覆盖状态等待索引" Foreground="#D7B778" FontSize="10" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                                <Button x:Name="HistoryBackfillButton" Content="补齐历史日志" HorizontalAlignment="Left" Padding="9,5" FontSize="11" Margin="0,7,0,0" IsEnabled="False" ToolTip="手动分批导入历史日志；可以取消，随后继续。测量期间不可运行。"/>
+                                <TextBlock x:Name="HistoryBackfillStatusText" Text="启动只冻结当前位置，不自动扫描历史内容。" Foreground="{StaticResource MutedBrush}" FontSize="9" TextWrapping="Wrap" Margin="0,4,0,0"/>
                             </StackPanel>
                             <Button x:Name="OpenLogsButton" Grid.Column="1" Content="打开目录" Padding="9,5" FontSize="11"/>
                         </Grid>
@@ -478,6 +481,7 @@
                                     <TextBlock Text="API 等价美元（仅可观察 Token）" Foreground="#A8C7C0" FontSize="10"/>
                                     <TextBlock x:Name="UsageHistoryUsdText" Text="$0.0000" Foreground="{StaticResource AccentBrush}" FontSize="25" FontWeight="SemiBold" Margin="0,7,0,0"/>
                                     <TextBlock x:Name="UsageHistoryStatusText" Text="等待汇总" Foreground="#7FA39B" FontSize="9" Margin="0,3,0,0"/>
+                                    <TextBlock x:Name="UsageHistoryCoverageText" Text="历史覆盖状态等待索引" Foreground="#D7B778" FontSize="9" TextWrapping="Wrap" Margin="0,3,0,0"/>
                                 </StackPanel>
                             </Border>
                             <DataGrid x:Name="UsageHistoryModelGrid" Grid.Row="2" Grid.ColumnSpan="5" AutoGenerateColumns="False" Height="158" AlternationCount="2">
