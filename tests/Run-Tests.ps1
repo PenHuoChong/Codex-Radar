@@ -1977,6 +1977,8 @@ try {
     & (Join-Path $PSScriptRoot 'Run-RecentHistoryIndexerTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-RecentHistoryCoreTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-RecentHistoryUiTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-OversizedHistoryIndexerTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-FailureInfoUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-FastStartCoreTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-FastStartIndexerTests.ps1')
     & (Join-Path $PSScriptRoot 'Test-BackgroundErrorDetails.ps1')

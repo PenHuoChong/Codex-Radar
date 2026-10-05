@@ -19,6 +19,8 @@ $source = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
 # supplies only small UI/lifecycle seams below; it never reads auth data or
 # real session logs.
 foreach ($helperName in @(
+        'ConvertTo-TokenRaderCopyableStatusText',
+        'Set-TokenRaderLastFailureInfo',
         'Get-TokenRaderCallbackContextValue',
         'Complete-TokenRaderIntervalComputeJob',
         'Complete-TokenRaderIntervalCompute',
@@ -125,6 +127,7 @@ Assert-IntervalRecovery ($script:State.IntervalBaseline -eq $baseline) 'live ren
 Assert-IntervalRecovery ([Int64]$script:State.IntervalComputeRequestId -eq 0L) 'live rendering failure did not release the request id'
 Assert-IntervalRecovery (-not [bool]$script:State.IntervalComputing) 'live rendering failure left computation locked'
 Assert-IntervalRecovery ($script:State.IntervalLastError -match 'synthetic interval result rendering failure') 'live rendering error was not retained'
+Assert-IntervalRecovery ($script:State.LastFailureInfo -match 'synthetic interval result rendering failure') 'live render failure was not retained for copying'
 Assert-IntervalRecovery ($script:QuotaCardCalls -eq 1) 'live rendering failure did not refresh quota cards safely'
 Assert-IntervalRecovery ($script:HistoryRefreshCalls -eq 0) 'failed live rendering refreshed usage history as if successful'
 
@@ -187,6 +190,7 @@ Assert-IntervalRecovery ([Int64]$script:State.IntervalFinalRetry.EndRevision -eq
 Assert-IntervalRecovery ([Int64]$script:State.IntervalComputeRequestId -eq 0L) 'final rendering failure did not release the request id'
 Assert-IntervalRecovery (-not [bool]$script:State.IntervalComputing) 'final rendering failure left computation locked'
 Assert-IntervalRecovery ($script:State.IntervalLastError -match 'synthetic interval result rendering failure') 'final rendering error was not retained'
+Assert-IntervalRecovery ($script:State.LastFailureInfo -match 'synthetic interval result rendering failure') 'final render failure was not retained for copying'
 Assert-IntervalRecovery ($script:QuotaCardCalls -eq 1) 'final rendering failure did not refresh quota cards safely'
 Assert-IntervalRecovery ($script:HistoryRefreshCalls -eq 0) 'failed final rendering refreshed usage history as if successful'
 
@@ -211,6 +215,7 @@ $script:RetryStart = $null
 Update-IntervalView -Manual
 
 Assert-IntervalRecovery ($script:ShowCalls -eq 1) 'View Result did not attempt to paint its cached result'
+Assert-IntervalRecovery ($script:State.LastFailureInfo -match 'synthetic interval result rendering failure') 'cached render failure was not retained before retry status update'
 Assert-IntervalRecovery ($null -ne $script:RetryStart) 'cached render failure aborted the final retry'
 Assert-IntervalRecovery ([bool]$script:RetryStart.Final) 'cached render failure scheduled a non-final retry'
 Assert-IntervalRecovery ([bool]$script:RetryStart.ScanRateLimits) 'cached render failure skipped quota evidence on retry'

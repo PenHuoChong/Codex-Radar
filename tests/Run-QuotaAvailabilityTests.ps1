@@ -5,7 +5,8 @@ $ErrorActionPreference='Stop'
 $root=Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $root 'TokenRader.Core.psm1') -Force
 $source=Get-Content -Raw -Encoding UTF8 (Join-Path $root 'TokenRader.ps1')
-foreach($name in @('Fail-TokenRaderIndexSyncJob','Retain-TokenRaderQuotaEstimatesForCurrentWindow',
+foreach($name in @('ConvertTo-TokenRaderCopyableStatusText','Set-TokenRaderLastFailureInfo',
+    'Fail-TokenRaderIndexSyncJob','Retain-TokenRaderQuotaEstimatesForCurrentWindow',
     'Test-TokenRaderQuotaEstimateMatchesWindow','Mark-TokenRaderQuotaEstimatesRetainedAfterFailure',
     'Get-TokenRaderQuotaDiagnostic','Get-TokenRaderQuotaDiagnosticValue','Set-MeasurementPricingConfirmation',
     'Get-TokenRaderCallbackContextValue')) {

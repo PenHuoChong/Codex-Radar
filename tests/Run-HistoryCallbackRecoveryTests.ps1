@@ -16,6 +16,8 @@ $source = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
 # source-extraction harness: it does not launch the application, inspect logs,
 # or load account/auth/private-index data.
 foreach ($helperName in @(
+        'ConvertTo-TokenRaderCopyableStatusText',
+        'Set-TokenRaderLastFailureInfo',
         'Get-TokenRaderCallbackContextValue',
         'Reset-TokenRaderBackgroundFailureState',
         'Resolve-TokenRaderBackgroundCallbackFailure',

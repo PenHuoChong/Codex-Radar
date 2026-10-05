@@ -38,6 +38,7 @@ $script:State = @{
     IntervalComputePending = $false
     IntervalComputePendingRequest = $null
     IntervalLastError = ''
+    LastFailureInfo = ''
     IntervalFinalRetry = $null
     IntervalEnd = $null
     IntervalCache = $null
@@ -421,6 +422,104 @@ function New-TokenRaderRequestId {
     return [Int64]$script:State.RequestSequence
 }
 
+function ConvertTo-TokenRaderCopyableStatusText {
+    param([AllowNull()][string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return '' }
+    $text = [string]$Message
+
+    # Use the already-formatted UI/exception message only. Preserve useful
+    # multiline exception causes, while omitting structured session-record
+    # lines and any apparent body field if a lower layer includes one.
+    $safeLines = New-Object System.Collections.Generic.List[string]
+    $omittedBody = $false
+    foreach ($line in [regex]::Split($text, '\r?\n')) {
+        $recordMarker = [regex]::Match($line, '(?i)\{\s*"(?:type|payload|session_id|response_item|event_msg)"\s*:')
+        if ($recordMarker.Success) {
+            $prefix = $line.Substring(0, $recordMarker.Index).TrimEnd()
+            if (-not [string]::IsNullOrWhiteSpace($prefix)) { [void]$safeLines.Add($prefix) }
+            $omittedBody = $true
+            continue
+        }
+        $bodyMarker = [regex]::Match($line, '(?i)"(?:text|content|output|input|prompt|transcript|tool_output)"\s*:')
+        if ($bodyMarker.Success) {
+            $prefix = $line.Substring(0, $bodyMarker.Index).TrimEnd()
+            if ([string]::IsNullOrWhiteSpace($prefix)) { $prefix = '诊断信息' }
+            [void]$safeLines.Add($prefix)
+            $omittedBody = $true
+            continue
+        }
+        [void]$safeLines.Add($line)
+    }
+    if ($omittedBody) { [void]$safeLines.Add('[日志正文片段已省略]') }
+    $safeText = [string]::Join([Environment]::NewLine, $safeLines.ToArray()).Trim()
+    if ([string]::IsNullOrWhiteSpace($safeText)) { return '失败详情包含日志记录内容，已省略。' }
+    if ($safeText.Length -gt 8192) {
+        return $safeText.Substring(0, 8192) + [Environment]::NewLine + '… [尾部已截断，原始日志正文不会被读取或复制。]'
+    }
+    return $safeText
+}
+
+function Set-TokenRaderLastFailureInfo {
+    param([AllowNull()][string]$Message)
+    $copyableMessage = ConvertTo-TokenRaderCopyableStatusText -Message $Message
+    if ([string]::IsNullOrWhiteSpace($copyableMessage)) { return }
+    # Keep the last user-visible failure in memory only. Ordinary status and
+    # progress updates deliberately do not clear or replace this value.
+    $script:State.LastFailureInfo = $copyableMessage
+}
+
+function Get-TokenRaderCopyableStatusInfo {
+    param([AllowNull()][string]$CurrentStatus)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $safeStatus = ConvertTo-TokenRaderCopyableStatusText -Message $CurrentStatus
+    $lastFailure = ''
+    if ($script:State.ContainsKey('LastFailureInfo')) {
+        $lastFailure = ConvertTo-TokenRaderCopyableStatusText -Message ([string]$script:State.LastFailureInfo)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($safeStatus)) { [void]$lines.Add('当前状态：' + $safeStatus) }
+    if (-not [string]::IsNullOrWhiteSpace($lastFailure)) { [void]$lines.Add('最近失败：' + $lastFailure) }
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Copy-TokenRaderStatusAndFailureInfo {
+    param([AllowNull()][string]$CurrentStatus)
+    $copyText = Get-TokenRaderCopyableStatusInfo -CurrentStatus $CurrentStatus
+    if ([string]::IsNullOrWhiteSpace($copyText)) { return $false }
+    try {
+        [System.Windows.Clipboard]::SetText($copyText)
+        return $true
+    } catch {
+        try { $script:StatusText.Text = '复制失败：剪贴板暂不可用；请关闭其他剪贴板占用后重试。' } catch { }
+        return $false
+    }
+}
+
+function Initialize-TokenRaderStatusCopyMenus {
+    $targets = @(
+        $script:StatusText,
+        $script:HistoryBackfillStatusText,
+        $script:UsageHistoryStatusText,
+        $script:ToolUsageStatusText
+    )
+    foreach ($target in $targets) {
+        if ($null -eq $target) { continue }
+        $contextMenu = New-Object Windows.Controls.ContextMenu
+        $copyItem = New-Object Windows.Controls.MenuItem
+        $copyItem.Header = '复制状态/失败信息'
+        $copyItem.ToolTip = '手动点击后复制当前状态和最近失败信息；不会读取或复制原始日志正文。'
+        $copyItem.Tag = $target
+        $copyItem.Add_Click({
+            param($sender, $eventArgs)
+            $statusControl = $sender.Tag
+            $currentStatus = if ($null -ne $statusControl) { [string]$statusControl.Text } else { '' }
+            [void](Copy-TokenRaderStatusAndFailureInfo -CurrentStatus $currentStatus)
+        })
+        [void]$contextMenu.Items.Add($copyItem)
+        $target.ContextMenu = $contextMenu
+        $target.ToolTip = '右键可手动复制当前状态和最近失败信息。'
+    }
+}
+
 function Set-TokenRaderUiState {
     param(
         [Parameter(Mandatory = $true)]
@@ -429,6 +528,9 @@ function Set-TokenRaderUiState {
         [string]$StatusMessage = ''
     )
 
+    if ($NewState -eq 'Error' -and -not [string]::IsNullOrWhiteSpace($StatusMessage)) {
+        Set-TokenRaderLastFailureInfo -Message $StatusMessage
+    }
     $script:State.UiState = $NewState
     $script:State.IsMeasuring = ($NewState -eq 'Measuring')
     $canOperate = $NewState -in @('Idle', 'Ready', 'Error')
@@ -621,6 +723,7 @@ function Get-TokenRaderBackgroundErrorMessage {
 
 function Reset-TokenRaderBackgroundFailureState {
     param([Parameter(Mandatory = $true)][string]$Message)
+    Set-TokenRaderLastFailureInfo -Message $Message
     $script:State.MeasurementGeneration = [Int64]$script:State.MeasurementGeneration + 1L
     $script:State.IndexSyncing = $false
     $script:State.IndexSyncRequestId = 0L
@@ -702,7 +805,9 @@ function Resolve-TokenRaderBackgroundCallbackFailure {
     $script:State.UsageHistoryStopping = $stopPending
     $script:State.UsageHistoryRefreshing = $stopPending
     if (-not $stopPending) { $script:State.UsageHistoryRequestId = 0L }
-    try { $script:UsageHistoryStatusText.Text = $Message + ' 主测量不受影响，可重新查询周期用量。' } catch { }
+    $failureMessage = $Message + ' 主测量不受影响，可重新查询周期用量。'
+    Set-TokenRaderLastFailureInfo -Message $failureMessage
+    try { $script:UsageHistoryStatusText.Text = $failureMessage } catch { }
     try { Update-TokenRaderToolBackfillButton } catch { }
 }
 
@@ -1069,7 +1174,9 @@ function Fail-TokenRaderIndexSyncJob {
     $nextState = if ([string]$script:State.UiState -in @('Measuring','Stopping','ComputingFinal','Ready')) {
         [string]$script:State.UiState
     } else { 'Error' }
-    Set-TokenRaderUiState -NewState $nextState -StatusMessage ('后台索引同步失败：' + [string]$ErrorMessage + $(if ($stopPending) { ' 正在停止，退出前不能重新同步。' } else { '' }))
+    $statusMessage = '后台索引同步失败：' + [string]$ErrorMessage + $(if ($stopPending) { ' 正在停止，退出前不能重新同步。' } else { '' })
+    Set-TokenRaderLastFailureInfo -Message $statusMessage
+    Set-TokenRaderUiState -NewState $nextState -StatusMessage $statusMessage
     Update-QuotaCards
 }
 
@@ -1147,7 +1254,9 @@ function Fail-TokenRaderHistoryBackfillJob {
     $script:State.HistoryBackfillStopping = $stopPending
     $script:State.HistoryBackfillRunning = $stopPending
     if (-not $stopPending) { $script:State.HistoryBackfillRequestId = 0L }
-    $script:HistoryBackfillStatusText.Text = '历史补齐未完成：' + [string]$ErrorMessage + ' 已提交批次保留，可稍后继续；已有结果保持不变。'
+    $failureMessage = '历史补齐未完成：' + [string]$ErrorMessage + ' 已提交批次保留，可稍后继续；已有结果保持不变。'
+    Set-TokenRaderLastFailureInfo -Message $failureMessage
+    $script:HistoryBackfillStatusText.Text = $failureMessage
     Set-TokenRaderUiState -NewState ([string]$script:State.UiState)
 }
 
@@ -1307,7 +1416,9 @@ function Fail-TokenRaderUsageHistoryJob {
     param($ErrorMessage, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
     if ($script:WindowClosing -or [Int64]$script:State.UsageHistoryRequestId -ne $RequestId) { return }
     $stopPending = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'StopPending' -Default $false)
-    $script:UsageHistoryStatusText.Text = '汇总失败：' + [string]$ErrorMessage
+    $failureMessage = '汇总失败：' + [string]$ErrorMessage
+    Set-TokenRaderLastFailureInfo -Message $failureMessage
+    $script:UsageHistoryStatusText.Text = $failureMessage
     if ($stopPending) {
         $script:State.UsageHistoryStopping = $true
         return
@@ -1451,7 +1562,9 @@ function Fail-TokenRaderToolBackfillJob {
     param($ErrorMessage, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
     if ($script:WindowClosing -or [Int64]$script:State.ToolBackfillRequestId -ne $RequestId) { return }
     $stopPending = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'StopPending' -Default $false)
-    $script:ToolUsageStatusText.Text = '工具元数据回填失败：' + [string]$ErrorMessage
+    $failureMessage = '工具元数据回填失败：' + [string]$ErrorMessage
+    Set-TokenRaderLastFailureInfo -Message $failureMessage
+    $script:ToolUsageStatusText.Text = $failureMessage
     if ($stopPending) { return }
     $script:State.ToolBackfillRequestId = 0L
     $script:State.ToolBackfillRunning = $false
@@ -1577,6 +1690,7 @@ function Fail-TokenRaderIntervalComputeJob {
         [Int64]$script:State.IntervalComputeRequestId -ne $RequestId) { return }
 
     $message = '时间段后台计算失败：' + [string]$ErrorMessage
+    Set-TokenRaderLastFailureInfo -Message $message
     $stopPending = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'StopPending' -Default $false)
     $script:State.IntervalLastError = $message
 
@@ -3403,6 +3517,7 @@ function Complete-TokenRaderIntervalCompute {
         # available and a manual retry can refresh both quota cards.
         $script:State.QuotaCalibrationMessage = '时间段后台计算失败：' + $_.Exception.Message
         $script:State.IntervalLastError = [string]$script:State.QuotaCalibrationMessage
+        Set-TokenRaderLastFailureInfo -Message ([string]$script:State.IntervalLastError)
         if ($Final) {
             # Rendering is not evidence that the measurement boundary failed.
             # Keep the captured end for a manual retry, never restart counting.
@@ -3472,6 +3587,7 @@ function Update-IntervalView {
             # A failed cached render must not prevent the retry below from
             # requesting a fresh result or retaining the final frozen boundary.
             $script:State.IntervalLastError = '显示上次结果失败：' + $_.Exception.Message
+            Set-TokenRaderLastFailureInfo -Message ([string]$script:State.IntervalLastError)
             $script:StatusText.Text = $script:State.IntervalLastError + ' 正在重试更新。'
         }
         if ($script:State.UiState -in @('Stopping', 'ComputingFinal')) {
@@ -3578,6 +3694,8 @@ function Update-ProjectView {
             Set-EmptyMetrics -Message '项目汇总失败'
             $script:FormulaText.Text = '无法完成项目日志汇总。'
             $script:CaveatText.Text = [string]$_.Exception.Message
+            $failureMessage = '项目统计失败，请查看提示。' + [Environment]::NewLine + '原因：' + [string]$_.Exception.Message
+            Set-TokenRaderLastFailureInfo -Message $failureMessage
             $script:StatusText.Text = '项目统计失败，请查看提示。'
             return
         }
@@ -4260,7 +4378,9 @@ $script:RebuildIndexButton.Add_Click({
         Update-TokenRaderToolBackfillButton
         Start-TokenRaderUsageHistoryRefresh -ForceRefresh $true
     } catch {
-        $script:StatusText.Text = '索引重建失败：' + $_.Exception.Message
+        $failureMessage = '索引重建失败：' + $_.Exception.Message
+        Set-TokenRaderLastFailureInfo -Message $failureMessage
+        $script:StatusText.Text = $failureMessage
     } finally {
         Set-TokenRaderUiState -NewState ([string]$script:State.UiState)
     }
@@ -4282,7 +4402,9 @@ $script:PurgeOldIndexButton.Add_Click({
         $script:StatusText.Text = ('已清理 {0} 个30天以前的索引记录；原始日志保持不变。' -f [int]$cleanup.RemovedFiles)
         Start-TokenRaderUsageHistoryRefresh
     } catch {
-        $script:StatusText.Text = '旧索引清理失败：' + $_.Exception.Message
+        $failureMessage = '旧索引清理失败：' + $_.Exception.Message
+        Set-TokenRaderLastFailureInfo -Message $failureMessage
+        $script:StatusText.Text = $failureMessage
     } finally {
         Set-TokenRaderUiState -NewState ([string]$script:State.UiState)
     }
@@ -4374,6 +4496,7 @@ $script:Window.Add_Closing({
 })
 
 Set-PricingTable
+Initialize-TokenRaderStatusCopyMenus
 # 索引保存在项目 data/private 下。先立即显示已有结果，再在窗口出现后
 # 后台冻结当前位置（不扫描历史内容）；历史导入只能由用户手动启动。
 # Opening/migrating SQLite may wait for another writer. It belongs entirely to

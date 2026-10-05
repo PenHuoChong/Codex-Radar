@@ -968,6 +968,8 @@ public static class TokenRaderIndexer
             // the intentionally unimported older history complete.
             cmd.CommandText = "CREATE TABLE IF NOT EXISTS recent_history_work (path TEXT PRIMARY KEY, start_offset INTEGER NOT NULL DEFAULT 0, end_offset INTEGER NOT NULL, cursor_offset INTEGER NOT NULL DEFAULT 0, discard_line INTEGER NOT NULL DEFAULT 0, blocked_reason TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', model_source TEXT NOT NULL DEFAULT '', model_timestamp TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', service_tier_source TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', reasoning_effort TEXT NOT NULL DEFAULT '', has_total INTEGER NOT NULL DEFAULT 0, total_input INTEGER NOT NULL DEFAULT 0, total_cached INTEGER NOT NULL DEFAULT 0, total_output INTEGER NOT NULL DEFAULT 0, total_reasoning INTEGER NOT NULL DEFAULT 0)";
             cmd.ExecuteNonQuery();
+            EnsureHistoryBodyScanColumn(db, "history_gaps");
+            EnsureHistoryBodyScanColumn(db, "recent_history_work");
             cmd.CommandText = "CREATE TABLE IF NOT EXISTS recent_history_sources(path TEXT PRIMARY KEY,end_offset INTEGER NOT NULL)";
             cmd.ExecuteNonQuery();
             // Numeric lineage proof is not a token/cost row. It only prevents
@@ -1750,6 +1752,7 @@ public static class TokenRaderIndexer
         public string Path, Session, Root, Parent, Model, ModelSource, ModelTimestamp,
             Tier, TierSource, TurnId, ReasoningEffort, BlockedReason;
         public long Start, End, Cursor;
+        public string BodyScanState;
         public bool Discard;
         public bool Recent, HasTotal;
         public long TotalInput, TotalCached, TotalOutput, TotalReasoning;
@@ -2107,10 +2110,12 @@ public static class TokenRaderIndexer
             cmd.ExecuteNonQuery();
             if (resumeCompatible)
             {
-                string[] stateColumns = { "cursor_offset", "discard_line", "blocked_reason", "model", "model_source", "model_timestamp", "service_tier", "service_tier_source", "turn_id", "reasoning_effort", "has_total", "total_input", "total_cached", "total_output", "total_reasoning" };
+                string[] stateColumns = { "cursor_offset", "discard_line", "body_scan_state", "blocked_reason", "model", "model_source", "model_timestamp", "service_tier", "service_tier_source", "turn_id", "reasoning_effort", "has_total", "total_input", "total_cached", "total_output", "total_reasoning" };
                 var assignments = new List<string>();
                 foreach (string column in stateColumns) assignments.Add(column+"=(SELECT "+(column=="blocked_reason" ? "CASE WHEN p.blocked_reason='io_unavailable' THEN '' ELSE p.blocked_reason END" : "p."+column)+" FROM previous_recent_work p WHERE p.path=recent_history_work.path)");
-                cmd.CommandText = "UPDATE recent_history_work SET "+string.Join(",",assignments.ToArray())+" WHERE blocked_reason='' AND EXISTS(SELECT 1 FROM previous_recent_work p WHERE p.path=recent_history_work.path AND p.start_offset<=recent_history_work.start_offset AND p.cursor_offset>=recent_history_work.cursor_offset AND p.end_offset<=recent_history_work.end_offset AND p.blocked_reason IN ('','oversized_line','io_unavailable'))";
+                // Old oversized markers have no whole-line proof. Re-read the
+                // frozen gap rather than laundering a discarded suffix into coverage.
+                cmd.CommandText = "UPDATE recent_history_work SET "+string.Join(",",assignments.ToArray())+" WHERE blocked_reason='' AND EXISTS(SELECT 1 FROM previous_recent_work p WHERE p.path=recent_history_work.path AND p.start_offset<=recent_history_work.start_offset AND p.cursor_offset>=recent_history_work.cursor_offset AND p.end_offset<=recent_history_work.end_offset AND p.blocked_reason IN ('','io_unavailable') AND (p.discard_line=0 OR p.body_scan_state<>''))";
                 cmd.ExecuteNonQuery();
             }
             cmd.CommandText="DROP TABLE temp.previous_recent_work"; cmd.ExecuteNonQuery();
@@ -2204,11 +2209,11 @@ public static class TokenRaderIndexer
         HistoryGapState state = null;
         using (var cmd = db.CreateCommand())
         {
-            cmd.CommandText = "SELECT w.path,w.start_offset,w.end_offset,w.cursor_offset,w.discard_line,w.blocked_reason,w.model,w.model_source,w.model_timestamp,w.service_tier,w.service_tier_source,w.turn_id,w.reasoning_effort,COALESCE(f.session_id,''),COALESCE(f.root_session_id,''),COALESCE(NULLIF(f.parent_thread_id,''),f.forked_from_id,''),w.has_total,w.total_input,w.total_cached,w.total_output,w.total_reasoning FROM recent_history_work w LEFT JOIN file_metadata f ON f.path=w.path WHERE w.cursor_offset<w.end_offset AND w.blocked_reason IN ('','oversized_line') ORDER BY w.path LIMIT 1";
+            cmd.CommandText = "SELECT w.path,w.start_offset,w.end_offset,w.cursor_offset,w.discard_line,w.blocked_reason,w.model,w.model_source,w.model_timestamp,w.service_tier,w.service_tier_source,w.turn_id,w.reasoning_effort,COALESCE(f.session_id,''),COALESCE(f.root_session_id,''),COALESCE(NULLIF(f.parent_thread_id,''),f.forked_from_id,''),w.has_total,w.total_input,w.total_cached,w.total_output,w.total_reasoning,w.body_scan_state FROM recent_history_work w LEFT JOIN file_metadata f ON f.path=w.path WHERE w.cursor_offset<w.end_offset AND w.blocked_reason IN ('','oversized_line') ORDER BY w.path LIMIT 1";
             using (var reader = cmd.ExecuteReader()) if (reader.Read()) state = new HistoryGapState {
                 Recent = true, Cutoff = status.Cutoff.Value, FrozenEnd = status.FrozenAt.Value,
                 Path = ReadReaderString(reader,0), Start = ReadReaderInt64(reader,1), End = ReadReaderInt64(reader,2), Cursor = ReadReaderInt64(reader,3), Discard = ReadReaderInt64(reader,4)!=0,
-                BlockedReason = ReadReaderString(reader,5), Model = ReadReaderString(reader,6), ModelSource = ReadReaderString(reader,7), ModelTimestamp = ReadReaderString(reader,8), Tier = ReadReaderString(reader,9), TierSource = ReadReaderString(reader,10), TurnId = ReadReaderString(reader,11), ReasoningEffort = ReadReaderString(reader,12), Session = ReadReaderString(reader,13), Root = ReadReaderString(reader,14), Parent = ReadReaderString(reader,15), HasTotal = ReadReaderInt64(reader,16)!=0, TotalInput = ReadReaderInt64(reader,17), TotalCached = ReadReaderInt64(reader,18), TotalOutput = ReadReaderInt64(reader,19), TotalReasoning = ReadReaderInt64(reader,20) };
+                BlockedReason = ReadReaderString(reader,5), Model = ReadReaderString(reader,6), ModelSource = ReadReaderString(reader,7), ModelTimestamp = ReadReaderString(reader,8), Tier = ReadReaderString(reader,9), TierSource = ReadReaderString(reader,10), TurnId = ReadReaderString(reader,11), ReasoningEffort = ReadReaderString(reader,12), Session = ReadReaderString(reader,13), Root = ReadReaderString(reader,14), Parent = ReadReaderString(reader,15), HasTotal = ReadReaderInt64(reader,16)!=0, TotalInput = ReadReaderInt64(reader,17), TotalCached = ReadReaderInt64(reader,18), TotalOutput = ReadReaderInt64(reader,19), TotalReasoning = ReadReaderInt64(reader,20), BodyScanState = ReadReaderString(reader,21) };
         }
         if (state == null) return status;
         long original = state.Cursor; int imported = 0;
@@ -2241,14 +2246,14 @@ public static class TokenRaderIndexer
         HistoryGapState state = null;
         using (var cmd = db.CreateCommand())
         {
-            cmd.CommandText = "SELECT g.path,g.start_offset,g.end_offset,g.cursor_offset,g.discard_line,g.blocked_reason,g.model,g.model_source,g.model_timestamp,g.service_tier,g.service_tier_source,g.turn_id,g.reasoning_effort,COALESCE(f.session_id,''),COALESCE(f.root_session_id,''),COALESCE(NULLIF(f.parent_thread_id,''),f.forked_from_id,'') FROM history_gaps g LEFT JOIN file_metadata f ON f.path=g.path WHERE g.cursor_offset<g.end_offset AND g.blocked_reason IN ('','oversized_line','fast_start_boundary_unknown') ORDER BY g.path,g.start_offset LIMIT 1";
+            cmd.CommandText = "SELECT g.path,g.start_offset,g.end_offset,g.cursor_offset,g.discard_line,g.blocked_reason,g.model,g.model_source,g.model_timestamp,g.service_tier,g.service_tier_source,g.turn_id,g.reasoning_effort,COALESCE(f.session_id,''),COALESCE(f.root_session_id,''),COALESCE(NULLIF(f.parent_thread_id,''),f.forked_from_id,''),g.body_scan_state FROM history_gaps g LEFT JOIN file_metadata f ON f.path=g.path WHERE g.cursor_offset<g.end_offset AND g.blocked_reason IN ('','oversized_line','fast_start_boundary_unknown') ORDER BY g.path,g.start_offset LIMIT 1";
             using (var reader = cmd.ExecuteReader())
                 if (reader.Read()) state = new HistoryGapState {
                     Path = ReadReaderString(reader, 0), Start = ReadReaderInt64(reader, 1), End = ReadReaderInt64(reader, 2), Cursor = ReadReaderInt64(reader, 3),
                     Discard = ReadReaderInt64(reader, 4) != 0L,
                     BlockedReason = ReadReaderString(reader, 5), Model = ReadReaderString(reader, 6), ModelSource = ReadReaderString(reader, 7), ModelTimestamp = ReadReaderString(reader, 8),
                     Tier = ReadReaderString(reader, 9), TierSource = ReadReaderString(reader, 10), TurnId = ReadReaderString(reader, 11), ReasoningEffort = ReadReaderString(reader, 12),
-                    Session = ReadReaderString(reader, 13), Root = ReadReaderString(reader, 14), Parent = ReadReaderString(reader, 15) };
+                    Session = ReadReaderString(reader, 13), Root = ReadReaderString(reader, 14), Parent = ReadReaderString(reader, 15), BodyScanState = ReadReaderString(reader,16) };
         }
         if (state == null) { var empty = GetHistoryBackfillStatus(db); empty.AttemptedFiles = attempted; return empty; }
         attempted++;
@@ -2271,13 +2276,17 @@ public static class TokenRaderIndexer
         var stopped = GetHistoryBackfillStatus(db); stopped.AttemptedFiles = attempted; return stopped;
     }
 
-    /// <summary>Retry only transient I/O failures; safety blocks stay intact.</summary>
+    /// <summary>Retry I/O, and re-scan oversized gaps from their original boundary.</summary>
     public static int ResetHistoryBackfillRetries(SQLiteConnection db)
     {
         using (var cmd = db.CreateCommand())
         {
             cmd.CommandText = "UPDATE history_gaps SET blocked_reason=CASE WHEN blocked_reason='io_unavailable' THEN '' ELSE substr(blocked_reason,16) END WHERE blocked_reason='io_unavailable' OR blocked_reason LIKE 'io_unavailable:%'";
-            return cmd.ExecuteNonQuery();
+            int changed = cmd.ExecuteNonQuery();
+            // Clearing this diagnosis is permitted only with a full frozen-gap
+            // replay: no previous discarded suffix or context can become proof.
+            cmd.CommandText = "UPDATE history_gaps SET cursor_offset=start_offset,discard_line=0,body_scan_state='',blocked_reason='',model='',model_source='',model_timestamp='',service_tier='',service_tier_source='',turn_id='',reasoning_effort='' WHERE blocked_reason='oversized_line'";
+            return changed + cmd.ExecuteNonQuery();
         }
     }
 
@@ -2575,6 +2584,26 @@ public static class TokenRaderIndexer
                 if (history != null && effectiveEnd < history.End && fs.Length < history.End)
                     throw new IOException("Historical source shrank before its frozen EOF; gap retained.");
                 if (safeStart >= effectiveEnd) { cancel.ThrowIfCancellationRequested(); tx.Commit(); return 0; }
+                long bodySourceCreatedTicks = history == null ? 0L : File.GetCreationTimeUtc(filePath).Ticks;
+                if (history != null && history.Discard && !string.IsNullOrEmpty(history.BodyScanState) &&
+                    !BodyScanSourceMatches(history.BodyScanState, bodySourceCreatedTicks))
+                {
+                    // This guard prevents continuation state being joined to a
+                    // replaced path. Creation time is not a content-integrity proof.
+                    history.BlockedReason = "source_replaced";
+                    using (var guard = db.CreateCommand())
+                    {
+                        guard.Transaction = tx; guard.CommandText = "UPDATE history_gaps SET blocked_reason='source_replaced' WHERE path=@path AND (cursor_offset<end_offset OR blocked_reason<>'')";
+                        guard.Parameters.AddWithValue("@path", history.Path); guard.ExecuteNonQuery();
+                    }
+                    cancel.ThrowIfCancellationRequested();
+                    SaveHistoryGapState(db, tx, history); AdvanceRevisionInTransaction(db, tx); tx.Commit(); return 0;
+                }
+                if (history != null && effectiveEnd < history.End && effectiveEnd-safeStart > 1L)
+                {
+                    fs.Seek(effectiveEnd-1L, SeekOrigin.Begin);
+                    if (fs.ReadByte() == '\r') effectiveEnd--; // keep CRLF together in the next bounded batch
+                }
 
                 string currentModel = inheritedModel;
                 string currentModelSource = inheritedModelSource;
@@ -2603,7 +2632,8 @@ public static class TokenRaderIndexer
                 // The byte reader below reports the exact UTF-8 end offset,
                 // including the newline, for every inserted token record.
                 using (var lineReader = new Utf8JsonlLineReader(fs, safeStart, effectiveEnd, cancel,
-                    progress, deadline, null, history != null && history.Discard, maxMilliseconds))
+                    progress, deadline, null, history != null && history.Discard, maxMilliseconds,
+                    history != null, history == null ? null : history.BodyScanState, bodySourceCreatedTicks))
                 {
                     if (skipPartialLine)
                     {
@@ -3044,10 +3074,14 @@ public static class TokenRaderIndexer
                             else
                             {
                                 history.Discard = true;
-                                history.BlockedReason = effectiveEnd == history.End ? "incomplete_frozen_line" : "oversized_line";
+                                if (lineReader.Position >= history.End) history.BlockedReason = "incomplete_frozen_line";
+                                else if (!lineReader.BodyScanCanContinue) history.BlockedReason = "oversized_line";
                             }
                         }
-                        if (lineReader.SkippedOversizedLine) history.BlockedReason = "oversized_line";
+                        if (lineReader.OversizedPotentialUsage) history.BlockedReason = "oversized_line";
+                        history.BodyScanState = history.Discard ? lineReader.BodyScanState : "";
+                        if (history.Discard && history.Cursor >= history.End)
+                            history.BlockedReason = "incomplete_frozen_line";
                         history.Model = currentModel; history.ModelSource = currentModelSource;
                         history.ModelTimestamp = currentModelContextTimestamp;
                         history.Tier = currentServiceTier; history.TierSource = currentServiceTierSource;
@@ -3098,7 +3132,7 @@ public static class TokenRaderIndexer
         using (var cmd = db.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = "UPDATE " + (history.Recent ? "recent_history_work" : "history_gaps") + " SET cursor_offset=MAX(cursor_offset,@cursor),discard_line=@discard,blocked_reason=@blocked,model=@model,model_source=@modelSource,model_timestamp=@modelTimestamp,service_tier=@tier,service_tier_source=@tierSource,turn_id=@turn,reasoning_effort=@reasoning" + (history.Recent ? ",has_total=@hasTotal,total_input=@totalInput,total_cached=@totalCached,total_output=@totalOutput,total_reasoning=@totalReasoning" : "") + " WHERE path=@path AND start_offset=@start AND end_offset=@end";
+            cmd.CommandText = "UPDATE " + (history.Recent ? "recent_history_work" : "history_gaps") + " SET cursor_offset=MAX(cursor_offset,@cursor),discard_line=@discard,body_scan_state=@bodyScan,blocked_reason=@blocked,model=@model,model_source=@modelSource,model_timestamp=@modelTimestamp,service_tier=@tier,service_tier_source=@tierSource,turn_id=@turn,reasoning_effort=@reasoning" + (history.Recent ? ",has_total=@hasTotal,total_input=@totalInput,total_cached=@totalCached,total_output=@totalOutput,total_reasoning=@totalReasoning" : "") + " WHERE path=@path AND start_offset=@start AND end_offset=@end";
             if (history.Recent) {
                 cmd.Parameters.AddWithValue("@hasTotal",history.HasTotal ? 1 : 0);
                 cmd.Parameters.AddWithValue("@totalInput",history.TotalInput); cmd.Parameters.AddWithValue("@totalCached",history.TotalCached);
@@ -3107,6 +3141,7 @@ public static class TokenRaderIndexer
             cmd.Parameters.AddWithValue("@path", history.Path); cmd.Parameters.AddWithValue("@start", history.Start); cmd.Parameters.AddWithValue("@end", history.End);
             cmd.Parameters.AddWithValue("@cursor", history.Cursor);
             cmd.Parameters.AddWithValue("@discard", history.Discard ? 1 : 0); cmd.Parameters.AddWithValue("@blocked", history.BlockedReason ?? "");
+            cmd.Parameters.AddWithValue("@bodyScan", history.BodyScanState ?? "");
             cmd.Parameters.AddWithValue("@model", history.Model ?? ""); cmd.Parameters.AddWithValue("@modelSource", history.ModelSource ?? ""); cmd.Parameters.AddWithValue("@modelTimestamp", history.ModelTimestamp ?? "");
             cmd.Parameters.AddWithValue("@tier", history.Tier ?? ""); cmd.Parameters.AddWithValue("@tierSource", history.TierSource ?? "");
             cmd.Parameters.AddWithValue("@turn", history.TurnId ?? ""); cmd.Parameters.AddWithValue("@reasoning", history.ReasoningEffort ?? "");
@@ -6995,6 +7030,176 @@ public static class TokenRaderIndexer
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
+    private static void EnsureHistoryBodyScanColumn(SQLiteConnection db, string table)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(" + table + ")";
+            bool exists = false;
+            using (var reader = cmd.ExecuteReader())
+                while (reader.Read()) if (string.Equals(reader.GetString(1), "body_scan_state", StringComparison.Ordinal)) exists = true;
+            if (!exists) { cmd.CommandText = "ALTER TABLE " + table + " ADD COLUMN body_scan_state TEXT NOT NULL DEFAULT ''"; cmd.ExecuteNonQuery(); }
+        }
+    }
+
+    private static bool BodyScanSourceMatches(string state, long createdTicks)
+    {
+        if (string.IsNullOrEmpty(state) || state.Length > 600) return false;
+        string[] parts = (state ?? "").Split('|'); long stored;
+        return parts.Length == 3 && parts[0] == "2" &&
+            long.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out stored) && stored > 0L && stored == createdTicks;
+    }
+
+    // Deliberately not a general JSON parser. Only this four-level, pure-text
+    // response schema can be discarded without losing usage, context, tools or
+    // image metadata. Strings are validated but never retained. Persisted state
+    // contains only versioned enum values, bitsets and counters (at most 512 chars).
+    private sealed class PureTextBodyScan
+    {
+        private static readonly string[] Keys = { "type", "timestamp", "payload", "role", "content", "id", "phase", "text", "end_turn", "recipient" };
+        private static readonly string[] Types = { "response_item", "message", "input_text", "output_text", "text" };
+        private static readonly string[] Roles = { "user", "assistant", "system", "developer" };
+        private static readonly string[] Literals = { "true", "false", "null" };
+        // invalid, depth, done, lex mode, match mask/position, escape/unicode,
+        // UTF-8 remaining/min/max, then four (kind, stage, seen keys, key) frames.
+        private readonly int[] s = new int[27];
+        public bool CanContinue { get { return s[0] == 0; } }
+        public bool Complete { get { return CanContinue && s[1] == 0 && s[2] == 1 && s[3] == 0; } }
+        public PureTextBodyScan() { }
+        public PureTextBodyScan(string state)
+        {
+            if (string.IsNullOrEmpty(state) || state.Length > 512) { s[0] = 1; return; }
+            string[] parts = (state ?? "").Split(',');
+            // Version 2 requires a validated role and forbids recipient strings.
+            // Version 1 continuation cannot satisfy this stricter whole-line proof.
+            if (parts.Length != 28 || parts[0] != "2" || (state ?? "").Length > 512) { s[0] = 1; return; }
+            for (int i = 0; i < s.Length; i++)
+                if (!int.TryParse(parts[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || s[i] > 1023) { s[0] = 1; return; }
+            if (s[0] > 1 || s[1] > 4 || s[2] > 1 || s[3] > 5 || s[5] > 16 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[9] > 255 || s[10] > 255) s[0] = 1;
+            if (!CanContinue) return;
+            if ((s[3] != 0 && s[1] == 0) || (s[2] == 1 && s[1] != 0)) s[0] = 1;
+            for (int i = 0; i < 4; i++) if (s[11+i*4] > 4 || s[12+i*4] > 4 || s[14+i*4] > Keys.Length) s[0] = 1;
+            for (int i = 0; i < s[1]; i++) if (s[11+i*4] != i+1) s[0] = 1;
+        }
+        public string Save()
+        {
+            var values = new string[28]; values[0] = "2";
+            for (int i = 0; i < s.Length; i++) values[i+1] = s[i].ToString(CultureInfo.InvariantCulture);
+            return string.Join(",", values);
+        }
+        private int Frame { get { return 11 + (s[1]-1)*4; } }
+        private void Fail() { s[0] = 1; }
+        private static bool Space(int b) { return b == 0x20 || b == 0x09 || b == 0x0D || b == 0x0A; }
+        private static bool Hex(int b) { return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F'); }
+        private void BeginString(int mode)
+        {
+            s[3] = mode; s[4] = mode == 2 ? (1 << Keys.Length)-1 : mode == 3 ? (1 << Types.Length)-1 : mode == 5 ? (1 << Roles.Length)-1 : 0; s[5] = s[6] = s[7] = s[8] = 0;
+        }
+        private int Exact(string[] candidates)
+        {
+            for (int i = 0; i < candidates.Length; i++) if ((s[4] & (1 << i)) != 0 && candidates[i].Length == s[5]) return i;
+            return -1;
+        }
+        private void Match(int b, string[] candidates)
+        {
+            for (int i = 0; i < candidates.Length; i++)
+                if ((s[4] & (1 << i)) != 0 && (s[5] >= candidates[i].Length || candidates[i][s[5]] != b)) s[4] &= ~(1 << i);
+            s[5]++; if (s[4] == 0) Fail();
+        }
+        private void EndString()
+        {
+            int f = Frame, kind = s[f], mode = s[3]; s[3] = 0;
+            if (mode == 2)
+            {
+                int key = Exact(Keys)+1;
+                int allowed = kind == 1 ? 7 : kind == 2 ? 1|8|16|32|64|256|512 : kind == 4 ? 1|128 : 0;
+                int bit = key > 0 ? 1 << (key-1) : 0;
+                if (bit == 0 || (allowed & bit) == 0 || (s[f+2] & bit) != 0) { Fail(); return; }
+                s[f+2] |= bit; s[f+3] = key; s[f+1] = 1;
+            }
+            else
+            {
+                int type = mode == 3 ? Exact(Types) : -1;
+                if (mode == 3 && !((kind == 1 && type == 0) || (kind == 2 && type == 1) || (kind == 4 && type >= 2))) { Fail(); return; }
+                if (mode == 5 && (kind != 2 || Exact(Roles) < 0)) { Fail(); return; }
+                s[f+1] = 3;
+            }
+        }
+        private void Push(int kind)
+        {
+            if (s[1] == 4) { Fail(); return; }
+            if (s[1] > 0) s[Frame+1] = 3;
+            int f = 11 + s[1]*4; s[1]++; s[f] = kind; s[f+1] = s[f+2] = s[f+3] = 0;
+        }
+        private void Close(int b)
+        {
+            int f = Frame, kind = s[f], required = kind == 1 ? 5 : kind == 2 ? 25 : kind == 4 ? 129 : 0;
+            if (b != (kind == 3 ? ']' : '}') || (s[f+2] & required) != required) { Fail(); return; }
+            s[1]--; if (s[1] == 0) s[2] = 1;
+        }
+        public void Feed(int b)
+        {
+            if (!CanContinue) return;
+            if (s[3] == 4)
+            {
+                if (b >= 'a' && b <= 'z') { Match(b, Literals); return; }
+                int literal = Exact(Literals), key = s[Frame+3];
+                if (literal < 0 || (key != 9 && literal != 2)) { Fail(); return; }
+                s[3] = 0; s[Frame+1] = 3; Feed(b); return;
+            }
+            if (s[3] != 0)
+            {
+                if (s[8] > 0)
+                {
+                    if (b < s[9] || b > s[10]) { Fail(); return; }
+                    s[8]--; s[9] = 0x80; s[10] = 0xBF; return;
+                }
+                if (s[6] == 2) { if (!Hex(b)) Fail(); else if (--s[7] == 0) s[6] = 0; return; }
+                if (s[6] == 1)
+                {
+                    s[6] = 0;
+                    if (b == 'u') { s[6] = 2; s[7] = 4; }
+                    else if (b != '"' && b != '\\' && b != '/' && b != 'b' && b != 'f' && b != 'n' && b != 'r' && b != 't') Fail();
+                    return;
+                }
+                if (b == '"') { EndString(); return; }
+                if (b < 0x20) { Fail(); return; }
+                if (s[3] == 2 || s[3] == 3 || s[3] == 5) { Match(b, s[3] == 2 ? Keys : s[3] == 3 ? Types : Roles); return; }
+                if (b == '\\') { s[6] = 1; return; }
+                if (b < 0x80) return;
+                s[9] = 0x80; s[10] = 0xBF;
+                if (b >= 0xC2 && b <= 0xDF) s[8] = 1;
+                else if (b >= 0xE0 && b <= 0xEF) { s[8] = 2; if (b == 0xE0) s[9] = 0xA0; if (b == 0xED) s[10] = 0x9F; }
+                else if (b >= 0xF0 && b <= 0xF4) { s[8] = 3; if (b == 0xF0) s[9] = 0x90; if (b == 0xF4) s[10] = 0x8F; }
+                else Fail();
+                return;
+            }
+            if (Space(b)) return;
+            if (s[1] == 0) { if (s[2] == 0 && b == '{') Push(1); else Fail(); return; }
+            int frame = Frame, k = s[frame], stage = s[frame+1], property = s[frame+3];
+            if (stage == 0 || stage == 4)
+            {
+                if (stage == 0 && b == (k == 3 ? ']' : '}')) { Close(b); return; }
+                if (k == 3) { if (b == '{') Push(4); else Fail(); }
+                else if (b == '"') BeginString(2); else Fail();
+            }
+            else if (stage == 1) { if (b == ':') s[frame+1] = 2; else Fail(); }
+            else if (stage == 2)
+            {
+                if (k == 1 && property == 3) { if (b == '{') Push(2); else Fail(); }
+                else if (k == 2 && property == 5) { if (b == '[') Push(3); else Fail(); }
+                // A routed recipient may represent a tool call even when its
+                // content is text. Only absent/null recipient is proven harmless.
+                else if (b == '"' && property != 9 && property != 10) BeginString(property == 1 ? 3 : property == 4 ? 5 : 1);
+                else if (k == 2 && (property == 6 || property == 7 || property == 9 || property == 10) && (b == 't' || b == 'f' || b == 'n'))
+                { s[3] = 4; s[4] = 7; s[5] = 0; Feed(b); }
+                else Fail();
+            }
+            else if (stage == 3) { if (b == ',') s[frame+1] = 4; else Close(b); }
+            else Fail();
+        }
+    }
+
     /// <summary>
     /// 读取 [startOffset,endOffset) 内的 UTF-8 JSONL。StreamReader 会预读
     /// 数 KB 内容，无法用 BaseStream.Position 得到当前行结束位置；本类
@@ -7014,11 +7219,16 @@ public static class TokenRaderIndexer
         private readonly Stopwatch _deadline;
         private readonly int _maxMilliseconds;
         private bool _discarding;
+        private readonly bool _classifyBody;
+        private readonly long _bodySourceCreatedTicks;
+        private PureTextBodyScan _bodyScan;
         public long Position { get { return _position; } }
         public long IncompleteStart { get; private set; }
         public bool Discarding { get { return _discarding; } }
         public bool SkippedOversizedLine { get; private set; }
         public bool OversizedPotentialUsage { get; private set; }
+        public bool BodyScanCanContinue { get { return _bodyScan != null && _bodyScan.CanContinue; } }
+        public string BodyScanState { get { return _bodyScan == null ? "" : "2|" + _bodySourceCreatedTicks.ToString(CultureInfo.InvariantCulture) + "|" + _bodyScan.Save(); } }
 
         public Utf8JsonlLineReader(Stream stream, long startOffset, long endOffset)
             : this(stream, startOffset, endOffset, CancellationToken.None, null, null, null, false, 0)
@@ -7026,7 +7236,8 @@ public static class TokenRaderIndexer
 
         public Utf8JsonlLineReader(Stream stream, long startOffset, long endOffset,
             CancellationToken cancel, IDictionary progress, Stopwatch deadline,
-            byte[] unusedPending, bool discard, int maxMilliseconds = 0)
+            byte[] unusedPending, bool discard, int maxMilliseconds = 0,
+            bool classifyBody = false, string bodyScanState = null, long bodySourceCreatedTicks = 0L)
         {
             _stream = stream;
             _position = Math.Max(0L, startOffset);
@@ -7036,6 +7247,10 @@ public static class TokenRaderIndexer
             _bufferCount = 0;
             _cancel = cancel; _progress = progress; _deadline = deadline; _maxMilliseconds = maxMilliseconds;
             _discarding = discard; IncompleteStart = -1L;
+            _classifyBody = classifyBody;
+            _bodySourceCreatedTicks = bodySourceCreatedTicks;
+            if (_classifyBody && discard)
+                _bodyScan = new PureTextBodyScan(BodyScanSourceMatches(bodyScanState, bodySourceCreatedTicks) ? bodyScanState.Split('|')[2] : "");
         }
 
         public bool ReadLine(out string line, out long lineEndOffset, out bool terminated)
@@ -7046,6 +7261,7 @@ public static class TokenRaderIndexer
             _cancel.ThrowIfCancellationRequested();
             if (_deadline != null && _maxMilliseconds > 0 && _deadline.ElapsedMilliseconds >= _maxMilliseconds) return false;
             long lineStart = _position;
+            if (_classifyBody && !_discarding) _bodyScan = new PureTextBodyScan();
 
             using (var bytes = new MemoryStream())
             {
@@ -7065,22 +7281,28 @@ public static class TokenRaderIndexer
                         terminated = true;
                         break;
                     }
+                    if (_bodyScan != null) _bodyScan.Feed(value);
                     if (!_discarding)
                     {
                         if (bytes.Length < 1024L * 1024L) bytes.WriteByte((byte)value);
                         else
                         {
-                            string prefix = Encoding.UTF8.GetString(bytes.ToArray());
-                            string topType; bool isNull;
-                            bool provenBody = TryGetJsonStringOrNullAtPath(prefix, new[] { "type" }, out topType, out isNull) &&
-                                !isNull && string.Equals(topType, "response_item", StringComparison.OrdinalIgnoreCase);
-                            if (!provenBody) OversizedPotentialUsage = true;
+                            if (!_classifyBody)
+                            {
+                                string prefix = Encoding.UTF8.GetString(bytes.ToArray());
+                                string topType; bool isNull;
+                                bool provenBody = TryGetJsonStringOrNullAtPath(prefix, new[] { "type" }, out topType, out isNull) &&
+                                    !isNull && string.Equals(topType, "response_item", StringComparison.OrdinalIgnoreCase);
+                                if (!provenBody) OversizedPotentialUsage = true;
+                            }
                             _discarding = true; SkippedOversizedLine = true; bytes.SetLength(0L);
                         }
                     }
                 }
 
                 lineEndOffset = _position;
+                if (terminated && _discarding && _classifyBody && (_bodyScan == null || !_bodyScan.Complete))
+                    OversizedPotentialUsage = true;
                 if (bytes.Length == 0 && !terminated && _position >= _endOffset)
                 {
                     if (_position > lineStart) IncompleteStart = lineStart;
@@ -7113,6 +7335,7 @@ public static class TokenRaderIndexer
         {
             if (_bufferIndex < _bufferCount) return true;
             _cancel.ThrowIfCancellationRequested();
+            if (_deadline != null && _maxMilliseconds > 0 && _deadline.ElapsedMilliseconds >= _maxMilliseconds) return false;
             long remaining = _endOffset - _position;
             if (remaining <= 0L) return false;
             int requested = (int)Math.Min((long)_buffer.Length, remaining);

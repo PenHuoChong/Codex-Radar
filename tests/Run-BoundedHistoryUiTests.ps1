@@ -15,7 +15,8 @@ $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens
 Assert-BoundedUi (@($errors).Count -eq 0) 'production UI must parse'
 $coreSource = [IO.File]::ReadAllText((Join-Path $root 'TokenRader.Core.psm1'))
 Assert-BoundedUi ($coreSource -match '(?s)if \(\$requiresReplacement\) \{[^}]*source_replaced[^}]*throw.*?DeleteTokenRecordsBySessionId') 'blocked source replacement must be rejected before deleting preserved indexed rows'
-foreach ($name in @('Get-TokenRaderCallbackContextValue', 'Set-TokenRaderHistoryCoverage',
+foreach ($name in @('ConvertTo-TokenRaderCopyableStatusText', 'Set-TokenRaderLastFailureInfo',
+        'Get-TokenRaderCallbackContextValue', 'Set-TokenRaderHistoryCoverage',
         'Update-TokenRaderHistoryBackfillButton', 'Fail-TokenRaderHistoryBackfillJob',
         'Complete-TokenRaderHistoryBackfillStopJob', 'Fail-TokenRaderIndexSyncJob',
         'Complete-TokenRaderIndexSyncStopJob', 'Resolve-TokenRaderBackgroundCallbackFailure',

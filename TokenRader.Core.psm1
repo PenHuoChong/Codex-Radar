@@ -4187,8 +4187,9 @@ function Invoke-TokenRaderHistoryBackfillBatch {
     $lease = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
     try {
         if ($RetryBlocked) {
-            # Retry transient file access failures only on an explicit new
-            # user action, never reset source-replacement/oversized protections.
+            # Explicit retries reopen transient I/O failures. Oversized gaps
+            # restart at their original boundary for whole-line validation;
+            # source-replacement blocks are never cleared by this action.
             [void][TokenRaderIndexer]::ResetHistoryBackfillRetries($index.Connection)
         }
         $result = [TokenRaderIndexer]::BackfillHistoryBatch($index.Connection, $MaxBytes, $MaxMilliseconds, $ProgressState, $CancellationToken)
