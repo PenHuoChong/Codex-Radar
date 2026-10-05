@@ -110,6 +110,12 @@ try {
     Assert-Boundary (-not $message.Contains($temp) -and -not $message.Contains('padding')) 'initial import diagnostic excludes source data'
     Close-TokenRaderIndex
 
+    $safeCompacted = & $module {
+        Get-TokenRaderSafeIndexFailure -Exception ([IO.IOException]::new('Compacted archival record cannot be safely indexed; synthetic-private-body'))
+    }
+    Assert-Boundary ($safeCompacted.Kind -eq 'safety') 'compacted structure failure is not mislabeled as temporary I/O'
+    Assert-Boundary (-not $safeCompacted.Message.Contains('synthetic-private')) 'compacted failure does not expose source detail'
+
     $safeUnknown = & $module {
         Get-TokenRaderSafeIndexFailure -Exception ([InvalidOperationException]::new('synthetic-private-path and {"text":"synthetic private body"}'))
     }

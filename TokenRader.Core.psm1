@@ -3761,6 +3761,9 @@ function Get-TokenRaderSafeIndexFailure {
     if ($message -match 'Oversized usage/context line cannot be safely indexed') {
         return [pscustomobject]@{ Kind = 'safety'; Message = '超大记录结构未通过安全校验（Oversized usage/context line cannot be safely indexed）；保留原游标，需核对记录类型或完整性' }
     }
+    if ($message -match 'Compacted archival record cannot be safely indexed') {
+        return [pscustomobject]@{ Kind = 'safety'; Message = '压缩归档记录结构未通过安全校验；保留原游标，需核对记录完整性' }
+    }
     if ($message -match 'Source was replaced/truncated|源日志已被替换') {
         return [pscustomobject]@{ Kind = 'safety'; Message = '源日志被替换或截断；为避免混合来源，保留阻断及原游标' }
     }

@@ -120,6 +120,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
 
 超过 1 MiB 的已知 `event_msg → item_completed → CommandExecution` 命令完成记录使用有界流式解析：完整校验结构后仅保留必要工具元数据，不保存命令、工作目录或标准输出/错误正文，后续 Token 记录仍正常导入。实时统计与分批历史补齐采用同一规则；半行、未知字段、重复字段及损坏结构不会被当作已完成，工具完成记录按调用标识去重，不额外增加 Token 或费用。
 
+`compacted` 上下文压缩记录同样使用有界流式校验，适用于小记录和超大记录。其替换历史、保留消息和恢复信息只验证 JSON 结构，不保存正文，也不重新统计其中的图片、工具或历史调用；`latest_token_usage_record` 作为历史快照处理，不把会话累计量或最近一次调用再次加入费用，也不覆盖现有 Token 基线。后续真实 `token_count` 仍按原规则导入。这不表示压缩操作本身免费；[官方压缩文档](https://developers.openai.com/api/docs/guides/compaction)描述的是 API 的压缩过程，本程序不能把本地归档快照冒充一次新增计费事件。未知外层字段、异常数值、损坏结构和未结束行仍保留阻断，不将部分历史伪报为已补齐。
+
 启动命令与完整克隆示例见上方“安装方法”，不需要额外依赖安装步骤。
 
 ## 输入与输出

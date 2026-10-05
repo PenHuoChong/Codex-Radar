@@ -2732,6 +2732,24 @@ public static class TokenRaderIndexer
                         if (string.IsNullOrWhiteSpace(line)) continue;
                         line = line.TrimStart('\uFEFF');
 
+                        if (IsCompactedEnvelope(line))
+                        {
+                            var compactedScan = new CompactedBodyScan();
+                            byte[] compactedBytes = Encoding.UTF8.GetBytes(line);
+                            for (int i = 0; i < compactedBytes.Length; i++) {
+                                if ((i & 65535) == 0) cancel.ThrowIfCancellationRequested();
+                                compactedScan.Feed(compactedBytes[i]);
+                            }
+                            if (!compactedScan.Complete) {
+                                if (history == null)
+                                    throw new IOException("Compacted archival record cannot be safely indexed; import rolled back and cursor retained.");
+                                history.BlockedReason = "oversized_line";
+                            }
+                            // Archival copies are not additional calls, images,
+                            // context updates, or token_count cumulative baselines.
+                            continue;
+                        }
+
                         // Metadata state is driven only by the top-level event
                         // envelope.  Prompt/response text can mention words
                         // such as "turn_context" or "reasoning_effort" and
@@ -3241,6 +3259,47 @@ public static class TokenRaderIndexer
         }
     }
 
+    private static bool IsCompactedEnvelope(string line)
+    {
+        if (string.IsNullOrEmpty(line) || line.IndexOf("\"compacted\"", StringComparison.Ordinal) < 0) return false;
+        // Classification only, not validation. Avoid the recursive metadata
+        // walker on archival trees: the closed DFA below owns full validation
+        // and its explicit depth bound. Never interpret a nested type as root.
+        int index = 0, depth = 0; bool keyExpected = false;
+        SkipJsonWhitespace(line, ref index);
+        if (index >= line.Length || line[index++] != '{') return false;
+        depth = 1; keyExpected = true;
+        while (index < line.Length && depth > 0) {
+            char b = line[index];
+            if (b == '"') {
+                if (depth == 1 && keyExpected) {
+                    string key;
+                    if (!TryReadJsonString(line, ref index, out key)) return false;
+                    SkipJsonWhitespace(line, ref index);
+                    if (index >= line.Length || line[index++] != ':') return false;
+                    SkipJsonWhitespace(line, ref index);
+                    if (key == "type") {
+                        string type;
+                        return TryReadJsonString(line, ref index, out type) && type == "compacted";
+                    }
+                    keyExpected = false; continue;
+                }
+                index++;
+                while (index < line.Length) {
+                    char c = line[index++];
+                    if (c == '\\') { if (index < line.Length) index++; else return false; }
+                    else if (c == '"') break;
+                }
+                continue;
+            }
+            if (b == '{' || b == '[') depth++;
+            else if (b == '}' || b == ']') depth--;
+            else if (b == ',' && depth == 1) keyExpected = true;
+            index++;
+        }
+        return false;
+    }
+
     private static bool MightContainToolMetadata(string line)
     {
         if (string.IsNullOrWhiteSpace(line)) return false;
@@ -3274,6 +3333,7 @@ public static class TokenRaderIndexer
     {
         TokenRaderJsonRecord record = DeserializeLogRecord(line);
         if (record == null) return 0;
+        if (string.Equals(record.Type, "compacted", StringComparison.Ordinal)) return 0;
         if (string.Equals(record.Type, "event_msg", StringComparison.Ordinal) &&
             record.Payload != null && string.Equals(record.Payload.Type, "item_completed", StringComparison.Ordinal) &&
             line.IndexOf("CommandExecution", StringComparison.Ordinal) >= 0)
@@ -7172,7 +7232,7 @@ public static class TokenRaderIndexer
     {
         if (string.IsNullOrEmpty(state) || state.Length > 600) return false;
         string[] parts = (state ?? "").Split('|'); long stored;
-        return parts.Length == 3 && (parts[0] == "2" || parts[0] == "3") &&
+        return parts.Length == 3 && (parts[0] == "2" || parts[0] == "3" || parts[0] == "4") &&
             long.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out stored) && stored > 0L && stored == createdTicks;
     }
 
@@ -7374,32 +7434,218 @@ public static class TokenRaderIndexer
         }
     }
 
+    // Compaction is an archival checkpoint, never an additional usage/tool
+    // event. Closed semantic envelopes surround explicitly opaque archives.
+    // Those archives receive full JSON syntax validation but no interpretation.
+    private sealed class CompactedBodyScan
+    {
+        private static readonly string[][] Keys = {
+            new string[0],
+            new[] { "timestamp", "type", "ordinal", "payload" },
+            new[] { "compaction_response_id", "first_window_id", "latest_token_usage_record", "message", "previous_window_id", "replacement_history", "replacement_history_metadata", "resume_metadata", "retained_context", "window_id", "window_number" },
+            new[] { "response_id", "root_turn_id", "session_id", "thread_id", "turn_id", "thread_token_usage", "turn_token_usage", "usage" },
+            new[] { "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens", "cache_write_input_tokens" },
+            new string[0], new string[0]
+        };
+        private static readonly string[] Literals = { "true", "false", "null" };
+        private const int MaxDepth = 24;
+        // Invalid/depth/done/mode/match/position/escape/unicode/UTF8 bounds,
+        // number stage and reserved slots; then bounded kind/stage/seen/key frames.
+        private readonly int[] s = new int[14+MaxDepth*4];
+        private long number;
+        public bool CanContinue { get { return s[0] == 0; } }
+        public bool Complete { get { return CanContinue && s[1] == 0 && s[2] == 1 && s[3] == 0; } }
+        private int Frame { get { return 14+(s[1]-1)*4; } }
+        public CompactedBodyScan() { }
+        public CompactedBodyScan(string saved)
+        {
+            string[] p = (saved ?? "").Split(',');
+            if (p.Length != s.Length+2 || p[0] != "1" || (saved ?? "").Length > 575) { Fail(); return; }
+            for (int i = 0; i < s.Length; i++)
+                if (!int.TryParse(p[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || s[i] > 2047) { Fail(); return; }
+            if (!long.TryParse(p[p.Length-1], NumberStyles.None, CultureInfo.InvariantCulture, out number) || number < 0 || s[0] > 1 || s[1] > MaxDepth || s[2] > 1 || s[3] > 6 || s[5] > 64 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[9] > 255 || s[10] > 255 || s[11] > 8 || s[12] != 0 || s[13] != 0) { Fail(); return; }
+            if ((s[3] != 0 && s[1] == 0) || (s[2] == 1 && s[1] != 0)) { Fail(); return; }
+            for (int i = 0; i < s[1]; i++) {
+                int f = 14+i*4, k = s[f];
+                if (k < 1 || k > 6 || s[f+1] > 4 || s[f+3] > Keys[k].Length || (s[f+2] >> Keys[k].Length) != 0) { Fail(); return; }
+                if (i == 0 && k != 1) { Fail(); return; }
+                if (i == 1 && k != 2) { Fail(); return; }
+                if (i > 1) {
+                    int parent = s[f-4], key = s[f-1];
+                    bool permitted = parent == 2 && ((key == 3 && k == 3) || ((key == 6 || key == 7) && k == 5) || ((key == 8 || key == 9) && k == 6)) || parent == 3 && key >= 6 && k == 4 || (parent == 5 || parent == 6) && (k == 5 || k == 6);
+                    if (!permitted) { Fail(); return; }
+                }
+            }
+        }
+        public string Save()
+        {
+            string[] p = new string[s.Length+2]; p[0] = "1";
+            for (int i = 0; i < s.Length; i++) p[i+1] = s[i].ToString(CultureInfo.InvariantCulture);
+            p[p.Length-1] = number.ToString(CultureInfo.InvariantCulture);
+            return string.Join(",",p);
+        }
+        private void Fail() { s[0] = 1; }
+        private static bool Space(int b) { return b == 32 || b == 9 || b == 13 || b == 10; }
+        private void Push(int kind)
+        {
+            if (s[1] == MaxDepth) { Fail(); return; }
+            if (s[1] > 0) s[Frame+1] = 3;
+            int f = 14+s[1]*4; s[1]++; s[f] = kind; s[f+1] = s[f+2] = s[f+3] = 0;
+        }
+        private void Close(int b)
+        {
+            int f = Frame, k = s[f], required = k == 1 ? 10 : k == 4 ? 63 : 0;
+            if (b != (k == 5 ? ']' : '}') || (s[f+2] & required) != required) { Fail(); return; }
+            s[1]--; if (s[1] == 0) s[2] = 1;
+        }
+        private void BeginString(int mode)
+        {
+            s[3] = mode; s[4] = mode == 2 ? (1 << Keys[s[Frame]].Length)-1 : 0;
+            s[5] = s[6] = s[7] = s[8] = 0;
+        }
+        private void EndString()
+        {
+            int f = Frame, k = s[f], mode = s[3]; s[3] = 0;
+            if (mode == 2) {
+                int key = -1;
+                for (int i = 0; i < Keys[k].Length; i++) if ((s[4] & (1 << i)) != 0 && Keys[k][i].Length == s[5]) { key = i; break; }
+                if (key < 0 || (s[f+2] & (1 << key)) != 0) { Fail(); return; }
+                s[f+2] |= 1 << key; s[f+3] = key+1; s[f+1] = 1;
+            } else if (mode == 6) s[f+1] = 1; // opaque object property name
+            else {
+                if (mode == 3 && s[5] != 9) { Fail(); return; }
+                s[f+1] = 3;
+            }
+        }
+        private void BeginValue(int b, bool opaque)
+        {
+            int k = s[Frame], key = s[Frame+3];
+            int child = opaque ? (b == '{' ? 6 : b == '[' ? 5 : 0) : k == 1 && key == 4 ? 2 : k == 2 && key == 3 ? 3 : k == 2 && (key == 6 || key == 7) ? 5 : k == 2 && (key == 8 || key == 9) ? 6 : k == 3 && key >= 6 ? 4 : 0;
+            // An explicitly absent archive contains no events to replay. Keep
+            // old compacted records with null optional archives compatible.
+            bool nullable = k == 2 && (key == 3 || key >= 6 && key <= 9) || k == 3 && key <= 5;
+            if (child > 0 && b == (child == 5 ? '[' : '{')) { Push(child); return; }
+            if ((opaque || nullable) && b == 'n' || opaque && (b == 't' || b == 'f')) { s[3] = 5; s[4] = opaque ? 7 : 4; s[5] = 0; Feed(b); return; }
+            if (child > 0) { Fail(); return; }
+            bool numeric = opaque || k == 1 && key == 3 || k == 2 && key == 11 || k == 4;
+            bool text = opaque || k == 1 && key <= 2 || k == 2 && key != 11 || k == 3 && key <= 5;
+            if (text && b == '"') { BeginString(k == 1 && key == 2 ? 3 : 1); return; }
+            if (numeric && (b == '-' || b >= '0' && b <= '9')) {
+                if (k == 4 && b == '-') { Fail(); return; }
+                s[3] = 4; s[11] = b == '-' ? 1 : 0; number = 0;
+                if (b != '-') Feed(b); return;
+            }
+            Fail();
+        }
+        public void Feed(int b)
+        {
+            if (!CanContinue) return;
+            if (s[3] == 4) {
+                int stage = s[11]; bool usage = s[Frame] == 4;
+                if (b >= '0' && b <= '9') {
+                    if (stage == 2) { Fail(); return; }
+                    if (usage) { int digit = b-'0'; if (number > (long.MaxValue-digit)/10L) { Fail(); return; } number = number*10L+digit; }
+                    s[11] = stage == 0 || stage == 1 ? (b == '0' ? 2 : 3) : stage == 4 || stage == 5 ? 5 : stage >= 6 ? 8 : 3;
+                    return;
+                }
+                if (!usage && b == '.' && (stage == 2 || stage == 3)) { s[11] = 4; return; }
+                if (!usage && (b == 'e' || b == 'E') && (stage == 2 || stage == 3 || stage == 5)) { s[11] = 6; return; }
+                if (!usage && (b == '+' || b == '-') && stage == 6) { s[11] = 7; return; }
+                if (stage != 2 && stage != 3 && stage != 5 && stage != 8) { Fail(); return; }
+                s[3] = 0; s[Frame+1] = 3; Feed(b); return;
+            }
+            if (s[3] == 5) {
+                if (b >= 'a' && b <= 'z') {
+                    for (int i = 0; i < Literals.Length; i++) if ((s[4] & (1 << i)) != 0 && (s[5] >= Literals[i].Length || Literals[i][s[5]] != b)) s[4] &= ~(1 << i);
+                    s[5]++; if (s[4] == 0) Fail(); return;
+                }
+                bool exact = false;
+                for (int i = 0; i < Literals.Length; i++) if ((s[4] & (1 << i)) != 0 && Literals[i].Length == s[5]) exact = true;
+                if (!exact) { Fail(); return; }
+                s[3] = 0; s[Frame+1] = 3; Feed(b); return;
+            }
+            if (s[3] != 0) {
+                if (s[8] > 0) { if (b < s[9] || b > s[10]) Fail(); else { s[8]--; s[9] = 128; s[10] = 191; } return; }
+                if (s[6] == 2) {
+                    if (!((b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F'))) Fail(); else if (--s[7] == 0) s[6] = 0; return;
+                }
+                if (s[6] == 1) {
+                    s[6] = 0;
+                    if (b == 'u') { s[6] = 2; s[7] = 4; }
+                    else if (b != '"' && b != '\\' && b != '/' && b != 'b' && b != 'f' && b != 'n' && b != 'r' && b != 't') Fail();
+                    return;
+                }
+                if (b == '"') { EndString(); return; }
+                if (b < 32) { Fail(); return; }
+                if (s[3] == 2) {
+                    string[] keys = Keys[s[Frame]];
+                    for (int i = 0; i < keys.Length; i++) if ((s[4] & (1 << i)) != 0 && (s[5] >= keys[i].Length || keys[i][s[5]] != b)) s[4] &= ~(1 << i);
+                    s[5]++; if (s[4] == 0) Fail(); return;
+                }
+                if (s[3] == 3) { const string type = "compacted"; if (s[5] >= type.Length || type[s[5]++] != b) Fail(); return; }
+                if (b == '\\') { s[6] = 1; return; }
+                if (b < 128) return;
+                s[9] = 128; s[10] = 191;
+                if (b >= 194 && b <= 223) s[8] = 1;
+                else if (b >= 224 && b <= 239) { s[8] = 2; if (b == 224) s[9] = 160; if (b == 237) s[10] = 159; }
+                else if (b >= 240 && b <= 244) { s[8] = 3; if (b == 240) s[9] = 144; if (b == 244) s[10] = 143; }
+                else Fail(); return;
+            }
+            if (Space(b)) return;
+            if (s[1] == 0) { if (s[2] == 0 && b == '{') Push(1); else Fail(); return; }
+            int f0 = Frame, kind = s[f0], current = s[f0+1];
+            if (current == 0 || current == 4) {
+                if (current == 0 && b == (kind == 5 ? ']' : '}')) { Close(b); return; }
+                if (kind == 5) BeginValue(b,true);
+                else if (b == '"') BeginString(kind == 6 ? 6 : 2); else Fail();
+            } else if (current == 1) { if (b == ':') s[f0+1] = 2; else Fail(); }
+            else if (current == 2) BeginValue(b,kind == 6);
+            else if (current == 3) { if (b == ',') s[f0+1] = 4; else Close(b); }
+            else Fail();
+        }
+    }
+
     private sealed class SafeOversizedBodyScan
     {
         private PureTextBodyScan text;
         private CommandExecutionBodyScan command;
-        public SafeOversizedBodyScan() { text = new PureTextBodyScan(); command = new CommandExecutionBodyScan(); }
-        public SafeOversizedBodyScan(string state, bool legacy)
+        private CompactedBodyScan compacted;
+        public SafeOversizedBodyScan() { text = new PureTextBodyScan(); command = new CommandExecutionBodyScan(); compacted = new CompactedBodyScan(); }
+        public SafeOversizedBodyScan(string state, string protocol)
         {
-            if (legacy) { text = new PureTextBodyScan(state); return; }
+            if (protocol == "2") { text = new PureTextBodyScan(state); return; }
             if (string.IsNullOrEmpty(state)) return;
+            if (protocol == "4") {
+                if (state[0] != 'B') { compacted = new CompactedBodyScan(state); return; }
+                string[] combined = state.Substring(1).Split(':');
+                if (combined.Length != 3) return;
+                if (combined[0].Length > 0) text = new PureTextBodyScan(combined[0]);
+                if (combined[1].Length > 0) command = new CommandExecutionBodyScan(combined[1]);
+                compacted = new CompactedBodyScan(combined[2]); return;
+            }
+            if (protocol != "3") return;
             string[] p = state.Substring(1).Split(':');
             if (state[0] == 'T' && p.Length == 1) text = new PureTextBodyScan(p[0]);
             else if (state[0] == 'C' && p.Length == 1) command = new CommandExecutionBodyScan(p[0]);
             else if (state[0] == 'B' && p.Length == 2) { text = new PureTextBodyScan(p[0]); command = new CommandExecutionBodyScan(p[1]); }
         }
-        public bool CanContinue { get { return (text != null && text.CanContinue || command != null && command.CanContinue) && Save().Length <= 575; } }
-        public bool Complete { get { return CanContinue && (text != null && text.Complete || command != null && command.Complete); } }
+        public bool CanContinue { get { return (text != null && text.CanContinue || command != null && command.CanContinue || compacted != null && compacted.CanContinue) && Save().Length <= 575; } }
+        public bool Complete { get { return CanContinue && (text != null && text.Complete || command != null && command.Complete || compacted != null && compacted.Complete); } }
         public CommandExecutionProjection Projection { get { return command == null ? null : command.Projection; } }
         // Keep the original numeric v2 rejection state too. A failed command
         // candidate must not change pure-text continuation's storage contract;
         // this does not revive either failed validator or admit its suffix.
-        public bool TextOnly { get { return text != null && (command == null || !command.CanContinue); } }
+        public bool TextOnly { get { return text != null && (command == null || !command.CanContinue) && (compacted == null || !compacted.CanContinue); } }
         public string TextState { get { return text == null ? "" : text.Save(); } }
-        public void Feed(int b) { if (text != null) text.Feed(b); if (command != null) command.Feed(b); }
+        public string Protocol { get { return TextOnly ? "2" : compacted != null && compacted.CanContinue ? "4" : "3"; } }
+        public void Feed(int b) { if (text != null) text.Feed(b); if (command != null) command.Feed(b); if (compacted != null) compacted.Feed(b); }
         public string Save()
         {
             bool t = text != null && text.CanContinue, c = command != null && command.CanContinue;
+            if (compacted != null && compacted.CanContinue) {
+                if (!t && !c) return compacted.Save();
+                return "B" + (t ? text.Save() : "") + ":" + (c ? command.Save() : "") + ":" + compacted.Save();
+            }
             if (t && c) return "B" + text.Save() + ":" + command.Save();
             if (t) return "T" + text.Save();
             if (c) return "C" + command.Save();
@@ -7585,7 +7831,7 @@ public static class TokenRaderIndexer
         public bool SkippedOversizedLine { get; private set; }
         public bool OversizedPotentialUsage { get; private set; }
         public bool BodyScanCanContinue { get { return _bodyScan != null && _bodyScan.CanContinue; } }
-        public string BodyScanState { get { return _bodyScan == null ? "" : (_bodyScan.TextOnly ? "2|" : "3|") + _bodySourceCreatedTicks.ToString(CultureInfo.InvariantCulture) + "|" + (_bodyScan.TextOnly ? _bodyScan.TextState : _bodyScan.CanContinue ? _bodyScan.Save() : "X"); } }
+        public string BodyScanState { get { return _bodyScan == null ? "" : _bodyScan.Protocol + "|" + _bodySourceCreatedTicks.ToString(CultureInfo.InvariantCulture) + "|" + (_bodyScan.TextOnly ? _bodyScan.TextState : _bodyScan.CanContinue ? _bodyScan.Save() : "X"); } }
         public CommandExecutionProjection CommandExecution { get; private set; }
 
         public Utf8JsonlLineReader(Stream stream, long startOffset, long endOffset)
@@ -7610,7 +7856,7 @@ public static class TokenRaderIndexer
             if (_classifyBody && discard)
             {
                 bool matches = BodyScanSourceMatches(bodyScanState, bodySourceCreatedTicks);
-                _bodyScan = new SafeOversizedBodyScan(matches ? bodyScanState.Split('|')[2] : "", matches && bodyScanState.Split('|')[0] == "2");
+                _bodyScan = new SafeOversizedBodyScan(matches ? bodyScanState.Split('|')[2] : "", matches ? bodyScanState.Split('|')[0] : "");
             }
         }
 
