@@ -354,7 +354,7 @@ try {
 } finally {
     if (Test-Path -LiteralPath $tempRoot) {
         $resolved = [IO.Path]::GetFullPath($tempRoot)
-        $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+        $tempBase = [IO.Path]::GetFullPath((Get-Item -LiteralPath ([IO.Path]::GetTempPath())).FullName).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
         if (-not $resolved.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe test cleanup target' }
         Remove-Item -LiteralPath $resolved -Recurse -Force
     }

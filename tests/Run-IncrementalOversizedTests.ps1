@@ -233,6 +233,6 @@ public sealed class IncrementalOversizedCancelProgress : Hashtable {
 finally {
     if($null-ne$db){$db.Close();$db.Dispose()}
     $resolved=[IO.Path]::GetFullPath($temp)
-    $prefix=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\TokenRader-IncrementalOversizedSynthetic-'
+    $prefix=[IO.Path]::GetFullPath((Get-Item -LiteralPath ([IO.Path]::GetTempPath())).FullName).TrimEnd('\')+'\TokenRader-IncrementalOversizedSynthetic-'
     if($resolved.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)){Remove-Item -LiteralPath $resolved -Recurse -Force}
 }

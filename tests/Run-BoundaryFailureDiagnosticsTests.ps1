@@ -274,7 +274,7 @@ try {
     if ($null -eq $previousDb) { Remove-Item Env:TOKEN_RADER_INDEX_DB -ErrorAction SilentlyContinue }
     else { $env:TOKEN_RADER_INDEX_DB = $previousDb }
     $full = [IO.Path]::GetFullPath($temp)
-    $base = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    $base = [IO.Path]::GetFullPath((Get-Item -LiteralPath ([IO.Path]::GetTempPath())).FullName).TrimEnd('\') + '\'
     if ($full.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) -and
         [IO.Path]::GetFileName($full).StartsWith('TokenRader-BoundaryDiagnostic-')) {
         Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue

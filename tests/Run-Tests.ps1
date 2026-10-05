@@ -279,7 +279,21 @@ $previousGlobalIndexOverride = [Environment]::GetEnvironmentVariable('TOKEN_RADE
 $globalTestIndexPath = Join-Path $tempRoot 'data\private\global-index\index.db'
 New-Item -ItemType Directory -Path (Split-Path -Parent $globalTestIndexPath) -Force | Out-Null
 $env:TOKEN_RADER_INDEX_DB = $globalTestIndexPath
+$previousTestTemporaryDirectories = @{
+    TEMP = [Environment]::GetEnvironmentVariable('TEMP', 'Process')
+    TMP = [Environment]::GetEnvironmentVariable('TMP', 'Process')
+}
+$fallbackTestTemporaryDirectory = [IO.Path]::GetTempPath()
 try {
+    # Child regressions use TEMP/TMP paths as exact SQLite source/offset keys.
+    # Expand CI's 8.3 aliases (e.g. RUNNER~1) once for the synthetic suite,
+    # matching the compiled indexer and PowerShell enumeration path spelling.
+    foreach ($temporaryVariable in @('TEMP', 'TMP')) {
+        $temporaryDirectory = [string]$previousTestTemporaryDirectories[$temporaryVariable]
+        if ([string]::IsNullOrWhiteSpace($temporaryDirectory)) { $temporaryDirectory = $fallbackTestTemporaryDirectory }
+        $canonicalTemporaryDirectory = [IO.Path]::GetFullPath((Get-Item -LiteralPath $temporaryDirectory).FullName)
+        [Environment]::SetEnvironmentVariable($temporaryVariable, $canonicalTemporaryDirectory, 'Process')
+    }
     $fixturePath = Join-Path $tempRoot 'rollout-2026-07-14T00-00-00-00000000-0000-0000-0000-000000000001.jsonl'
     $records = @(
         [ordered]@{
@@ -2470,6 +2484,7 @@ try {
 
     Write-Output 'ALL_TESTS_PASSED'
 } finally {
+    try {
     try { Close-TokenRaderIndex } catch { }
     if ($null -eq $previousGlobalIndexOverride) {
         Remove-Item Env:TOKEN_RADER_INDEX_DB -ErrorAction SilentlyContinue
@@ -2481,6 +2496,11 @@ try {
         $tempResolved = (Resolve-Path -LiteralPath $env:TEMP).Path
         if ($resolved.StartsWith($tempResolved, [System.StringComparison]::OrdinalIgnoreCase)) {
             Remove-Item -LiteralPath $tempRoot -Recurse -Force
+        }
+    }
+    } finally {
+        foreach ($temporaryVariable in @('TEMP', 'TMP')) {
+            [Environment]::SetEnvironmentVariable($temporaryVariable, $previousTestTemporaryDirectories[$temporaryVariable], 'Process')
         }
     }
 }

@@ -337,6 +337,9 @@ if ($null -eq ('TokenRaderIndexer' -as [type])) { Add-Type -Path $indexerDll }
 $prices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.json')
 $tempRoot = Join-Path $env:TEMP ('token-rader-usage-compat-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
+# Standalone runs also need identical long-path spelling for imported
+# source_path values and the aggregator's exact offset-map keys.
+$tempRoot = [IO.Path]::GetFullPath((Get-Item -LiteralPath $tempRoot).FullName)
 $intentionalDifferences = New-Object System.Collections.Generic.List[string]
 
 try {
@@ -684,7 +687,7 @@ try {
 } finally {
     if (Test-Path -LiteralPath $tempRoot) {
         $resolved = (Resolve-Path -LiteralPath $tempRoot).Path
-        $tempResolved = (Resolve-Path -LiteralPath $env:TEMP).Path
+        $tempResolved = [IO.Path]::GetFullPath((Get-Item -LiteralPath $env:TEMP).FullName).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
         if ($resolved.StartsWith($tempResolved, [StringComparison]::OrdinalIgnoreCase)) {
             Remove-Item -LiteralPath $tempRoot -Recurse -Force
         }
