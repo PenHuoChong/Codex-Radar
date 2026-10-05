@@ -4712,6 +4712,8 @@ function Sync-TokenRaderMeasurementBoundary {
     $totalImportedRecords = 0
     $totalRootBackfills = 0
     $lastSyncError = ''
+    $index = $null
+    $permanentFailure = $false
     do {
         $CancellationToken.ThrowIfCancellationRequested()
         $attempt++
@@ -4770,6 +4772,24 @@ function Sync-TokenRaderMeasurementBoundary {
         $totalRootBackfills += [int]$index.RootBackfilledRows
         $failedCount = @($index.LastFailedFiles).Count
         if ($failedCount -gt 0) {
+            # Preserve the actual per-file failures. Previously only the count
+            # survived this loop, hiding deterministic parser failures behind
+            # a misleading generic 'stable boundary' timeout.
+            $failureDetails = @($index.LastFailureMessages | Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$_)
+            } | Select-Object -Unique)
+            if ($failureDetails.Count -gt 0) {
+                $lastSyncError = (@($failureDetails | Select-Object -First 3 | ForEach-Object {
+                    $message = ([string]$_ -replace '[\r\n]+', ' ')
+                    if ($message.Length -gt 600) { $message.Substring(0, 600) + '…' } else { $message }
+                }) -join '；')
+            }
+            # Retrying an intentionally rejected source cannot repair it.
+            # Keep the cursor and records intact; do not reread it for 25 s.
+            $permanentFailure = @($failureDetails | Where-Object {
+                [string]$_ -match 'Oversized usage/context line cannot be safely indexed|源日志已被替换'
+            }).Count -gt 0
+            if ($permanentFailure) { break }
             $stableCatalogPasses = 0
             if ($null -ne $ProgressState) {
                 $ProgressState.Stage = ('重试 {0} 个暂时不可读日志' -f $failedCount)
@@ -4806,6 +4826,9 @@ function Sync-TokenRaderMeasurementBoundary {
 
     $remaining = if ($null -ne $index) { @($index.LastFailedFiles).Count } else { 0 }
     $detail = if ([string]::IsNullOrWhiteSpace($lastSyncError)) { '' } else { ' 最近错误：' + $lastSyncError }
+    if ($permanentFailure) {
+        throw ('无法安全导入 {0} 个日志；已停止重复重试，保留原游标且未冻结不完整结果。{1}' -f $remaining, $detail)
+    }
     throw ('无法在 {0} 秒内获得完整且稳定的日志边界（仍有 {1} 个日志待同步）；未冻结不完整结果。{2}' -f $TimeoutSeconds, $remaining, $detail)
 }
 

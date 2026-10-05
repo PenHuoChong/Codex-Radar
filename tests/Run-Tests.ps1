@@ -1973,6 +1973,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-HistoryCallbackRecoveryTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-BoundedHistoryUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IndexLockResponsivenessTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-BoundaryFailureDiagnosticsTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-FastStartCoreTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-FastStartIndexerTests.ps1')
     & (Join-Path $PSScriptRoot 'Test-BackgroundErrorDetails.ps1')
