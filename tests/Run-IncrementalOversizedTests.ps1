@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([string]$IndexerDll)
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'

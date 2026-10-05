@@ -2485,19 +2485,19 @@ try {
     Write-Output 'ALL_TESTS_PASSED'
 } finally {
     try {
-    try { Close-TokenRaderIndex } catch { }
-    if ($null -eq $previousGlobalIndexOverride) {
-        Remove-Item Env:TOKEN_RADER_INDEX_DB -ErrorAction SilentlyContinue
-    } else {
-        $env:TOKEN_RADER_INDEX_DB = $previousGlobalIndexOverride
-    }
-    if (Test-Path -LiteralPath $tempRoot) {
-        $resolved = (Resolve-Path -LiteralPath $tempRoot).Path
-        $tempResolved = (Resolve-Path -LiteralPath $env:TEMP).Path
-        if ($resolved.StartsWith($tempResolved, [System.StringComparison]::OrdinalIgnoreCase)) {
-            Remove-Item -LiteralPath $tempRoot -Recurse -Force
+        try { Close-TokenRaderIndex } catch { }
+        if ($null -eq $previousGlobalIndexOverride) {
+            Remove-Item Env:TOKEN_RADER_INDEX_DB -ErrorAction SilentlyContinue
+        } else {
+            $env:TOKEN_RADER_INDEX_DB = $previousGlobalIndexOverride
         }
-    }
+        if (Test-Path -LiteralPath $tempRoot) {
+            $resolved = (Resolve-Path -LiteralPath $tempRoot).Path
+            $tempResolved = (Resolve-Path -LiteralPath $env:TEMP).Path
+            if ($resolved.StartsWith($tempResolved, [System.StringComparison]::OrdinalIgnoreCase)) {
+                Remove-Item -LiteralPath $tempRoot -Recurse -Force
+            }
+        }
     } finally {
         foreach ($temporaryVariable in @('TEMP', 'TMP')) {
             [Environment]::SetEnvironmentVariable($temporaryVariable, $previousTestTemporaryDirectories[$temporaryVariable], 'Process')
