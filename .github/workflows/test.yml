@@ -5,9 +5,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,9 +26,12 @@ jobs:
       - name: Build launcher and indexer
         shell: powershell
         run: .\Build.ps1
-      - name: Run regression tests
+      - name: Run regression tests on Windows PowerShell 5.1
         shell: powershell
-        run: .\tests\Run-Tests.ps1
+        run: powershell.exe -NoProfile -STA -File .\tests\Run-Tests.ps1
+      - name: Run regression tests on PowerShell 7
+        shell: pwsh
+        run: pwsh -NoProfile -STA -File .\tests\Run-Tests.ps1
       - name: Verify UI callbacks on Windows PowerShell 5.1
         shell: powershell
         run: .\tests\Run-UiCallbackTests.ps1

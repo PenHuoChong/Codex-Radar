@@ -3523,6 +3523,7 @@ function Format-TokenRaderUsd {
 # ── SQLite 索引引擎（磁盘数据库，sub2api 式，内存恒定） ─────────────────
 
 $script:TokenRaderIndex = $null
+$script:TokenRaderIndexerLoadDiagnostic = $null
 
 function Get-TokenRaderIndexerPath {
     return Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.dll'
@@ -3551,23 +3552,108 @@ function Get-TokenRaderIndexerDbPath {
     return Join-Path (Get-TokenRaderIndexerDataDir) 'index.db'
 }
 
+function New-TokenRaderIndexerLoadDiagnostic {
+    param(
+        [Parameter(Mandatory = $true)][string]$Code,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [AllowNull()][string]$HResult,
+        [AllowNull()][string]$ExceptionType
+    )
+    # Only fixed, code-owned text may be stored. Add-Type details can include
+    # private paths or source data, so exception messages are never retained.
+    return [pscustomobject]@{
+        Code = $Code
+        Message = $Message
+        HResult = $HResult
+        ExceptionType = $ExceptionType
+    }
+}
+
+function New-TokenRaderIndexerExceptionDiagnostic {
+    param([Parameter(Mandatory = $true)][Exception]$Exception)
+
+    $policyHResult = [int]-2147020345 # 0x800711C7: Windows app-control policy block.
+    $cursor = $Exception
+    $leaf = $Exception
+    $policyException = $null
+    for ($depth = 0; $null -ne $cursor -and $depth -lt 16; $depth++) {
+        $leaf = $cursor
+        if ([int]$cursor.HResult -eq $policyHResult) {
+            $policyException = $cursor
+            break
+        }
+        $cursor = $cursor.InnerException
+    }
+
+    $diagnosticException = if ($null -ne $policyException) { $policyException } else { $leaf }
+    $exceptionType = [string]$diagnosticException.GetType().FullName
+    $hresult = '0x{0:X8}' -f [int]$diagnosticException.HResult
+    if ($null -ne $policyException) {
+        return New-TokenRaderIndexerLoadDiagnostic -Code 'windows-app-control-blocked' `
+            -Message 'Windows 应用控制策略阻止加载额度索引组件 (HRESULT 0x800711C7)。重新生成 DLL 不会解除此策略限制；请联系设备管理员检查应用控制策略。' `
+            -HResult $hresult -ExceptionType $exceptionType
+    }
+
+    return New-TokenRaderIndexerLoadDiagnostic -Code 'load-error' `
+        -Message ('额度索引组件加载失败 (Type={0}, HRESULT={1})。' -f $exceptionType, $hresult) `
+        -HResult $hresult -ExceptionType $exceptionType
+}
+
+function Get-TokenRaderIndexerLoadDiagnostic {
+    if ($null -eq $script:TokenRaderIndexerLoadDiagnostic) { return $null }
+    return [pscustomobject]@{
+        Code = [string]$script:TokenRaderIndexerLoadDiagnostic.Code
+        Message = [string]$script:TokenRaderIndexerLoadDiagnostic.Message
+        HResult = $script:TokenRaderIndexerLoadDiagnostic.HResult
+        ExceptionType = $script:TokenRaderIndexerLoadDiagnostic.ExceptionType
+    }
+}
+
 <#
 .SYNOPSIS
     加载 C# 和 SQLite DLL，返回是否成功。
 #>
 function Initialize-TokenRaderIndexer {
-    $dllPath = Get-TokenRaderIndexerPath
-    $sqlitePath = Join-Path $PSScriptRoot 'indexer\System.Data.SQLite.dll'
-    $indexerLoaded = $null -ne ('TokenRaderIndexer' -as [type])
-    $sqliteLoaded = $null -ne ('System.Data.SQLite.SQLiteConnection' -as [type])
-    if ((-not $indexerLoaded -and -not (Test-Path -LiteralPath $dllPath)) -or
-        (-not $sqliteLoaded -and -not (Test-Path -LiteralPath $sqlitePath))) { return $false }
+    $script:TokenRaderIndexerLoadDiagnostic = $null
     try {
+        $dllPath = Get-TokenRaderIndexerPath
+        $sqlitePath = Join-Path $PSScriptRoot 'indexer\System.Data.SQLite.dll'
+        $indexerLoaded = $null -ne ('TokenRaderIndexer' -as [type])
+        $sqliteLoaded = $null -ne ('System.Data.SQLite.SQLiteConnection' -as [type])
+        $indexerExists = $indexerLoaded -or (Test-Path -LiteralPath $dllPath)
+        $sqliteExists = $sqliteLoaded -or (Test-Path -LiteralPath $sqlitePath)
+        if (-not $indexerExists -or -not $sqliteExists) {
+            $missing = @()
+            if (-not $indexerExists) { $missing += 'indexer' }
+            if (-not $sqliteExists) { $missing += 'sqlite' }
+            if ($missing.Count -eq 2) {
+                $message = '缺少额度索引器和 SQLite 运行时依赖；运行 Build.ps1 生成索引器，并还原应用依赖后重试。'
+                $code = 'missing-indexer-and-dependency'
+            } elseif (-not $indexerExists) {
+                $message = '额度索引器 DLL 缺失；运行 Build.ps1 生成索引器后重试。'
+                $code = 'missing-indexer'
+            } else {
+                $message = 'SQLite 运行时依赖缺失；请还原应用依赖后重试。'
+                $code = 'missing-dependency'
+            }
+            $script:TokenRaderIndexerLoadDiagnostic = New-TokenRaderIndexerLoadDiagnostic `
+                -Code $code -Message $message -HResult $null -ExceptionType $null
+            return $false
+        }
         if (-not $sqliteLoaded) { Add-Type -Path $sqlitePath -ErrorAction Stop }
         if (-not $indexerLoaded) { Add-Type -Path $dllPath -ErrorAction Stop }
-        return ($null -ne ('TokenRaderIndexer' -as [type]) -and
+        $loaded = ($null -ne ('TokenRaderIndexer' -as [type]) -and
             $null -ne ('System.Data.SQLite.SQLiteConnection' -as [type]))
-    } catch { return $false }
+        if (-not $loaded) {
+            $script:TokenRaderIndexerLoadDiagnostic = New-TokenRaderIndexerLoadDiagnostic `
+                -Code 'load-incomplete' -Message '额度索引组件加载后仍不可用；请检查组件版本及运行时依赖。' `
+                -HResult $null -ExceptionType $null
+        }
+        return [bool]$loaded
+    } catch {
+        $script:TokenRaderIndexerLoadDiagnostic = New-TokenRaderIndexerExceptionDiagnostic -Exception $_.Exception
+        return $false
+    }
 }
 
 function Close-TokenRaderIndex {
@@ -3592,7 +3678,11 @@ function Open-TokenRaderIndex {
     )
 
     if (-not (Initialize-TokenRaderIndexer)) {
-        throw 'C# Indexer DLL 不可用，请先运行 Build.ps1'
+        $loadDiagnostic = Get-TokenRaderIndexerLoadDiagnostic
+        if ($null -ne $loadDiagnostic -and -not [string]::IsNullOrWhiteSpace([string]$loadDiagnostic.Message)) {
+            throw [string]$loadDiagnostic.Message
+        }
+        throw '额度索引组件不可用；未生成加载诊断。'
     }
     $canonicalRoot = [IO.Path]::GetFullPath($SessionsRoot).TrimEnd([char]'\', [char]'/')
     $existing = $script:TokenRaderIndex
@@ -3652,10 +3742,68 @@ function Open-TokenRaderIndex {
         LastImportedRecords = 0
         LastFailedFiles = @()
         LastFailureMessages = @()
+        LastFailureDiagnostics = @()
         SyncComplete = $true
         RootBackfilledRows = 0
     }
     return $script:TokenRaderIndex
+}
+
+function Get-TokenRaderSafeIndexFailure {
+    param([Parameter(Mandatory = $true)][Exception]$Exception)
+    $cause = $Exception
+    for ($depth = 0; $null -ne $cause.InnerException -and $depth -lt 16; $depth++) {
+        $cause = $cause.InnerException
+    }
+    # Only fixed, code-owned descriptions may reach the background status.
+    # Arbitrary exception messages can contain source paths or JSON/body text.
+    $message = [string]$cause.Message
+    if ($message -match 'Oversized usage/context line cannot be safely indexed') {
+        return [pscustomobject]@{ Kind = 'safety'; Message = '超大用量/上下文记录无法安全导入（Oversized usage/context line cannot be safely indexed）；重复重试不能修复，保留原游标' }
+    }
+    if ($message -match 'Source was replaced/truncated|源日志已被替换') {
+        return [pscustomobject]@{ Kind = 'safety'; Message = '源日志被替换或截断；为避免混合来源，保留阻断及原游标' }
+    }
+    if ($message -match 'Replacement source has no complete JSONL (?:boundary|line)|Replacement boundary is not a complete JSONL line') {
+        return [pscustomobject]@{ Kind = 'pending'; Message = '替换来源尚无完整 JSONL 记录边界；保留旧记录和游标，等待写入完成后重试' }
+    }
+    if ($message -match 'Replacement source shrank before its frozen boundary') {
+        return [pscustomobject]@{ Kind = 'pending'; Message = '替换来源在冻结边界前缩短；本轮保留旧记录和游标，等待来源稳定后重试' }
+    }
+    if ($message -match 'Replacement source changed before its frozen boundary') {
+        return [pscustomobject]@{ Kind = 'pending'; Message = '替换来源在冻结边界前变化；本轮保留旧记录和游标，等待来源稳定后重试' }
+    }
+    if ($message -match 'Malformed replacement (?:usage|context|tool metadata|metadata) record') {
+        return [pscustomobject]@{ Kind = 'safety'; Message = '替换来源含损坏的用量、上下文或工具元数据；保留旧记录和游标，需修复来源后重试' }
+    }
+    $hresult = [int]$cause.HResult
+    if ($cause -is [UnauthorizedAccessException] -or $cause -is [Security.SecurityException]) {
+        return [pscustomobject]@{ Kind = 'access'; Message = ('文件访问被拒绝（{0}，HResult={1}）；未将不完整索引视为成功' -f $cause.GetType().Name, $hresult) }
+    }
+    if ($cause -is [IO.IOException]) {
+        return [pscustomobject]@{ Kind = 'io'; Message = ('文件读取暂时失败（{0}，HResult={1}，可能被占用或不可用）；路径已重新排队，可稍后重试' -f $cause.GetType().Name, $hresult) }
+    }
+    if ($cause.GetType().FullName -eq 'System.Data.SQLite.SQLiteException') {
+        $resultCode = ''
+        foreach ($propertyName in @('ResultCode', 'ErrorCode')) {
+            $property = $cause.PSObject.Properties[$propertyName]
+            if ($null -eq $property -or $null -eq $property.Value) { continue }
+            try { $resultCode = '，' + $propertyName + '=' + ([int]$property.Value); break } catch { }
+        }
+        return [pscustomobject]@{ Kind = 'database'; Message = ('索引数据库操作失败（SQLiteException，HResult={0}{1}）；路径已重新排队，未将不完整索引视为成功' -f $hresult, $resultCode) }
+    }
+    return [pscustomobject]@{ Kind = 'unknown'; Message = ('未分类索引异常（{0}，HResult={1}）；保留待重试路径，未将不完整索引视为成功' -f $cause.GetType().Name, $hresult) }
+}
+
+function Get-TokenRaderIndexFailureSummary {
+    param([Parameter(Mandatory = $true)]$Index, [Parameter(Mandatory = $true)][string]$Operation)
+    $diagnosticProperty = $Index.PSObject.Properties['LastFailureDiagnostics']
+    $diagnostics = if ($null -ne $diagnosticProperty) { @($diagnosticProperty.Value) } else { @() }
+    $details = @($diagnostics | Group-Object -Property Message | ForEach-Object {
+        '{0} 个：{1}' -f $_.Count, $_.Name
+    })
+    if ($details.Count -eq 0) { $details = @('原因未分类（Exception）；保留待重试路径，未将不完整索引视为成功') }
+    return ('{0}有 {1} 个日志未能完成；{2}。' -f $Operation, @($Index.LastFailedFiles).Count, ($details -join '；'))
 }
 
 function ConvertTo-TokenRaderMetadataMap {
@@ -3769,7 +3917,8 @@ function Sync-TokenRaderIndexFiles {
     $seen = @{}
     $relationshipBySession = @{}
     $storedRootBySession = @{}
-    $hasRelationshipChanges = $false
+    $pendingRootBackfill = [string][TokenRaderIndexer]::GetSetting($conn, 'pending_root_backfill') -eq '1'
+    $hasRelationshipChanges = $pendingRootBackfill
 
     $workItems = New-Object System.Collections.ArrayList
     $catalogProcessed = 0
@@ -3868,6 +4017,7 @@ function Sync-TokenRaderIndexFiles {
     $nextRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($conn) + 1L
     $failedFiles = New-Object System.Collections.ArrayList
     $failureMessages = New-Object System.Collections.ArrayList
+    $failureDiagnostics = New-Object System.Collections.ArrayList
     $canonicalRoots = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
     if ($hasRelationshipChanges) {
         foreach ($relationship in @($relationshipBySession.Values)) {
@@ -3882,10 +4032,13 @@ function Sync-TokenRaderIndexFiles {
             }
         }
     }
-    $rootBackfilledRows = if ($canonicalRoots.Count -gt 0) {
-        [int][TokenRaderIndexer]::BackfillSessionRoots($conn, $canonicalRoots, $nextRevision)
-    } else { 0 }
-    if ($rootBackfilledRows -gt 0) { $changed = $true }
+    $rootBackfilledRows = 0
+    if ($canonicalRoots.Count -gt 0) {
+        # Imports below can commit changed parent metadata before descendant
+        # backfill starts. Persist its retry intent first, so cancellation or
+        # a backfill exception cannot hide that work behind unchanged cursors.
+        [TokenRaderIndexer]::SetSetting($conn, 'pending_root_backfill', '1')
+    }
     $workProcessed = 0
     foreach ($work in @($workItems)) {
         $CancellationToken.ThrowIfCancellationRequested()
@@ -3939,6 +4092,10 @@ function Sync-TokenRaderIndexFiles {
                 ($lastWrite -ne [Int64]$knownRow['last_write_ticks'] -and $length -le [Int64]$knownRow['length'])
             )
             if ($requiresReplacement) {
+                $completeOffset = Get-TokenRaderCompleteJsonlOffset -FilePath $canonical -MinimumOffset 0L -CancellationToken $CancellationToken
+                if ($length -gt 0L -and $completeOffset -eq 0L) {
+                    throw [IO.IOException]::new('Replacement source has no complete JSONL boundary; retained records and cursor preserved.')
+                }
                 $replacementCheck = $conn.CreateCommand()
                 try {
                     $replacementCheck.CommandText = "SELECT COUNT(*) FROM history_gaps WHERE path=@path AND blocked_reason='source_replaced'"
@@ -3948,12 +4105,19 @@ function Sync-TokenRaderIndexFiles {
                     }
                 } finally { $replacementCheck.Dispose() }
                 if ([string]::IsNullOrWhiteSpace($knownSessionId)) { $knownSessionId = [string]$metadata.SessionId }
-                [void][TokenRaderIndexer]::DeleteTokenRecordsBySessionId($conn, $knownSessionId)
-                [void][TokenRaderIndexer]::DeleteToolRecordsBySourcePath($conn, $canonical)
-                $startOffset = 0L
             }
 
-            $count = if ($completeOffset -gt $startOffset) {
+            $count = if ($requiresReplacement) {
+                # Deletion, import, and cursor/catalog update share one
+                # transaction. Rejected replacements retain all old evidence.
+                # Call even for an empty replacement so stale rows are removed
+                # only when its zero boundary can be committed atomically.
+                [TokenRaderIndexer]::ReplaceFile($conn, $canonical, [long]$completeOffset,
+                    $knownSessionId, $length, $lastWrite, [string]$metadata.SessionId,
+                    [string]$metadata.Cwd, [string]$metadata.ParentThreadId,
+                    [string]$metadata.ForkedFromId, [string]$rootSessionId,
+                    $nextRevision, $ProgressState, $CancellationToken)
+            } elseif ($completeOffset -gt $startOffset) {
                 $directParentId = if (-not [string]::IsNullOrWhiteSpace([string]$metadata.ParentThreadId)) {
                     [string]$metadata.ParentThreadId
                 } else { [string]$metadata.ForkedFromId }
@@ -3963,10 +4127,12 @@ function Sync-TokenRaderIndexFiles {
             # Keep the catalog observation that selected this import. Recording
             # a later EOF here can falsely mark bytes appended during parsing
             # as already synchronized while parsed_offset still precedes them.
-            [TokenRaderIndexer]::UpdateFileMetadata(
-                $conn, $canonical, $length, $lastWrite,
-                [Int64]$completeOffset, [string]$metadata.SessionId, [string]$metadata.Cwd,
-                [string]$metadata.ParentThreadId, [string]$metadata.ForkedFromId, [string]$rootSessionId)
+            if (-not $requiresReplacement) {
+                [TokenRaderIndexer]::UpdateFileMetadata(
+                    $conn, $canonical, $length, $lastWrite,
+                    [Int64]$completeOffset, [string]$metadata.SessionId, [string]$metadata.Cwd,
+                    [string]$metadata.ParentThreadId, [string]$metadata.ForkedFromId, [string]$rootSessionId)
+            }
             $importedFiles++
             $importedRecords += [int]$count
             $changed = $true
@@ -3977,11 +4143,24 @@ function Sync-TokenRaderIndexFiles {
             # silently disappear from the next synchronization attempt.
             [void]$failedFiles.Add($canonical)
             [void]$failureMessages.Add([string]$_.Exception.Message)
+            [void]$failureDiagnostics.Add((Get-TokenRaderSafeIndexFailure -Exception $_.Exception))
             [TokenRaderIndexer]::RequeueChangedPath($SessionsRoot, $canonical)
             continue
         }
     }
 
+    # A rejected source can carry untrusted replacement ancestry. Do not alter
+    # retained rows until every import in this batch has succeeded. Failed
+    # paths remain queued, so their root map is recomputed on the next retry.
+    if ($failedFiles.Count -eq 0) {
+        if ($canonicalRoots.Count -gt 0) {
+            $rootBackfilledRows = [int][TokenRaderIndexer]::BackfillSessionRoots($conn, $canonicalRoots, $nextRevision)
+            if ($rootBackfilledRows -gt 0) { $changed = $true }
+        }
+        if ($pendingRootBackfill -or $canonicalRoots.Count -gt 0) {
+            [TokenRaderIndexer]::SetSetting($conn, 'pending_root_backfill', '0')
+        }
+    }
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '完成索引同步'
         $ProgressState.ProcessedFiles = $ProgressState.TotalFiles
@@ -4035,6 +4214,7 @@ function Sync-TokenRaderIndexFiles {
     $Index.LastImportedRecords = $importedRecords
     $Index.LastFailedFiles = @($failedFiles)
     $Index.LastFailureMessages = @($failureMessages)
+    $Index.LastFailureDiagnostics = @($failureDiagnostics)
     $Index.SyncComplete = $failedFiles.Count -eq 0
     $Index.RootBackfilledRows = $rootBackfilledRows
     $Index.IndexedFileCount = [int][TokenRaderIndexer]::GetFileCursorCount($conn)
@@ -4098,7 +4278,7 @@ function New-TokenRaderIndex {
         throw ('空模型索引回填有 {0} 个日志暂时无法校验；未将不完整索引视为成功。' -f [int]$modelBackfill.FailedFiles)
     }
     if (-not [bool]$result.SyncComplete) {
-        throw ('索引构建有 {0} 个日志暂时无法读取；已保留待重试路径，未将不完整索引视为成功。' -f @($result.LastFailedFiles).Count)
+        throw (Get-TokenRaderIndexFailureSummary -Index $result -Operation '索引构建')
     }
     return $result
 }
@@ -4168,6 +4348,7 @@ function Initialize-TokenRaderIndexFromNow {
         $index.LastImportedRecords = 0
         $index.LastFailedFiles = @()
         $index.LastFailureMessages = @()
+        $index.LastFailureDiagnostics = @()
         $index.SyncComplete = $true
         return Add-TokenRaderHistoryCoverage -Result $index -Connection $index.Connection
     } finally { $lease.Dispose() }
@@ -4221,6 +4402,7 @@ function Complete-TokenRaderRecentHistory {
         $index.LastImportedRecords = 0
         $index.LastFailedFiles = @()
         $index.LastFailureMessages = @()
+        $index.LastFailureDiagnostics = @()
     } finally { $lease.Dispose() }
     $processedBytes = 0L
     while (-not [bool]$result.Completed) {
@@ -4344,6 +4526,7 @@ function Update-TokenRaderIndex {
             $index.LastImportedRecords = 0
             $index.LastFailedFiles = @()
             $index.LastFailureMessages = @()
+            $index.LastFailureDiagnostics = @()
             $index.SyncComplete = $true
             $index.RootBackfilledRows = 0
             if ($null -ne $ProgressState) {
@@ -4365,7 +4548,7 @@ function Update-TokenRaderIndex {
         }
     }
     if (-not $AllowIncomplete -and -not [bool]$result.SyncComplete) {
-        throw ('索引同步有 {0} 个日志暂时无法读取；路径已重新排队，请稍后重试。' -f @($result.LastFailedFiles).Count)
+        throw (Get-TokenRaderIndexFailureSummary -Index $result -Operation '索引同步')
     }
     return $result
 }
@@ -4855,7 +5038,10 @@ function Sync-TokenRaderMeasurementBoundary {
             # hand-off can fail before a per-file incomplete result exists.
             # Sync-TokenRaderIndexFiles has already requeued the candidates;
             # keep retrying within the same bounded boundary capture.
-            $lastSyncError = [string]$_.Exception.Message
+            $safeFailure = Get-TokenRaderSafeIndexFailure -Exception $_.Exception
+            $lastSyncError = [string]$safeFailure.Message
+            $permanentFailure = $safeFailure.Kind -eq 'safety'
+            if ($permanentFailure) { break }
             $stableCatalogPasses = 0
             if ($null -ne $ProgressState) {
                 $ProgressState.Stage = '等待并发索引写入完成后重试'
@@ -4870,22 +5056,15 @@ function Sync-TokenRaderMeasurementBoundary {
         $totalRootBackfills += [int]$index.RootBackfilledRows
         $failedCount = @($index.LastFailedFiles).Count
         if ($failedCount -gt 0) {
-            # Preserve the actual per-file failures. Previously only the count
-            # survived this loop, hiding deterministic parser failures behind
-            # a misleading generic 'stable boundary' timeout.
-            $failureDetails = @($index.LastFailureMessages | Where-Object {
-                -not [string]::IsNullOrWhiteSpace([string]$_)
-            } | Select-Object -Unique)
-            if ($failureDetails.Count -gt 0) {
-                $lastSyncError = (@($failureDetails | Select-Object -First 3 | ForEach-Object {
-                    $message = ([string]$_ -replace '[\r\n]+', ' ')
-                    if ($message.Length -gt 600) { $message.Substring(0, 600) + '…' } else { $message }
-                }) -join '；')
-            }
+            # Only categorized, code-owned descriptions reach displayed errors.
+            # Legacy indexes without diagnostics must not fall back to raw text.
+            $lastSyncError = Get-TokenRaderIndexFailureSummary -Index $index -Operation '索引同步'
+            $diagnosticProperty = $index.PSObject.Properties['LastFailureDiagnostics']
+            $failureDetails = if ($null -ne $diagnosticProperty) { @($diagnosticProperty.Value) } else { @() }
             # Retrying an intentionally rejected source cannot repair it.
             # Keep the cursor and records intact; do not reread it for 25 s.
             $permanentFailure = @($failureDetails | Where-Object {
-                [string]$_ -match 'Oversized usage/context line cannot be safely indexed|源日志已被替换'
+                $_.Kind -eq 'safety'
             }).Count -gt 0
             if ($permanentFailure) { break }
             $stableCatalogPasses = 0

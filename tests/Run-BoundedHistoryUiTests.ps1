@@ -14,7 +14,12 @@ $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
 Assert-BoundedUi (@($errors).Count -eq 0) 'production UI must parse'
 $coreSource = [IO.File]::ReadAllText((Join-Path $root 'TokenRader.Core.psm1'))
-Assert-BoundedUi ($coreSource -match '(?s)if \(\$requiresReplacement\) \{[^}]*source_replaced[^}]*throw.*?DeleteTokenRecordsBySessionId') 'blocked source replacement must be rejected before deleting preserved indexed rows'
+$replacementMatch = [regex]::Match($coreSource, '(?s)if \(\$requiresReplacement\) \{(?<guard>.*?)\$count = if \(\$requiresReplacement\) \{(?<atomic>.*?)\} elseif')
+Assert-BoundedUi $replacementMatch.Success 'replacement must have a guarded atomic import branch'
+$replacementGuard = $replacementMatch.Groups['guard'].Value
+$atomicReplacement = $replacementMatch.Groups['atomic'].Value
+Assert-BoundedUi ($replacementGuard -match '(?s)source_replaced.*?throw' -and $atomicReplacement -match '\[TokenRaderIndexer\]::ReplaceFile\(') 'blocked source replacement must be rejected before atomically replacing preserved indexed rows'
+Assert-BoundedUi (($replacementGuard + $atomicReplacement) -notmatch 'DeleteTokenRecordsBySessionId|DeleteToolRecordsBySourcePath') 'replacement must not delete preserved rows outside the atomic replacement transaction'
 foreach ($name in @('ConvertTo-TokenRaderCopyableStatusText', 'Set-TokenRaderLastFailureInfo',
         'Get-TokenRaderCallbackContextValue', 'Set-TokenRaderHistoryCoverage',
         'Update-TokenRaderHistoryBackfillButton', 'Fail-TokenRaderHistoryBackfillJob',

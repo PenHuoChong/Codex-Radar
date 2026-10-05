@@ -2350,6 +2350,60 @@ public static class TokenRaderIndexer
     }
 
     /// <summary>
+    /// Replaces indexed source metadata and records atomically. Failed parsing,
+    /// cancellation or catalog updates retain the prior indexed incarnation.
+    /// The original JSONL is read-only, including for a zero-byte replacement.
+    /// </summary>
+    public static int ReplaceFile(SQLiteConnection db, string filePath, long endOffset,
+        string previousSessionId, long length, long lastWriteTicks, string sessionId,
+        string cwd, string parentThreadId, string forkedFromId, string rootSessionId,
+        long indexRevision, IDictionary progress, CancellationToken cancel)
+    {
+        cancel.ThrowIfCancellationRequested();
+        string sourcePath = GetCanonicalPath(filePath);
+        if (length < 0L || endOffset < 0L || endOffset > length)
+            throw new ArgumentOutOfRangeException("endOffset", "Replacement boundary must be within its frozen source length.");
+        if (length > 0L && endOffset == 0L)
+            throw new IOException("Replacement source has no complete JSONL line; prior index retained.");
+        using (var tx = db.BeginTransaction())
+        {
+            using (var source = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                if (source.Length < length)
+                    throw new IOException("Replacement source shrank before its frozen boundary; prior index retained.");
+                if (endOffset > 0L)
+                {
+                    source.Seek(endOffset - 1L, SeekOrigin.Begin);
+                    int terminal = source.ReadByte();
+                    if ((terminal != '\n' && terminal != '\r') || (terminal == '\r' && source.ReadByte() == '\n'))
+                        throw new IOException("Replacement boundary is not a complete JSONL line; prior index retained.");
+                }
+            }
+            using (var remove = db.CreateCommand())
+            {
+                remove.Transaction = tx;
+                remove.CommandText = "SELECT COUNT(*) FROM history_gaps WHERE path=@path AND blocked_reason='source_replaced'";
+                remove.Parameters.AddWithValue("@path", sourcePath);
+                if (Convert.ToInt64(remove.ExecuteScalar(), CultureInfo.InvariantCulture) > 0L)
+                    throw new IOException("Source was replaced/truncated; retained history cannot be mixed with its new incarnation.");
+                remove.Parameters.AddWithValue("@session", previousSessionId ?? "");
+                remove.CommandText = "DELETE FROM token_records WHERE (session_id=@session AND @session<>'') OR source_path=@path; " +
+                    "DELETE FROM recent_lineage_evidence WHERE (session_id=@session AND @session<>'') OR source_path=@path; " +
+                    "DELETE FROM tool_records WHERE source_path=@path; DELETE FROM file_metadata WHERE path=@path";
+                remove.ExecuteNonQuery();
+            }
+            string directParent = string.IsNullOrWhiteSpace(parentThreadId) ? forkedFromId : parentThreadId;
+            int count = ImportFile(db, filePath, 0L, endOffset, rootSessionId, directParent,
+                (long?)indexRevision, progress, cancel, null, null, 0, tx);
+            UpsertFileMetadata(db, sourcePath, length, lastWriteTicks, Math.Max(0L, endOffset),
+                sessionId, cwd, parentThreadId, forkedFromId, rootSessionId, true, tx);
+            cancel.ThrowIfCancellationRequested();
+            tx.Commit();
+            return count;
+        }
+    }
+
+    /// <summary>
     /// Returns the latest trustworthy cumulative usage for an incremental
     /// session import. If the latest row has no total usage, its stored zero
     /// totals are only a placeholder for independently observable last-call
@@ -2437,7 +2491,7 @@ public static class TokenRaderIndexer
     private static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset,
         string rootSessionId, string parentSessionId, long? explicitIndexRevision,
         IDictionary progress, CancellationToken cancel, HistoryGapState history,
-        Stopwatch deadline, int maxMilliseconds)
+        Stopwatch deadline, int maxMilliseconds, SQLiteTransaction existingTransaction = null)
     {
         cancel.ThrowIfCancellationRequested();
         int count = 0;
@@ -2558,9 +2612,10 @@ public static class TokenRaderIndexer
         }
         bool insertedUnresolvedModel = false;
 
-        using (var tx = db.BeginTransaction())
+        using (var ownedTransaction = existingTransaction == null ? db.BeginTransaction() : null)
         using (var cmd = db.CreateCommand())
         {
+            var tx = existingTransaction ?? ownedTransaction;
             cmd.Transaction = tx;
             cmd.CommandText = "INSERT INTO token_records (session_id, timestamp, model, total_input, total_cached, total_output, total_reasoning, call_input, call_cached, call_output, call_reasoning, fingerprint, five_hour_used, five_hour_window, five_hour_resets, weekly_used, weekly_window, weekly_resets, plan_type, source_path, source_offset_end, root_session_id, index_revision, model_source, turn_id, request_id, response_id, identity_source, service_tier, service_tier_source, turn_context_service_tier, reasoning_effort, rate_limit_id, rate_limit_name, credits_balance, credits_has, credits_unlimited, five_hour_used_tokens, five_hour_remaining_tokens, five_hour_limit_tokens, weekly_used_tokens, weekly_remaining_tokens, weekly_limit_tokens, rate_limit_individual, rate_limit_reached_type, spend_control_reached, model_context_window, long_context_threshold, long_context_applied, long_context_source, cache_creation_tokens, cache_write_observable) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18,@p19,@p20,@p21,@p22,@p23,@p24,@p25,@p26,@p27,@p28,@p29,@p30,@p31,@p32,@p33,@p34,@p35,@p36,@p37,@p38,@p39,@p40,@p41,@p42,@p43,@p44,@p45,@p46,@p47,@p48,@p49,@p50,@p51,@p52)";
             // Replaying a committed segment after a cancelled caller must not
@@ -2581,9 +2636,18 @@ public static class TokenRaderIndexer
                 long safeStart = Math.Max(0L, startOffset);
                 long requestedEnd = endOffset < 0L ? 0L : endOffset;
                 long effectiveEnd = Math.Min(fs.Length, requestedEnd);
+                if (existingTransaction != null && fs.Length < requestedEnd)
+                    throw new IOException("Replacement source shrank before its frozen boundary; prior index retained.");
+                if (existingTransaction != null && requestedEnd > 0L)
+                {
+                    fs.Seek(requestedEnd - 1L, SeekOrigin.Begin);
+                    int terminal = fs.ReadByte();
+                    if ((terminal != '\n' && terminal != '\r') || (terminal == '\r' && fs.ReadByte() == '\n'))
+                        throw new IOException("Replacement boundary is not a complete JSONL line; prior index retained.");
+                }
                 if (history != null && effectiveEnd < history.End && fs.Length < history.End)
                     throw new IOException("Historical source shrank before its frozen EOF; gap retained.");
-                if (safeStart >= effectiveEnd) { cancel.ThrowIfCancellationRequested(); tx.Commit(); return 0; }
+                if (safeStart >= effectiveEnd) { cancel.ThrowIfCancellationRequested(); if (ownedTransaction != null) tx.Commit(); return 0; }
                 long bodySourceCreatedTicks = history == null ? 0L : File.GetCreationTimeUtc(filePath).Ticks;
                 if (history != null && history.Discard && !string.IsNullOrEmpty(history.BodyScanState) &&
                     !BodyScanSourceMatches(history.BodyScanState, bodySourceCreatedTicks))
@@ -2597,7 +2661,7 @@ public static class TokenRaderIndexer
                         guard.Parameters.AddWithValue("@path", history.Path); guard.ExecuteNonQuery();
                     }
                     cancel.ThrowIfCancellationRequested();
-                    SaveHistoryGapState(db, tx, history); AdvanceRevisionInTransaction(db, tx); tx.Commit(); return 0;
+                    SaveHistoryGapState(db, tx, history); AdvanceRevisionInTransaction(db, tx); if (ownedTransaction != null) tx.Commit(); return 0;
                 }
                 if (history != null && effectiveEnd < history.End && effectiveEnd-safeStart > 1L)
                 {
@@ -2670,8 +2734,13 @@ public static class TokenRaderIndexer
                             line.IndexOf("task_complete", StringComparison.OrdinalIgnoreCase) >= 0 ||
                             line.IndexOf("reasoning_effort", StringComparison.OrdinalIgnoreCase) >= 0 ||
                             line.IndexOf("turn_id", StringComparison.OrdinalIgnoreCase) >= 0;
-                        if (metadataMarker && TryDeserializeMetadataRecord(line, out metadataRecord))
-                            topLevelType = metadataRecord.Type ?? "";
+                        if (metadataMarker)
+                        {
+                            if (TryDeserializeMetadataRecord(line, out metadataRecord))
+                                topLevelType = metadataRecord.Type ?? "";
+                            else if (existingTransaction != null)
+                                throw new IOException("Malformed replacement metadata record; prior index retained.");
+                        }
 
                         bool isTurnContextLine = string.Equals(topLevelType,
                             "turn_context", StringComparison.OrdinalIgnoreCase);
@@ -2749,8 +2818,11 @@ public static class TokenRaderIndexer
                                 IndexToolMetadataLine(db, tx, line, sessionId, effectiveRootSessionId,
                                     currentModel, sourcePath, lineEndOffset, indexRevision, 0L);
                             }
+                            catch (SQLiteException) { throw; }
                             catch
                             {
+                                if (existingTransaction != null)
+                                    throw new IOException("Malformed replacement tool metadata record; prior index retained.");
                                 // Tool metadata is auxiliary. A malformed or
                                 // newly introduced event shape must never stop
                                 // token indexing or advance an incomplete file
@@ -3062,7 +3134,8 @@ public static class TokenRaderIndexer
                             count += inserted;
                         }
                         catch (OperationCanceledException) { throw; }
-                        catch { if (history != null && history.Recent) history.BlockedReason = "malformed_usage_record"; continue; }
+                        catch (SQLiteException) { throw; }
+                        catch { if (existingTransaction != null) throw new IOException("Malformed replacement usage record; prior index retained."); if (history != null && history.Recent) history.BlockedReason = "malformed_usage_record"; continue; }
                     }
                     if (history != null)
                     {
@@ -3096,6 +3169,8 @@ public static class TokenRaderIndexer
                     }
                     else if (lineReader.SkippedOversizedLine && lineReader.OversizedPotentialUsage)
                         throw new IOException("Oversized usage/context line cannot be safely indexed; import rolled back and cursor retained.");
+                    else if (existingTransaction != null && (lineReader.Position < effectiveEnd || lineReader.IncompleteStart >= 0L))
+                        throw new IOException("Replacement source changed before its frozen boundary; prior index retained.");
                 }
                 if (history == null) UpsertFileContextTier(db, tx, sourcePath, sessionId,
                     effectiveRootSessionId, effectiveEnd, currentServiceTier,
@@ -3106,7 +3181,7 @@ public static class TokenRaderIndexer
             }
             cancel.ThrowIfCancellationRequested();
             if (insertedUnresolvedModel) SetSettingInTransaction(db, tx, "missing_model_backfill_version", "0");
-            tx.Commit();
+            if (ownedTransaction != null) tx.Commit();
         }
         return count;
     }
@@ -6476,11 +6551,13 @@ public static class TokenRaderIndexer
         string parentThreadId,
         string forkedFromId,
         string rootSessionId,
-        bool writeRelationshipMetadata)
+        bool writeRelationshipMetadata,
+        SQLiteTransaction transaction = null)
     {
         int affected;
         using (var cmd = db.CreateCommand())
         {
+            cmd.Transaction = transaction;
             cmd.CommandText = writeRelationshipMetadata
                 ? "UPDATE file_metadata SET length=@p2, last_write_ticks=@p3, parsed_offset=@p4, session_id=@p5, cwd=@p6, parent_thread_id=@p7, forked_from_id=@p8, root_session_id=@p9, content_retained=1 WHERE path=@p1"
                 : "UPDATE file_metadata SET length=@p2, last_write_ticks=@p3, parsed_offset=@p4, content_retained=1 WHERE path=@p1";
@@ -6501,6 +6578,7 @@ public static class TokenRaderIndexer
 
         using (var cmd = db.CreateCommand())
         {
+            cmd.Transaction = transaction;
             cmd.CommandText = writeRelationshipMetadata
                 ? "INSERT OR IGNORE INTO file_metadata (path, length, last_write_ticks, parsed_offset, session_id, cwd, parent_thread_id, forked_from_id, content_retained, root_session_id) VALUES (@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,1,@p9)"
                 : "INSERT OR IGNORE INTO file_metadata (path, length, last_write_ticks, parsed_offset, content_retained) VALUES (@p1,@p2,@p3,@p4,1)";
@@ -7261,7 +7339,10 @@ public static class TokenRaderIndexer
             _cancel.ThrowIfCancellationRequested();
             if (_deadline != null && _maxMilliseconds > 0 && _deadline.ElapsedMilliseconds >= _maxMilliseconds) return false;
             long lineStart = _position;
-            if (_classifyBody && !_discarding) _bodyScan = new PureTextBodyScan();
+            // History batches must carry parsing state across a partial line.
+            // Live imports can defer the DFA until overflow, avoiding its cost
+            // for the ordinary <=1 MiB hot path.
+            if (!_discarding) _bodyScan = _classifyBody ? new PureTextBodyScan() : null;
 
             using (var bytes = new MemoryStream())
             {
@@ -7287,13 +7368,20 @@ public static class TokenRaderIndexer
                         if (bytes.Length < 1024L * 1024L) bytes.WriteByte((byte)value);
                         else
                         {
-                            if (!_classifyBody)
+                            if (_bodyScan == null)
                             {
-                                string prefix = Encoding.UTF8.GetString(bytes.ToArray());
-                                string topType; bool isNull;
-                                bool provenBody = TryGetJsonStringOrNullAtPath(prefix, new[] { "type" }, out topType, out isNull) &&
-                                    !isNull && string.Equals(topType, "response_item", StringComparison.OrdinalIgnoreCase);
-                                if (!provenBody) OversizedPotentialUsage = true;
+                                // A prefix type is not proof: usage, tool/image
+                                // metadata, duplicate keys or a late type can
+                                // occur after it. Replay the bounded prefix,
+                                // then validate every remaining byte to EOL.
+                                _bodyScan = new PureTextBodyScan();
+                                byte[] prefix = bytes.GetBuffer();
+                                for (int i = 0; i < bytes.Length; i++)
+                                {
+                                    if ((i & 65535) == 0) _cancel.ThrowIfCancellationRequested();
+                                    _bodyScan.Feed(prefix[i]);
+                                }
+                                _bodyScan.Feed(value);
                             }
                             _discarding = true; SkippedOversizedLine = true; bytes.SetLength(0L);
                         }
@@ -7301,7 +7389,7 @@ public static class TokenRaderIndexer
                 }
 
                 lineEndOffset = _position;
-                if (terminated && _discarding && _classifyBody && (_bodyScan == null || !_bodyScan.Complete))
+                if (_discarding && (terminated ? (_bodyScan == null || !_bodyScan.Complete) : !_classifyBody))
                     OversizedPotentialUsage = true;
                 if (bytes.Length == 0 && !terminated && _position >= _endOffset)
                 {
