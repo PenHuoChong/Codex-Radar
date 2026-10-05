@@ -361,6 +361,7 @@ public sealed class TokenRaderHistoryBackfillResult
     public long RemainingBytes { get; set; }
     public long ProcessedBytes { get; set; }
     public long ImportedRecords { get; set; }
+    public long RepairedModelRecords { get; set; }
     public long IndexRevision { get; set; }
     public int BlockedFiles { get; set; }
     public int AttemptedFiles { get; set; }
@@ -1756,6 +1757,7 @@ public static partial class TokenRaderIndexer
         public string Path, Session, Root, Parent, Model, ModelSource, ModelTimestamp,
             Tier, TierSource, TurnId, ReasoningEffort, BlockedReason;
         public long Start, End, Cursor;
+        public long RepairedModels;
         public string BodyScanState;
         public bool Discard;
         public bool Recent, HasTotal;
@@ -2159,6 +2161,7 @@ public static partial class TokenRaderIndexer
             cmd.ExecuteNonQuery();
             if (resumeCompatible)
             {
+                ExtendUnknownRecentContextWork(db, tx, cancel);
                 string[] stateColumns = { "cursor_offset", "discard_line", "body_scan_state", "blocked_reason", "model", "model_source", "model_timestamp", "service_tier", "service_tier_source", "turn_id", "reasoning_effort", "has_total", "total_input", "total_cached", "total_output", "total_reasoning" };
                 var assignments = new List<string>();
                 foreach (string column in stateColumns) assignments.Add(column+"=(SELECT "+(column=="blocked_reason" ? "CASE WHEN p.blocked_reason='io_unavailable' THEN '' ELSE p.blocked_reason END" : "p."+column)+" FROM previous_recent_work p WHERE p.path=recent_history_work.path)");
@@ -2197,6 +2200,40 @@ public static partial class TokenRaderIndexer
         prepared.ProcessedBytes=catalogResult.ProcessedBytes;
         CommitRecentCoverageIfCompleted(db, prepared, cancel);
         return prepared;
+    }
+
+    private static void ExtendUnknownRecentContextWork(SQLiteConnection db, SQLiteTransaction tx, CancellationToken cancel)
+    {
+        DateTimeOffset previousFrozenAt;
+        if (!TryParseTimestamp(GetSetting(db,"recent_history_frozen_at"),out previousFrozenAt)) return;
+        var continuations = new List<HistoryGapState>();
+        using (var query=db.CreateCommand())
+        {
+            query.Transaction=tx;
+            query.CommandText="SELECT p.path,p.start_offset,s.end_offset,p.model_source,p.model_timestamp,p.service_tier_source FROM previous_recent_work p JOIN recent_history_sources s ON s.path=p.path JOIN file_metadata f ON f.path=p.path JOIN recent_history_attempt_stamps a ON a.path=p.path AND a.parser_version=@version WHERE p.cursor_offset=p.end_offset AND p.blocked_reason='' AND p.discard_line=0 AND p.body_scan_state='' AND s.end_offset>p.end_offset AND f.parsed_offset=s.end_offset AND f.turn_context_model_source IN ('','fast_sample_unknown','fast_sample_incomplete') AND NOT EXISTS(SELECT 1 FROM history_gaps g WHERE g.path=p.path AND g.blocked_reason='source_replaced') AND NOT EXISTS(SELECT 1 FROM recent_history_work w WHERE w.path=p.path AND w.blocked_reason<>'')";
+            query.CommandText += " AND p.end_offset<=a.source_length AND a.source_length<=f.length";
+            query.Parameters.AddWithValue("@version",RecentHistoryParserVersion);
+            using(var reader=query.ExecuteReader()) while(reader.Read())
+            {
+                cancel.ThrowIfCancellationRequested();
+                string modelSource=ReadReaderString(reader,3), tierSource=ReadReaderString(reader,5);
+                DateTimeOffset contextAt;
+                if ((modelSource=="turn_context" || modelSource=="turn_context_missing") &&
+                    (tierSource=="turn_context" || tierSource=="turn_context_missing" || tierSource=="turn_context_null") &&
+                    TryParseTimestamp(ReadReaderString(reader,4),out contextAt) && contextAt<=previousFrozenAt)
+                    continuations.Add(new HistoryGapState { Path=ReadReaderString(reader,0), Start=ReadReaderInt64(reader,1), End=ReadReaderInt64(reader,2) });
+            }
+        }
+        foreach(var continuation in continuations)
+        using(var update=db.CreateCommand())
+        {
+            cancel.ThrowIfCancellationRequested(); update.Transaction=tx;
+            // Old complete context is reused; only the newly frozen suffix is
+            // validated. Existing source-offset token rows remain idempotent.
+            update.CommandText="UPDATE recent_history_work SET end_offset=@end WHERE path=@path AND blocked_reason=''; INSERT OR IGNORE INTO recent_history_work(path,start_offset,end_offset,cursor_offset) VALUES(@path,@start,@end,@start)";
+            update.Parameters.AddWithValue("@path",continuation.Path); update.Parameters.AddWithValue("@start",continuation.Start); update.Parameters.AddWithValue("@end",continuation.End);
+            update.ExecuteNonQuery();
+        }
     }
 
     public static TokenRaderHistoryBackfillResult GetRecentHistoryBackfillStatus(SQLiteConnection db)
@@ -2239,8 +2276,71 @@ public static partial class TokenRaderIndexer
         if (!result.Completed) return;
         using (var tx = db.BeginTransaction())
         {
+            RestoreCompletedRecentContext(db, tx, result.FrozenAt.Value, cancel);
             SetSettingInTransaction(db,tx,"recent_history_coverage_start",result.Cutoff.Value.ToString("o",CultureInfo.InvariantCulture));
             cancel.ThrowIfCancellationRequested(); tx.Commit();
+        }
+    }
+
+    private static void RestoreCompletedRecentContext(SQLiteConnection db, SQLiteTransaction tx,
+        DateTimeOffset frozenAt, CancellationToken cancel)
+    {
+        // Fast sampling deliberately clears context across an unseen middle.
+        // The completed bounded scan can repair that unknown snapshot, including
+        // on a reused preparation, but cannot rewrite an already imported tail.
+        var contexts = new List<HistoryGapState>();
+        using (var query = db.CreateCommand())
+        {
+            query.Transaction = tx;
+            query.CommandText = "SELECT w.path,w.end_offset,w.model,w.model_source,w.model_timestamp,w.service_tier,w.service_tier_source,w.has_total,w.total_input,w.total_cached,w.total_output,w.total_reasoning FROM recent_history_work w JOIN recent_history_sources s ON s.path=w.path AND s.end_offset=w.end_offset JOIN file_metadata f ON f.path=w.path JOIN recent_history_attempt_stamps a ON a.path=w.path AND a.source_length=f.length AND a.last_write_ticks=f.last_write_ticks WHERE w.cursor_offset=w.end_offset AND w.discard_line=0 AND w.body_scan_state='' AND w.blocked_reason='' AND w.has_total IN (0,1) AND w.total_input>=0 AND w.total_cached>=0 AND w.total_output>=0 AND w.total_reasoning>=0 AND f.parsed_offset=w.end_offset AND NOT EXISTS(SELECT 1 FROM history_gaps g WHERE g.path=w.path AND g.blocked_reason='source_replaced')";
+            query.CommandText += " AND a.parser_version=@parserVersion";
+            query.Parameters.AddWithValue("@parserVersion",RecentHistoryParserVersion);
+            using (var reader = query.ExecuteReader()) while (reader.Read())
+            {
+                cancel.ThrowIfCancellationRequested();
+                var context = new HistoryGapState {
+                    Path=ReadReaderString(reader,0), End=ReadReaderInt64(reader,1),
+                    Model=ReadReaderString(reader,2), ModelSource=ReadReaderString(reader,3),
+                    ModelTimestamp=ReadReaderString(reader,4), Tier=ReadReaderString(reader,5),
+                    TierSource=ReadReaderString(reader,6), HasTotal=ReadReaderInt64(reader,7)==1L,
+                    TotalInput=ReadReaderInt64(reader,8), TotalCached=ReadReaderInt64(reader,9),
+                    TotalOutput=ReadReaderInt64(reader,10), TotalReasoning=ReadReaderInt64(reader,11) };
+                DateTimeOffset contextAt;
+                bool modelProven = context.ModelSource == "turn_context" || context.ModelSource == "turn_context_missing";
+                bool tierProven = context.TierSource == "turn_context" || context.TierSource == "turn_context_null" || context.TierSource == "turn_context_missing";
+                if (modelProven && tierProven && TryParseTimestamp(context.ModelTimestamp, out contextAt) && contextAt <= frozenAt)
+                    contexts.Add(context);
+            }
+        }
+        foreach (var context in contexts)
+        {
+            cancel.ThrowIfCancellationRequested();
+            DateTimeOffset contextAt;
+            TryParseTimestamp(context.ModelTimestamp, out contextAt);
+            using (var update = db.CreateCommand())
+            {
+                update.Transaction = tx;
+                update.CommandText = "UPDATE file_metadata SET turn_context_model=@model,turn_context_model_source=@modelSource,turn_context_model_timestamp=@timestamp,turn_context_model_timestamp_ticks=@ticks,turn_context_service_tier=@tier,turn_context_service_tier_source=@tierSource WHERE path=@path AND parsed_offset=@end AND turn_context_model_source IN ('','fast_sample_unknown','fast_sample_incomplete')";
+                update.Parameters.AddWithValue("@path",context.Path); update.Parameters.AddWithValue("@end",context.End);
+                update.Parameters.AddWithValue("@model",context.Model); update.Parameters.AddWithValue("@modelSource",context.ModelSource);
+                update.Parameters.AddWithValue("@timestamp",context.ModelTimestamp); update.Parameters.AddWithValue("@ticks",contextAt.UtcDateTime.Ticks);
+                update.Parameters.AddWithValue("@tier",context.Tier); update.Parameters.AddWithValue("@tierSource",context.TierSource);
+                update.ExecuteNonQuery();
+            }
+            using (var baseline=db.CreateCommand())
+            {
+                baseline.Transaction=tx;
+                // The frozen cursor proves all numeric state through End,
+                // not that a token call occurred exactly at this byte offset.
+                // A last-only record explicitly breaks this cumulative chain.
+                baseline.CommandText="UPDATE file_metadata SET fast_baseline_offset=@end,fast_baseline_input=@input,fast_baseline_cached=@cached,fast_baseline_output=@output,fast_baseline_reasoning=@reasoning WHERE path=@path AND parsed_offset=@end AND fast_baseline_offset<=@end";
+                baseline.Parameters.AddWithValue("@path",context.Path); baseline.Parameters.AddWithValue("@end",context.End);
+                baseline.Parameters.AddWithValue("@input",context.HasTotal ? (object)context.TotalInput : DBNull.Value);
+                baseline.Parameters.AddWithValue("@cached",context.HasTotal ? (object)context.TotalCached : DBNull.Value);
+                baseline.Parameters.AddWithValue("@output",context.HasTotal ? (object)context.TotalOutput : DBNull.Value);
+                baseline.Parameters.AddWithValue("@reasoning",context.HasTotal ? (object)context.TotalReasoning : DBNull.Value);
+                baseline.ExecuteNonQuery();
+            }
         }
     }
 
@@ -2285,7 +2385,7 @@ public static partial class TokenRaderIndexer
         catch (OperationCanceledException) { throw; }
         catch (IOException) { BlockRecentHistoryIoFailure(db,state,cancel); }
         catch (UnauthorizedAccessException) { BlockRecentHistoryIoFailure(db,state,cancel); }
-        status = GetRecentHistoryBackfillStatus(db); status.ProcessedBytes = state.Cursor-original; status.ImportedRecords = imported; status.AttemptedFiles=1;
+        status = GetRecentHistoryBackfillStatus(db); status.ProcessedBytes = state.Cursor-original; status.ImportedRecords = imported; status.RepairedModelRecords=state.RepairedModels; status.AttemptedFiles=1;
         CommitRecentCoverageIfCompleted(db,status,cancel);
         ReportIndexProgress(progress,"RecentHistoryBackfill",state.Path,status.ProcessedBytes,imported,state.Cursor);
         return status;
@@ -2576,6 +2676,7 @@ public static partial class TokenRaderIndexer
     {
         cancel.ThrowIfCancellationRequested();
         int count = 0;
+        long repairedModels = 0L;
         string sessionId = history != null && !string.IsNullOrWhiteSpace(history.Session)
             ? history.Session : ExtractSessionId(filePath);
         string effectiveRootSessionId = string.IsNullOrWhiteSpace(rootSessionId) ? sessionId : rootSessionId;
@@ -3239,6 +3340,13 @@ public static partial class TokenRaderIndexer
                                         sessionId,oldAt,requestId,responseId,currentTurnId,identitySource,sourcePath,lineEndOffset);
                             }
                             else inserted = cmd.ExecuteNonQuery();
+                            DateTimeOffset verifiedContextAt, verifiedUsageAt;
+                            if (inserted == 0 && history != null && history.Recent &&
+                                string.IsNullOrWhiteSpace(history.BlockedReason) &&
+                                TryParseTimestamp(record.Timestamp,out verifiedUsageAt) && verifiedUsageAt>=history.Cutoff && verifiedUsageAt<=history.FrozenEnd &&
+                                currentModelSource == "turn_context" && !string.IsNullOrWhiteSpace(currentModel) &&
+                                TryParseTimestamp(currentModelContextTimestamp, out verifiedContextAt) && verifiedContextAt <= history.FrozenEnd)
+                                repairedModels += RepairVerifiedRecentUnknownModel(db, tx, cmd);
                             if (hasTotalUsage)
                             {
                                 // Only a real cumulative snapshot advances
@@ -3311,8 +3419,28 @@ public static partial class TokenRaderIndexer
             cancel.ThrowIfCancellationRequested();
             if (insertedUnresolvedModel) SetSettingInTransaction(db, tx, "missing_model_backfill_version", "0");
             if (ownedTransaction != null) tx.Commit();
+            if (history != null && ownedTransaction != null) history.RepairedModels += repairedModels;
         }
         return count;
+    }
+
+    private static int RepairVerifiedRecentUnknownModel(SQLiteConnection db, SQLiteTransaction tx, SQLiteCommand record)
+    {
+        // This is a source-position point repair, not historical model guessing.
+        // Every usage and identity field must agree with the revalidated line.
+        using (var repair=db.CreateCommand())
+        {
+            repair.Transaction=tx;
+            repair.CommandText="UPDATE token_records SET model=@p3,model_source=@p24,index_revision=@p23,long_context_threshold=@p48,long_context_applied=@p49,long_context_source=@p50 WHERE source_path=@p20 AND source_offset_end=@p21 AND source_offset_end>0 AND model='' AND model_source IN ('fast_sample_unknown','fast_sample_incomplete') AND session_id=@p1 AND timestamp=@p2 AND total_input=@p4 AND total_cached=@p5 AND total_output=@p6 AND total_reasoning=@p7 AND call_input=@p8 AND call_cached=@p9 AND call_output=@p10 AND call_reasoning=@p11 AND fingerprint=@p12 AND turn_id=@p25 AND request_id=@p26 AND response_id=@p27 AND identity_source=@p28";
+            string tierGuard="service_tier='' AND service_tier_source IN ('','missing','fast_sample_unknown','fast_sample_incomplete','turn_context_missing','inherited_index') AND @p29<>'' AND @p30 IN ('turn_context','response','service_tier')";
+            repair.CommandText=repair.CommandText.Replace(" WHERE source_path=",
+                ",service_tier=CASE WHEN "+tierGuard+" THEN @p29 ELSE service_tier END"+
+                ",service_tier_source=CASE WHEN "+tierGuard+" THEN @p30 ELSE service_tier_source END"+
+                ",turn_context_service_tier=CASE WHEN "+tierGuard+" AND turn_context_service_tier='' THEN @p31 ELSE turn_context_service_tier END WHERE source_path=");
+            foreach(SQLiteParameter parameter in record.Parameters)
+                repair.Parameters.AddWithValue(parameter.ParameterName,parameter.Value);
+            return repair.ExecuteNonQuery();
+        }
     }
 
     private static void SaveRecentLineageEvidence(SQLiteConnection db, SQLiteTransaction tx,
@@ -9249,7 +9377,7 @@ public static partial class TokenRaderIndexer
     private static bool IsKnownLongContextModel(string model)
     {
         string normalized = (model ?? "").Trim().ToLowerInvariant();
-        foreach (string id in new[] { "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-cyber", "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "gpt-5.4" })
+        foreach (string id in new[] { "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6", "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-cyber", "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "gpt-5.4" })
         {
             if (normalized == id || normalized.StartsWith(id + "-20", StringComparison.OrdinalIgnoreCase)) return true;
         }

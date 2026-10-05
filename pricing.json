@@ -9,6 +9,7 @@
     "basis": "standard_api_normalized_reference",
     "fastMultipliers": {
       "gpt-6-astra": 2.5,
+      "gpt-6.1-sol": 2.5,
       "gpt-6-sol": 2.5,
       "gpt-6-luna": 2.5,
       "gpt-5.6-sol": 2.5,
@@ -16,6 +17,13 @@
       "gpt-5.6-luna": 2.5,
       "gpt-5.5": 2.5,
       "gpt-5.4": 2.0
+    },
+    "modelVerification": {
+      "gpt-6.1-sol": {
+        "verifiedAt": "2026-10-06",
+        "source": "https://learn.chatgpt.com/docs/pricing",
+        "fastMultiplierBasis": "included_subscription_usage"
+      }
     },
     "cacheWritePremium": false,
     "note": "Application-normalized dollar reference only; not official USD subscription rates and not a dollar-to-credit conversion."
@@ -46,6 +54,36 @@
         }
       },
       "source": "https://developers.openai.com/api/docs/models/gpt-6-astra"
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "displayName": "GPT-6.1 Sol",
+      "aliases": [],
+      "verifiedAt": "2026-10-06",
+      "input": 2.00,
+      "cachedInput": 0.10,
+      "cacheWrite": 2.50,
+      "cacheWriteMultiplier": 1.25,
+      "output": 10.00,
+      "contextWindow": 1050000,
+      "longContextThreshold": 272000,
+      "longContextInputMultiplier": 2.0,
+      "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 4.00,
+          "cachedInput": 0.20,
+          "cacheWrite": 5.00,
+          "cacheWriteMultiplier": 1.25,
+          "output": 20.00,
+          "longContextThreshold": 272000,
+          "longContextInputMultiplier": 2.0,
+          "longContextOutputMultiplier": 1.5,
+          "verifiedAt": "2026-10-06",
+          "source": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+        }
+      },
+      "source": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
     },
     {
       "id": "gpt-6-sol",

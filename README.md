@@ -283,7 +283,9 @@ SQLite 保存轻量文件游标；只把变化文件的新增完整 JSONL 行写
 
 ### 1. 运行确定性回归测试
 
-时间段结果回调发生显示或额度诊断异常时，程序保留测量起点及已取得的结果，实时测量继续，可再次点击“查看结果”；最终结果显示失败时保留原结束边界重试，不重新计时。`tests/Run-IntervalRecoveryTests.ps1` 使用合成异常验证这些恢复路径。
+时间段结果回调发生显示或额度诊断异常时，程序保留测量起点及已取得的结果，实时测量继续，可再次点击“查看结果”；最终结果显示失败时保留原结束边界重试，不重新计时。额度合并、校准和周参考值更新的异常分别隔离，不应让已经计算成功的主 Token/API 金额停留在初始零值。`tests/Run-IntervalRecoveryTests.ps1` 与 `tests/Run-IntervalPositiveRenderAuditTests.ps1` 使用合成异常验证这些恢复路径。
+
+完整补齐中已验证的模型、模式及累计用量基线会在来源和冻结位置一致时交接给实时解析，避免长文件的首尾采样未找到上下文后，新增调用持续被标成未知模型，或仅提供累计 Token 的新调用缺少差分基线。已有错误未知行只能在有界续扫中，按同一来源偏移、时间、Token 和请求标识逐项验证后补正；已有明确模式不覆盖，缺失证据不猜价，也不执行全库模型回填。`tests/Run-RecentContextHandoffTests.ps1` 覆盖上下文交接、重开索引及开始后新增调用的计价。
 
 完整回归包含 `tests/Run-UsageCompatibilityTests.ps1`，使用同一组合成记录对照 TokenTracker 的离线用量解析辅助函数。需预先安装 Node.js 22+；CI 自动配置。测试不安装或启动 TokenTracker，不联网查询额度，也不读取认证文件或真实日志。该对照只验证所选解析算法，不代表两套应用所有统计路径都已通过端到端验证。
 
@@ -538,11 +540,12 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 
 ## 官方价格与计价边界
 
-`pricing.json` 保存标准 API 价格及已核验的 Fast 价格，最近核对日期为 **2026-09-24**。下表为标准价格，Fast 费率保存在各模型的 `serviceTiers.priority` 中并显示于程序价格表：
+`pricing.json` 保存标准 API 价格及已核验的 Fast 价格，全表上次核对日期为 **2026-09-24**；**2026-10-06** 另行核验并补入 GPT-6.1 Sol，不代表其他模型也在该日重新核价。下表为标准价格，Fast 费率保存在各模型的 `serviceTiers.priority` 中并显示于程序价格表：
 
 | 模型 | 输入 | 缓存输入 | 输出 |
 |---|---:|---:|---:|
 | GPT-6 Astra | $10.00 | $1.00 | $50.00 |
+| GPT-6.1 Sol | $2.00 | $0.10 | $10.00 |
 | GPT-6 Sol | $2.00 | $0.20 | $10.00 |
 | GPT-6 Luna | $0.10 | $0.01 | $0.50 |
 | GPT-5.6 Sol | $4.00 | $0.40 | $20.00 |
@@ -565,6 +568,7 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 
 - [OpenAI API 标准价格总表](https://developers.openai.com/api/docs/pricing)
 - [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)
+- [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
 - [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol)
 - [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna)
 - [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
@@ -622,7 +626,9 @@ Codex、ChatGPT Work、Excel 和 Workspace Agents 可能共享 agentic usage，�
 套餐折算总额度参考 = 同一冻结校准区间的套餐折算参考成本 ÷ 实际百分比增量
 ```
 
-普通模式倍率为 1；Fast 模式按官方订阅消耗说明：GPT-6 Astra/Sol/Luna、GPT-5.6 Sol/Terra/Luna、GPT-5.5 为 **2.5**，GPT-5.4 为 **2**。逐模型、逐模式分桶计算，不能把混合模式总额统一乘倍率；未知 Fast 套餐倍率不猜价。日志明确模式优先，人工选择仅补足模式缺失的调用。日志百分比、Token 数不乘倍率，Pro 5x/20x 也不再次乘进结果。
+普通模式倍率为 1；Fast 模式按官方订阅消耗说明：GPT-6 Astra/Sol/Luna、GPT-6.1 Sol、GPT-5.6 Sol/Terra/Luna、GPT-5.5 为 **2.5**，GPT-5.4 为 **2**。逐模型、逐模式分桶计算，不能把混合模式总额统一乘倍率；未知 Fast 套餐倍率不猜价。日志明确模式优先，人工选择仅补足模式缺失的调用。日志百分比、Token 数不乘倍率，Pro 5x/20x 也不再次乘进结果。
+
+GPT-6.1 Sol 的缓存读取价为未缓存输入价的 5%，不能沿用 GPT-6 Sol 的 10%。其标准缓存写入价为 $2.50/百万 Token，Fast API 各项为标准价的 2 倍，输入超过 272,000 时仍分别应用输入侧 2 倍与输出侧 1.5 倍。订阅内含额度的 Fast 参考倍率保持 2.5；这与购买 credits 的倍率不是同一口径。来源：[模型定价](https://developers.openai.com/api/docs/models/gpt-6.1-sol)、[套餐用量说明](https://learn.chatgpt.com/docs/pricing)。
 
 此处美元是以普通 API 价格为单位的**应用内归一化参考**，不是官方套餐美元单价、credits 余额换汇或实际账单。套餐没有独立缓存写入收费，因此此参考不加 API 缓存写入溢价；历史长上下文仍使用普通 API 的对应上下文估值作为参考尺度，这不表示官方订阅采用相同长上下文倍率。主 API 卡继续保留 API 自身的缓存写入和长上下文规则。
 

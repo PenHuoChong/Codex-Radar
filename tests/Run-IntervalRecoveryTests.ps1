@@ -126,8 +126,8 @@ Assert-IntervalRecovery ([bool]$script:State.IsMeasuring) 'live rendering failur
 Assert-IntervalRecovery ($script:State.IntervalBaseline -eq $baseline) 'live rendering failure replaced the frozen baseline'
 Assert-IntervalRecovery ([Int64]$script:State.IntervalComputeRequestId -eq 0L) 'live rendering failure did not release the request id'
 Assert-IntervalRecovery (-not [bool]$script:State.IntervalComputing) 'live rendering failure left computation locked'
-Assert-IntervalRecovery ($script:State.IntervalLastError -match 'synthetic interval result rendering failure') 'live rendering error was not retained'
-Assert-IntervalRecovery ($script:State.LastFailureInfo -match 'synthetic interval result rendering failure') 'live render failure was not retained for copying'
+Assert-IntervalRecovery ($script:State.IntervalLastError -match '\u65F6\u95F4\u6BB5\u7ED3\u679C\u663E\u793A\u5931\u8D25\uFF1ARuntimeException' -and $script:State.IntervalLastError -notmatch 'synthetic interval result rendering failure') 'live rendering stage and safe type were not retained'
+Assert-IntervalRecovery ($script:State.LastFailureInfo -match '\u65F6\u95F4\u6BB5\u7ED3\u679C\u663E\u793A\u5931\u8D25\uFF1ARuntimeException' -and $script:State.LastFailureInfo -notmatch 'synthetic interval result rendering failure') 'live render safe failure was not retained for copying'
 Assert-IntervalRecovery ($script:QuotaCardCalls -eq 1) 'live rendering failure did not refresh quota cards safely'
 Assert-IntervalRecovery ($script:HistoryRefreshCalls -eq 0) 'failed live rendering refreshed usage history as if successful'
 
@@ -189,8 +189,8 @@ Assert-IntervalRecovery ([Int64]$script:State.IntervalFinalRetry.EndRevision -eq
     [Int64]$script:State.IntervalFinalRetry.EndOffsets['synthetic'] -eq 77L) 'final retry boundary changed'
 Assert-IntervalRecovery ([Int64]$script:State.IntervalComputeRequestId -eq 0L) 'final rendering failure did not release the request id'
 Assert-IntervalRecovery (-not [bool]$script:State.IntervalComputing) 'final rendering failure left computation locked'
-Assert-IntervalRecovery ($script:State.IntervalLastError -match 'synthetic interval result rendering failure') 'final rendering error was not retained'
-Assert-IntervalRecovery ($script:State.LastFailureInfo -match 'synthetic interval result rendering failure') 'final render failure was not retained for copying'
+Assert-IntervalRecovery ($script:State.IntervalLastError -match '\u65F6\u95F4\u6BB5\u7ED3\u679C\u663E\u793A\u5931\u8D25\uFF1ARuntimeException' -and $script:State.IntervalLastError -notmatch 'synthetic interval result rendering failure') 'final rendering stage and safe type were not retained'
+Assert-IntervalRecovery ($script:State.LastFailureInfo -match '\u65F6\u95F4\u6BB5\u7ED3\u679C\u663E\u793A\u5931\u8D25\uFF1ARuntimeException' -and $script:State.LastFailureInfo -notmatch 'synthetic interval result rendering failure') 'final render safe failure was not retained for copying'
 Assert-IntervalRecovery ($script:QuotaCardCalls -eq 1) 'final rendering failure did not refresh quota cards safely'
 Assert-IntervalRecovery ($script:HistoryRefreshCalls -eq 0) 'failed final rendering refreshed usage history as if successful'
 

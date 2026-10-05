@@ -3619,6 +3619,15 @@ function Complete-TokenRaderIntervalCompute {
         [Int64]$script:State.IntervalComputeRequestId -ne $effectiveRequestId) { return }
     if ($null -eq $script:State.IntervalBaseline -or [DateTimeOffset]$script:State.IntervalBaseline.StartedAt -ne $BaselineStartedAt) { return }
 
+    $ownedBaseline = $script:State.IntervalBaseline
+    $ownsTask = {
+        param([Int64]$OwnedRequestId = $effectiveRequestId)
+        -not $script:WindowClosing -and
+            [Int64]$script:State.MeasurementGeneration -eq $effectiveGeneration -and
+            [Int64]$script:State.IntervalComputeRequestId -eq $OwnedRequestId -and
+            [object]::ReferenceEquals($script:State.IntervalBaseline, $ownedBaseline)
+    }
+    $displayFailures = New-Object System.Collections.Generic.List[string]
     $accepted = $false
     $succeeded = $false
     try {
@@ -3637,19 +3646,99 @@ function Complete-TokenRaderIntervalCompute {
         $script:State.IntervalLastError = ''
         $endLimits = if ($null -ne $result.PSObject.Properties['EndRateLimits']) { $result.EndRateLimits } else { $result.RateLimits }
         $currentTag = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
+        $accountUnchanged = {
+            $tag = if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' }
+            [string]::Equals($tag, $currentTag, [StringComparison]::Ordinal)
+        }
         $resultTagValid = $null -eq $result.PSObject.Properties['AccountIdentity'] -or
             [string]::Equals([string]$result.AccountIdentity, $currentTag, [StringComparison]::Ordinal)
         if ($resultTagValid) {
-            if ($null -ne $Payload.PSObject.Properties['LatestRateLimits']) { Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits }
-            Merge-LatestRateLimits -Candidate $endLimits
+            if ($null -ne $Payload.PSObject.Properties['LatestRateLimits']) {
+                try { Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits }
+                catch { [void]$displayFailures.Add('额度快照合并失败：' + $_.Exception.GetType().Name) }
+            }
+            if (-not (& $ownsTask)) { return }
+            if (& $accountUnchanged) {
+                try { Merge-LatestRateLimits -Candidate $endLimits }
+                catch { [void]$displayFailures.Add('结束额度快照合并失败：' + $_.Exception.GetType().Name) }
+            }
         }
+        if (-not (& $ownsTask)) { return }
         # A caller may explicitly skip the quota query. Its null EndRateLimits
         # must not erase the last estimate calibrated by a quota-aware preview
         # or the final frozen settlement.
-        if ($ScanRateLimits) {
-            Update-QuotaEstimatesFromInterval -Result $result -Final $Final
+        if ($ScanRateLimits -and $resultTagValid -and (& $accountUnchanged)) {
+            $priorQuotaState = @{}
+            foreach ($name in @('QuotaEstimates', 'QuotaEstimateAccountIdentity', 'QuotaDiagnostics', 'QuotaCalibrationMessage')) {
+                if ($script:State.ContainsKey($name)) { $priorQuotaState[$name] = $script:State[$name] }
+            }
+            try { Update-QuotaEstimatesFromInterval -Result $result -Final $Final }
+            catch {
+                [void]$displayFailures.Add('额度校准更新失败：' + $_.Exception.GetType().Name)
+                if ((& $ownsTask) -and (& $accountUnchanged)) {
+                    # The helper renders cards after committing its validated
+                    # estimates. A card exception must not roll that commit
+                    # back to older evidence. Otherwise restore the previous
+                    # result, then revalidate it below against current limits.
+                    $priorQuota = if ($priorQuotaState.ContainsKey('QuotaEstimates')) { $priorQuotaState.QuotaEstimates } else { $null }
+                    $hasCommittedQuota = $script:State.ContainsKey('QuotaEstimates') -and
+                        $null -ne $script:State.QuotaEstimates -and
+                        -not [object]::ReferenceEquals($script:State.QuotaEstimates, $priorQuota) -and
+                        $script:State.ContainsKey('QuotaEstimateAccountIdentity') -and
+                        [string]::Equals([string]$script:State.QuotaEstimateAccountIdentity, $currentTag, [StringComparison]::Ordinal)
+                    if ($hasCommittedQuota) {
+                        try {
+                            Retain-TokenRaderQuotaEstimatesForCurrentWindow -AccountIdentity $currentTag
+                            $hasCommittedQuota = $null -ne $script:State.QuotaEstimates
+                        } catch {
+                            $hasCommittedQuota = $false
+                            [void]$displayFailures.Add('已提交额度复核失败：' + $_.Exception.GetType().Name)
+                        }
+                    }
+                    if ((& $ownsTask) -and (& $accountUnchanged) -and -not $hasCommittedQuota) {
+                        foreach ($name in @($priorQuotaState.Keys)) { $script:State[$name] = $priorQuotaState[$name] }
+                        if ($script:State.ContainsKey('QuotaEstimates') -and $null -ne $script:State.QuotaEstimates) {
+                            $resultBasis = if ($null -ne $result.PSObject.Properties['QuotaPricingBasis']) { [string]$result.QuotaPricingBasis } else { 'api_equivalent' }
+                            $restoredEstimates = $script:State.QuotaEstimates
+                            foreach ($kind in @('FiveHour', 'Weekly')) {
+                                $estimate = $restoredEstimates.$kind
+                                if ($null -eq $estimate) { continue }
+                                $estimateBasis = if ($null -ne $estimate.PSObject.Properties['QuotaPricingBasis']) { [string]$estimate.QuotaPricingBasis } else { 'api_equivalent' }
+                                if ($estimateBasis -ne $resultBasis) {
+                                    $restoredEstimates = $restoredEstimates.PSObject.Copy()
+                                    $restoredEstimates.$kind = $null
+                                }
+                            }
+                            $script:State.QuotaEstimates = $restoredEstimates
+                        }
+                    }
+                }
+            }
         }
-        Update-TokenRaderWeeklyReferenceFromResult -Result $result
+        if (-not (& $ownsTask)) { return }
+        if ($resultTagValid -and (& $accountUnchanged)) {
+            $priorWeeklyReference = if ($script:State.ContainsKey('WeeklyReferenceEstimate')) { $script:State.WeeklyReferenceEstimate } else { $null }
+            try { Update-TokenRaderWeeklyReferenceFromResult -Result $result }
+            catch {
+                [void]$displayFailures.Add('周美元参考更新失败：' + $_.Exception.GetType().Name)
+                if ((& $ownsTask) -and (& $accountUnchanged)) {
+                    $script:State.WeeklyReferenceEstimate = $priorWeeklyReference
+                }
+            }
+        }
+        if (-not (& $ownsTask)) { return }
+        if ($displayFailures.Count -gt 0 -and (& $accountUnchanged)) {
+            # Revalidate retained amounts against the accepted account/window;
+            # an auxiliary failure is not a new successful calibration.
+            try { Retain-TokenRaderQuotaEstimatesForCurrentWindow -AccountIdentity $currentTag }
+            catch { [void]$displayFailures.Add('额度结果保留失败：' + $_.Exception.GetType().Name) }
+            if (-not (& $ownsTask)) { return }
+            if (& $accountUnchanged) {
+                try { Mark-TokenRaderQuotaEstimatesRetainedAfterFailure }
+                catch { [void]$displayFailures.Add('额度保留诊断失败：' + $_.Exception.GetType().Name) }
+            }
+        }
+        if (-not (& $ownsTask)) { return }
         $baselineSnapshots = if ($null -ne $result.PSObject.Properties['BaselineSnapshots']) { $result.BaselineSnapshots } else { @{} }
         $script:State.IntervalCache = [pscustomobject]@{
             BaselineStartedAt = $BaselineStartedAt
@@ -3659,69 +3748,131 @@ function Complete-TokenRaderIntervalCompute {
             BaselineSnapshots = $baselineSnapshots
         }
         Show-IntervalResult -Result $result -Running ([bool]$script:State.IsMeasuring)
-        if ($Final) { $script:State.IntervalFinalRetry = $null }
+        if (-not (& $ownsTask)) { return }
+        if ($Final -and $displayFailures.Count -eq 0) { $script:State.IntervalFinalRetry = $null }
         $succeeded = $true
+        if ($displayFailures.Count -gt 0) {
+            $message = ($displayFailures -join '；') + ' 主测量结果已显示，冻结边界保留；额度可再次查看重试。'
+            $script:State.IntervalLastError = $message
+            if (& $accountUnchanged) { $script:State.QuotaCalibrationMessage = $message }
+            try { Set-TokenRaderLastFailureInfo -Message $message } catch { }
+            if (-not (& $ownsTask)) { return }
+            try { $script:StatusText.Text = $message } catch { }
+        }
     } catch {
         # A rendering/callback failure must not erase a quota calibration that
         # is already valid for the current window. The token result remains
         # available and a manual retry can refresh both quota cards.
-        $script:State.QuotaCalibrationMessage = '时间段后台计算失败：' + $_.Exception.Message
+        if (-not (& $ownsTask)) { return }
+        [void]$displayFailures.Add('时间段结果显示失败：' + $_.Exception.GetType().Name)
+        $script:State.QuotaCalibrationMessage = ($displayFailures -join '；')
         $script:State.IntervalLastError = [string]$script:State.QuotaCalibrationMessage
-        Set-TokenRaderLastFailureInfo -Message ([string]$script:State.IntervalLastError)
+        try { Set-TokenRaderLastFailureInfo -Message ([string]$script:State.IntervalLastError) } catch { }
+        if (-not (& $ownsTask)) { return }
         if ($Final) {
             # Rendering is not evidence that the measurement boundary failed.
             # Keep the captured end for a manual retry, never restart counting.
-            Set-TokenRaderUiState -NewState 'Ready' -StatusMessage ($script:State.IntervalLastError + ' 已保留结束边界，点击“查看结果”重试。')
+            $script:State.UiState = 'Ready'; $script:State.IsMeasuring = $false
+            try { Set-TokenRaderUiState -NewState 'Ready' -StatusMessage ($script:State.IntervalLastError + ' 已保留结束边界，点击“查看结果”重试。') } catch { }
         } elseif ([string]$script:State.UiState -eq 'Measuring') {
-            Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage ($script:State.IntervalLastError + ' 测量仍然有效，可再次查看。')
+            try { Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage ($script:State.IntervalLastError + ' 测量仍然有效，可再次查看。') } catch { }
         } else {
-            $script:StatusText.Text = $script:State.IntervalLastError
+            try { $script:StatusText.Text = $script:State.IntervalLastError } catch { }
         }
+        if (-not (& $ownsTask)) { return }
         try { Update-QuotaCards } catch { }
     } finally {
-        if ([Int64]$script:State.IntervalComputeRequestId -eq $effectiveRequestId) {
+        if (& $ownsTask) {
             $script:State.IntervalComputing = $false
             $script:State.IntervalComputeStopping = $false
             $script:State.IntervalActiveScanRateLimits = $false
             $script:State.IntervalComputeRequestId = 0
-        }
-        $hasPendingInterval = [bool]$script:State.IntervalComputePending
-        if ($succeeded -and $Final) {
-            Set-TokenRaderUiState -NewState 'Ready'
-            # The final interval has already synchronized the index. Refresh
-            # the selected rolling window from disk and remove snapshots whose
-            # window ended more than seven days ago.
-            Start-TokenRaderUsageHistoryRefresh -PurgeExpired $true
-        } elseif ($succeeded -and $accepted -and -not $hasPendingInterval) {
-            # During Measuring the five-minute timer runs an interval preview
-            # instead of the idle index-sync path. Refresh the rolling card
-            # after that preview so it cannot remain stale throughout a long
-            # measurement.
-            Start-TokenRaderUsageHistoryRefresh
-        }
-        if (-not $script:WindowClosing -and $succeeded -and $script:State.IntervalComputePending -and
-            [Int64]$script:State.MeasurementGeneration -eq $effectiveGeneration -and
-            $null -ne $script:State.IntervalBaseline) {
-            $request = $script:State.IntervalComputePendingRequest
-            $script:State.IntervalComputePending = $false
-            $script:State.IntervalComputePendingRequest = $null
-            if ($null -ne $request -and [Int64]$request.Generation -eq $effectiveGeneration -and
-                [DateTimeOffset]$request.BaselineStartedAt -eq [DateTimeOffset]$script:State.IntervalBaseline.StartedAt) {
-                if ([bool]$request.Final) { Set-TokenRaderUiState -NewState 'ComputingFinal' }
-                $pendingEndOffsets = if ($null -eq $request.EndOffsets) {
-                    $null
-                } else {
-                    ConvertTo-TokenRaderOffsetHashtable -Value $request.EndOffsets
+            $hasPendingInterval = [bool]$script:State.IntervalComputePending
+            if ($succeeded -and $Final) {
+                $script:State.UiState = 'Ready'; $script:State.IsMeasuring = $false
+                try { Set-TokenRaderUiState -NewState 'Ready' } catch { }
+                # The final interval has already synchronized the index. Refresh
+                # the selected rolling window from disk and remove snapshots whose
+                # window ended more than seven days ago.
+                if (& $ownsTask 0L) { Start-TokenRaderUsageHistoryRefresh -PurgeExpired $true }
+            } elseif ($succeeded -and $accepted -and -not $hasPendingInterval) {
+                # During Measuring the five-minute timer runs an interval preview
+                # instead of the idle index-sync path. Refresh the rolling card
+                # after that preview so it cannot remain stale throughout a long
+                # measurement.
+                if (& $ownsTask 0L) { Start-TokenRaderUsageHistoryRefresh }
+            }
+            if ((& $ownsTask 0L) -and $succeeded -and $script:State.IntervalComputePending -and
+                [Int64]$script:State.MeasurementGeneration -eq $effectiveGeneration -and
+                $null -ne $script:State.IntervalBaseline) {
+                $request = $script:State.IntervalComputePendingRequest
+                if ($null -ne $request -and [Int64]$request.Generation -eq $effectiveGeneration -and
+                    [DateTimeOffset]$request.BaselineStartedAt -eq [DateTimeOffset]$script:State.IntervalBaseline.StartedAt) {
+                    $pendingFailure = ''
+                    if ([bool]$request.Final) {
+                        $script:State.UiState = 'ComputingFinal'; $script:State.IsMeasuring = $false
+                        try { Set-TokenRaderUiState -NewState 'ComputingFinal' }
+                        catch { $pendingFailure = '排队结算状态显示失败：' + $_.Exception.GetType().Name }
+                    }
+                    if ((& $ownsTask 0L) -and [object]::ReferenceEquals($script:State.IntervalComputePendingRequest, $request)) {
+                        try {
+                            $pendingEndOffsets = if ($null -eq $request.EndOffsets) {
+                                $null
+                            } else {
+                                ConvertTo-TokenRaderOffsetHashtable -Value $request.EndOffsets
+                            }
+                            Start-TokenRaderIntervalComputeAsync `
+                                -Baseline $script:State.IntervalBaseline `
+                                -EndOffsets $pendingEndOffsets `
+                                -EndRevision $request.EndRevision `
+                                -EndedAt $request.EndedAt `
+                                -Final ([bool]$request.Final) `
+                                -ScanRateLimits ([bool]$request.ScanRateLimits) `
+                                -Generation $effectiveGeneration `
+                                -RequestId ([Int64]$request.RequestId)
+                        } catch {
+                            $pendingFailure = '排队时间段查询启动失败：' + $_.Exception.GetType().Name
+                        }
+                        $pendingRequestId = [Int64]$request.RequestId
+                        $pendingWorkerOwned = (& $ownsTask $pendingRequestId) -and
+                            $script:State.BackgroundJobs.ContainsKey($pendingRequestId)
+                        if ($pendingWorkerOwned) {
+                            # Consume the queue only after the replacement owns
+                            # a worker. A failed control redraw cannot lose it.
+                            if ([object]::ReferenceEquals($script:State.IntervalComputePendingRequest, $request)) {
+                                $script:State.IntervalComputePending = $false
+                                $script:State.IntervalComputePendingRequest = $null
+                            }
+                        } elseif ((& $ownsTask 0L) -or (& $ownsTask $pendingRequestId)) {
+                            # A launch failure has no worker. Preserve the exact
+                            # frozen request as retry evidence before unlocking.
+                            $script:State.IntervalComputing = $false
+                            $script:State.IntervalComputeStopping = $false
+                            $script:State.IntervalActiveScanRateLimits = $false
+                            $script:State.IntervalComputeRequestId = 0L
+                            if ([bool]$request.Final) {
+                                $script:State.IntervalFinalRetry = $request
+                                $script:State.UiState = 'Ready'; $script:State.IsMeasuring = $false
+                            }
+                            if ([object]::ReferenceEquals($script:State.IntervalComputePendingRequest, $request)) {
+                                $script:State.IntervalComputePending = $false
+                                $script:State.IntervalComputePendingRequest = $null
+                            }
+                            if (-not $pendingFailure) { $pendingFailure = '排队时间段查询未能创建后台任务；冻结请求已保留，可重试。' }
+                            try { Set-TokenRaderUiState -NewState ([string]$script:State.UiState) } catch { }
+                        }
+                        if ($pendingFailure -and (($pendingWorkerOwned -and (& $ownsTask $pendingRequestId)) -or (& $ownsTask 0L))) {
+                            $script:State.IntervalLastError = $pendingFailure
+                            try { Set-TokenRaderLastFailureInfo -Message $pendingFailure } catch { }
+                            if ((& $ownsTask $pendingRequestId) -or (& $ownsTask 0L)) {
+                                try { $script:StatusText.Text = $pendingFailure } catch { }
+                            }
+                        }
+                    }
+                } elseif ([object]::ReferenceEquals($script:State.IntervalComputePendingRequest, $request)) {
+                    $script:State.IntervalComputePending = $false
+                    $script:State.IntervalComputePendingRequest = $null
                 }
-                Start-TokenRaderIntervalComputeAsync `
-                    -Baseline $script:State.IntervalBaseline `
-                    -EndOffsets $pendingEndOffsets `
-                    -EndRevision $request.EndRevision `
-                    -EndedAt $request.EndedAt `
-                    -Final ([bool]$request.Final) `
-                    -ScanRateLimits ([bool]$request.ScanRateLimits) `
-                    -Generation $effectiveGeneration `
-                    -RequestId ([Int64]$request.RequestId)
             }
         }
     }
