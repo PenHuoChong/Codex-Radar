@@ -4111,8 +4111,24 @@ function Get-TokenRaderHistoryCoverage {
     $rawStart = [string][TokenRaderIndexer]::GetSetting($Connection, 'history_coverage_start')
     $parsedStart = [DateTimeOffset]::MinValue
     if ([DateTimeOffset]::TryParse($rawStart, [ref]$parsedStart)) { $start = $parsedStart }
+    $recentComplete = $false
+    # An already-running dashboard may still have the previous assembly loaded
+    # while source files are updated. Keep its existing coverage semantics;
+    # the new start preparation is available after restart with the new DLL.
+    $recentApiAvailable = $null -ne ([TokenRaderIndexer]).GetMethod('GetRecentHistoryBackfillStatus')
+    if ($enabled -and $recentApiAvailable) {
+        $recent = [TokenRaderIndexer]::GetRecentHistoryBackfillStatus($Connection)
+        if ($null -ne $recent -and [bool]$recent.Completed -and
+            -not [TokenRaderIndexer]::HasHistoryGapInRange($Connection, $recent.Cutoff, $recent.FrozenAt)) {
+            $recentComplete = $true
+            if ($null -eq $start -or [DateTimeOffset]$recent.Cutoff -lt $start) {
+                $start = [DateTimeOffset]$recent.Cutoff
+            }
+        }
+    }
     [pscustomobject]@{
         HistoryComplete = $null -eq $status -or [bool]$status.Completed
+        RecentHistoryComplete = $recentComplete
         CoverageStart = $start
         RemainingFiles = if ($null -eq $status) { 0 } else { [int]$status.RemainingFiles }
         RemainingBytes = if ($null -eq $status) { 0L } else { [long]$status.RemainingBytes }
@@ -4123,6 +4139,7 @@ function Add-TokenRaderHistoryCoverage {
     param([Parameter(Mandatory = $true)]$Result, [Parameter(Mandatory = $true)]$Connection)
     $coverage = Get-TokenRaderHistoryCoverage -Connection $Connection
     $Result | Add-Member -NotePropertyName HistoryComplete -NotePropertyValue ([bool]$coverage.HistoryComplete) -Force
+    $Result | Add-Member -NotePropertyName RecentHistoryComplete -NotePropertyValue ([bool]$coverage.RecentHistoryComplete) -Force
     $Result | Add-Member -NotePropertyName CoverageStart -NotePropertyValue $coverage.CoverageStart -Force
     $Result | Add-Member -NotePropertyName HistoryRemainingFiles -NotePropertyValue ([int]$coverage.RemainingFiles) -Force
     $Result | Add-Member -NotePropertyName HistoryRemainingBytes -NotePropertyValue ([long]$coverage.RemainingBytes) -Force
@@ -4178,6 +4195,86 @@ function Invoke-TokenRaderHistoryBackfillBatch {
         $index.IndexRevision = [long]$result.IndexRevision
         return $result
     } finally { $lease.Dispose() }
+}
+
+function Complete-TokenRaderRecentHistory {
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionsRoot,
+        [hashtable]$ProgressState,
+        [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
+    )
+    $CancellationToken.ThrowIfCancellationRequested()
+    $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    $at = [DateTimeOffset]::UtcNow
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '冻结最近24小时补齐边界'
+        $ProgressState.LastProgressAt = $at
+    }
+    $lease = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+    try {
+        $result = [TokenRaderIndexer]::PrepareRecentHistory(
+            $index.Connection, $SessionsRoot, $at.AddHours(-24), $at, $ProgressState, $CancellationToken)
+        $index.IsNew = $false
+        $index.CatalogInitialized = $true
+        $index.LastImportedFiles = 0
+        $index.LastImportedRecords = 0
+        $index.LastFailedFiles = @()
+        $index.LastFailureMessages = @()
+    } finally { $lease.Dispose() }
+    $processedBytes = 0L
+    while (-not [bool]$result.Completed) {
+        $CancellationToken.ThrowIfCancellationRequested()
+        if ($null -ne $ProgressState) {
+            $ProgressState.Stage = '分批补齐最近24小时日志'
+            $ProgressState.RemainingFiles = [int]$result.RemainingFiles
+            $ProgressState.RemainingBytes = [long]$result.RemainingBytes
+            $ProgressState.ProcessedBytes = $processedBytes
+            $ProgressState.HistoryProcessedBytes = $processedBytes
+        }
+        $lease = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
+        try {
+            $result = [TokenRaderIndexer]::BackfillRecentHistoryBatch(
+                $index.Connection, 8388608L, 2000, $ProgressState, $CancellationToken)
+        } finally { $lease.Dispose() }
+        $processedBytes += [long]$result.ProcessedBytes
+        if (-not [bool]$result.Completed -and [long]$result.ProcessedBytes -eq 0 -and
+            ([int]$result.EligibleFiles -eq 0 -or [int]$result.AttemptedFiles -eq 0)) {
+            $reasons = @($result.BlockedReasons | Select-Object -Unique | Select-Object -First 3 | ForEach-Object {
+                switch ([string]$_) {
+                    'io_unavailable' { '文件暂时无法读取' }
+                    'history_safety_block' { '来源变化或历史安全校验未通过' }
+                    'oversized_line' { '存在无法安全解析的超大记录' }
+                    'incomplete_frozen_line' { '历史记录未完整写入' }
+                    'usage_timestamp_unknown' { '用量记录缺少有效时间' }
+                    'usage_timestamp_after_frozen_end' { '用量时间晚于冻结时刻' }
+                    'malformed_usage_record' { '用量记录格式异常' }
+                    default { [string]$_ }
+                }
+            })
+            throw ('最近24小时日志尚未安全补齐：剩余 {0} 个文件，受阻 {1} 个；原因：{2}。已提交批次保留，可取消后重试，未开始计时。' -f
+                [int]$result.RemainingFiles, [int]$result.BlockedFiles, ($reasons -join '；'))
+        }
+    }
+    $CancellationToken.ThrowIfCancellationRequested()
+    $index.IndexRevision = [long]$result.IndexRevision
+    $index.IndexedFileCount = [int][TokenRaderIndexer]::GetFileCursorCount($index.Connection)
+    $index.LastSync = [DateTimeOffset]::Now
+    $index.LastFullReconcile = $index.LastSync
+    $index.SyncComplete = $true
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '最近24小时已补齐，冻结测量起点'
+        $ProgressState.ProcessedBytes = $processedBytes
+        $ProgressState.HistoryProcessedBytes = $processedBytes
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+    return [pscustomobject]@{
+        Completed = $true
+        SessionsRoot = [string]$index.SessionsRoot
+        Cutoff = $result.Cutoff
+        FrozenAt = $result.FrozenAt
+        EndOffsets = ConvertTo-TokenRaderOffsetMap -Value $result.EndOffsets
+        IndexRevision = [long]$result.IndexRevision
+    }
 }
 
 function Complete-TokenRaderPendingModelBackfill {
@@ -4838,13 +4935,27 @@ function CaptureMeasurementBaseline {
         $PricingDocument = $null,
         [string]$AccountIdentity = '',
         [hashtable]$ProgressState,
+        $PreparedHistory = $null,
         [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
     )
     $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
     $gate = [TokenRaderIndexer]::AcquireIndexGate($SessionsRoot)
     try {
-        $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $SessionsRoot -ProgressState $ProgressState -CancellationToken $CancellationToken
-        $startOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
+        $CancellationToken.ThrowIfCancellationRequested()
+        if ($null -ne $PreparedHistory) {
+            if (-not [bool]$PreparedHistory.Completed -or
+                -not [string]::Equals([IO.Path]::GetFullPath([string]$PreparedHistory.SessionsRoot).TrimEnd('\'),
+                    [IO.Path]::GetFullPath($SessionsRoot).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) {
+                throw '最近24小时补齐结果尚未完成或不属于当前日志目录。'
+            }
+            # The preparation owns a fixed byte boundary. Do not chase current
+            # EOF again while Codex is still running. Calls before StartedAt
+            # remain excluded by the interval time filter.
+            $startOffsets = ConvertTo-TokenRaderOffsetMap -Value $PreparedHistory.EndOffsets
+        } else {
+            $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $SessionsRoot -ProgressState $ProgressState -CancellationToken $CancellationToken
+            $startOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
+        }
         $startRateLimits = Get-TokenRaderIndexedRateLimitsAtOffsets -Connection $index.Connection -EndOffsets $startOffsets
         $files = foreach ($path in @($startOffsets.Keys)) {
             [pscustomobject]@{
@@ -4870,6 +4981,7 @@ function CaptureMeasurementBaseline {
             PlanType = if ($null -ne $startRateLimits) { [string]$startRateLimits.PlanType } else { '' }
             IndexRevision = [Int64][TokenRaderIndexer]::GetIndexRevision($index.Connection)
             ChangeRevision = [Int64][TokenRaderIndexer]::GetChangeRevision($SessionsRoot)
+            HistoryCoverage = Get-TokenRaderHistoryCoverage -Connection $index.Connection
         }
     } finally {
         $gate.Dispose()
@@ -5207,7 +5319,7 @@ function Get-TokenRaderQuotaWindowEvidence {
     if ($null -eq $historyRows -or $historyRows.Rows.Count -ne 2) {
         $code=[string]$selection.ReasonCode
         $message=if ($code -eq 'stale_snapshot') { '当前快照百分比低于本周期已观察值，等待有效快照' } else { '当前周期缺少两个可用快照组成的完整百分比步长' }
-        if (-not $historyCoverage.HistoryComplete -and $code -ne 'stale_snapshot') {
+        if (-not $historyCoverage.HistoryComplete -and -not $historyCoverage.RecentHistoryComplete -and $code -ne 'stale_snapshot') {
             $code = 'history_gap'
             $message = '历史日志尚未补齐；等待启动后的完整校准步长或手动补齐历史日志'
         }
@@ -5231,7 +5343,10 @@ function Get-TokenRaderQuotaWindowEvidence {
 
     [DateTimeOffset]$startObservedAt = [DateTimeOffset]$calibrationStart.ObservedAt
     [DateTimeOffset]$endObservedAt = [DateTimeOffset]$calibrationEnd.ObservedAt
-    if (-not $historyCoverage.HistoryComplete -and ($null -eq $coverageNotBefore -or $startObservedAt -lt [DateTimeOffset]$coverageNotBefore)) {
+    if (-not $historyCoverage.HistoryComplete -and
+        (($null -eq $coverageNotBefore -or $startObservedAt -lt [DateTimeOffset]$coverageNotBefore) -or
+            (($null -ne ([TokenRaderIndexer]).GetMethod('HasHistoryGapInRange')) -and
+                [TokenRaderIndexer]::HasHistoryGapInRange($Connection, $startObservedAt, $endObservedAt)))) {
         Set-TokenRaderQuotaDiagnostic $DiagnosticState 'history_gap' '校准区间历史日志尚未补齐；等待新完整步长或手动补齐历史日志'
         return $null
     }
@@ -6059,4 +6174,5 @@ function Remove-TokenRaderUsageHistory {
 Export-ModuleMember -Function ConvertTo-TokenRaderServiceTier, Resolve-TokenRaderServiceTierPrice
 Export-ModuleMember -Function Get-TokenRaderPlanNormalizedCost
 Export-ModuleMember -Function Initialize-TokenRaderIndexFromNow, Invoke-TokenRaderHistoryBackfillBatch, Get-TokenRaderHistoryCoverage
+Export-ModuleMember -Function Complete-TokenRaderRecentHistory
 Export-ModuleMember -Function Get-TokenRaderPaths, Get-TokenRaderAccount, Get-TokenRaderSessionFiles, Get-TokenRaderSessionMetadata, Get-TokenRaderProjects, Get-TokenRaderUsageSnapshot, Get-TokenRaderLatestRateLimits, Get-TokenRaderResetIdentity, Select-TokenRaderQuotaPlan, Get-TokenRaderPrices, Resolve-TokenRaderPrice, Get-TokenRaderCost, New-TokenRaderMeasurementBaseline, Get-TokenRaderIntervalResult, Get-TokenRaderProjectResult, Get-TokenRaderSessionResult, Get-TokenRaderQuotaEstimate, Get-TokenRaderSessionTreeSignature, Format-TokenRaderNumber, Format-TokenRaderUsd, Initialize-TokenRaderIndexer, Open-TokenRaderIndex, Close-TokenRaderIndex, New-TokenRaderIndex, Update-TokenRaderIndex, Clear-TokenRaderIndex, Remove-TokenRaderIndexHistory, Get-TokenRaderIndex, Get-TokenRaderIndexedSessionFiles, Get-TokenRaderIndexedProjects, Get-TokenRaderIndexRecords, ConvertFrom-TokenRaderIndexRecord, CaptureMeasurementBaseline, CaptureMeasurementEnd, QueryIntervalRecords, GetIndexRevision, Get-TokenRaderIndexedIntervalResult, Get-TokenRaderIndexedLatestRateLimits, Get-TokenRaderChangeRevision, Get-TokenRaderUsageHistoryWindow, Remove-TokenRaderUsageHistory, Get-TokenRaderToolBackfillStatus, Invoke-TokenRaderToolBackfill

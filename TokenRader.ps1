@@ -172,8 +172,26 @@ $script:MeasurementBaselineScript = {
     try {
     $prices = Get-TokenRaderPrices -PricingPath $PricingPath
     [void](Get-Command -Name CaptureMeasurementBaseline -ErrorAction Stop)
-    $baseline = CaptureMeasurementBaseline -SessionsRoot $SessionsRoot -PricingDocument $prices -AccountIdentity $AccountIdentity `
+    $CancellationToken.ThrowIfCancellationRequested()
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '分批补齐最近24小时日志'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+    # This preparation owns a fixed recent-history target. Older history is
+    # still a separate manual task; do not run the all-history button loop.
+    $preparedHistory = Complete-TokenRaderRecentHistory -SessionsRoot $SessionsRoot `
         -CancellationToken $CancellationToken -ProgressState $ProgressState
+    $CancellationToken.ThrowIfCancellationRequested()
+    if ($null -eq $preparedHistory -or $null -eq $preparedHistory.PSObject.Properties['Completed'] -or
+        -not [bool]$preparedHistory.Completed) {
+        throw '最近24小时日志尚未补齐；已提交批次保留，可重试，尚未开始计时。'
+    }
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '冻结开始位置'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+    $baseline = CaptureMeasurementBaseline -SessionsRoot $SessionsRoot -PricingDocument $prices -AccountIdentity $AccountIdentity `
+        -CancellationToken $CancellationToken -ProgressState $ProgressState -PreparedHistory $preparedHistory
     if ($null -eq $baseline) { throw '未能创建时间段测量基线。' }
     if ($null -eq $baseline.PSObject.Properties['StartOffsets']) {
         $offsets = @{}
@@ -424,15 +442,16 @@ function Set-TokenRaderUiState {
     # 同步完成后自动继续，而不是让按钮永久灰掉。
     $historyBusy = $script:State.ContainsKey('HistoryBackfillRunning') -and [bool]$script:State.HistoryBackfillRunning
     $boundaryBusy = @($script:State.BackgroundJobs.Values | Where-Object { [string]$_.Kind -in @('MeasurementBaseline', 'MeasurementEnd') }).Count -gt 0
-    $script:StartMeasureButton.IsEnabled = ($canOperate -and -not $historyBusy -and -not $boundaryBusy -and -not [bool]$script:State.ToolBackfillRunning)
+    $script:StartMeasureButton.IsEnabled = ($canOperate -and -not $historyBusy -and -not $boundaryBusy -and
+        -not [bool]$script:State.ToolBackfillRunning -and -not [bool]$script:State.UsageHistoryRefreshing)
     $script:StopMeasureButton.IsEnabled = ($NewState -in @('Starting', 'Measuring'))
     $script:StopMeasureButton.Content = if ($NewState -eq 'Starting') { '取消准备' } else { '结束计算' }
     $script:ViewIntervalButton.IsEnabled = ($canViewInterval -and $null -ne $script:State.IntervalBaseline)
     $script:MeasurementPricingButton.IsEnabled = ($NewState -in @('Measuring', 'Ready') -and $null -ne $script:State.IntervalBaseline)
-    $script:RefreshButton.IsEnabled = ($canOperate -and -not [bool]$script:State.IndexSyncing -and -not $historyBusy)
-    $script:RebuildIndexButton.IsEnabled = ($canOperate -and $indexReady -and -not $historyBusy -and -not [bool]$script:State.UsageHistoryRefreshing -and -not [bool]$script:State.ToolBackfillRunning)
+    $script:RefreshButton.IsEnabled = ($canOperate -and -not $boundaryBusy -and -not [bool]$script:State.IndexSyncing -and -not $historyBusy)
+    $script:RebuildIndexButton.IsEnabled = ($canOperate -and $indexReady -and -not $boundaryBusy -and -not $historyBusy -and -not [bool]$script:State.UsageHistoryRefreshing -and -not [bool]$script:State.ToolBackfillRunning)
     $script:PurgeOldIndexButton.IsEnabled = $script:RebuildIndexButton.IsEnabled
-    $script:BackfillToolUsageButton.IsEnabled = ($canOperate -and $indexReady -and
+    $script:BackfillToolUsageButton.IsEnabled = ($canOperate -and $indexReady -and -not $boundaryBusy -and
         -not [bool]$script:State.ToolBackfillRunning -and -not [bool]$script:State.ToolBackfillCompleted -and
         -not [bool]$script:State.UsageHistoryRefreshing -and -not [bool]$script:State.IndexSyncing -and -not $historyBusy)
     Update-TokenRaderHistoryBackfillButton
@@ -660,6 +679,15 @@ function Resolve-TokenRaderBackgroundCallbackFailure {
         try { Fail-TokenRaderHistoryBackfillJob $Message ([Int64]$Job.Generation) ([Int64]$Job.RequestId) 'HistoryBackfill' $Job.CallbackContext } catch { }
         return
     }
+    if ([string]$Job.Kind -in @('MeasurementBaseline', 'MeasurementEnd')) {
+        # Late boundary callbacks must pass the same generation/request guards
+        # as ordinary failures, never reset a newer measurement globally.
+        $handler = if ([string]$Job.Kind -eq 'MeasurementBaseline') {
+            'Fail-TokenRaderMeasurementBaselineJob'
+        } else { 'Fail-TokenRaderMeasurementEndJob' }
+        try { & $handler $Message ([Int64]$Job.Generation) ([Int64]$Job.RequestId) ([string]$Job.Kind) $Job.CallbackContext } catch { }
+        return
+    }
     if ([string]$Job.Kind -ne 'UsageHistory') {
         Reset-TokenRaderBackgroundFailureState -Message $Message
         return
@@ -777,6 +805,20 @@ function Start-TokenRaderBackgroundPoller {
                 }
 
                 $elapsed = $now - [DateTimeOffset]$job.StartedAt
+                if ([string]$job.Kind -eq 'MeasurementBaseline' -and
+                    [Int64]$script:State.MeasurementGeneration -eq [Int64]$job.Generation -and
+                    [Int64]$script:State.BaselineRequestId -eq [Int64]$job.RequestId -and
+                    [string]$script:State.UiState -eq 'Starting' -and
+                    ($now - [DateTimeOffset]$job.LastProgressUiAt).TotalMilliseconds -ge 500) {
+                    $job.LastProgressUiAt = $now
+                    $stage = [string](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'Stage' -Default '分批补齐最近24小时日志')
+                    if ($stage -in @('HistoryBackfill', 'RecentHistoryBackfill')) { $stage = '分批补齐最近24小时日志' }
+                    $processedBytes = [Int64](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'HistoryProcessedBytes' -Default 0L)
+                    $remainingFiles = [Int64](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'RemainingFiles' -Default 0L)
+                    $remainingBytes = [Int64](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'RemainingBytes' -Default 0L)
+                    $script:StatusText.Text = ('准备中：{0} · 已处理 {1:N1} MB · 剩余 {2:N0} 个文件 / {3:N1} MB · {4:0} 秒 · 尚未开始计时，可取消' -f
+                        $stage, ($processedBytes / 1MB), $remainingFiles, ($remainingBytes / 1MB), $elapsed.TotalSeconds)
+                }
                 if ([string]$job.Kind -eq 'IndexSync' -and $null -ne $job.ProgressState -and
                     ($now - [DateTimeOffset]$job.LastProgressUiAt).TotalMilliseconds -ge 500) {
                     $job.LastProgressUiAt = $now
@@ -993,7 +1035,7 @@ function Complete-TokenRaderIndexSyncJob {
     if ([bool]$script:State.PendingMeasurementStart -and [string]$script:State.UiState -eq 'Starting' -and
         [Int64]$script:State.BaselineRequestId -gt 0) {
         $script:State.PendingMeasurementStart = $false
-        Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '索引已就绪，正在后台冻结开始位置…'
+        Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '分批补齐最近24小时日志，完成后冻结开始位置并开始计时；可取消…'
         Start-TokenRaderMeasurementBaselineAsync `
             -Generation ([Int64]$script:State.MeasurementGeneration) `
             -RequestId ([Int64]$script:State.BaselineRequestId)
@@ -1053,8 +1095,11 @@ function Set-TokenRaderHistoryCoverage {
     if ($null -eq $Coverage) { return }
     $script:State.HistoryCoverage = $Coverage
     $complete = [bool](Get-TokenRaderCallbackContextValue -Context $Coverage -Name 'HistoryComplete' -Default $false)
+    $recentComplete = [bool](Get-TokenRaderCallbackContextValue -Context $Coverage -Name 'RecentHistoryComplete' -Default $false)
     $start = Get-TokenRaderCallbackContextValue -Context $Coverage -Name 'CoverageStart'
-    $label = if ($complete) { '历史已补齐' } else { '历史未补齐；历史汇总仅含已导入记录' }
+    $label = if ($complete) { '历史已补齐' } elseif ($recentComplete) {
+        '最近24小时已补齐；更早历史未完整'
+    } else { '历史未补齐；历史汇总仅含已导入记录' }
     if (-not $complete -and $null -ne $start) {
         try { $label += (' · 当前起点 {0:MM-dd HH:mm}' -f ([DateTimeOffset]$start).ToLocalTime()) } catch { }
     }
@@ -1291,6 +1336,8 @@ function Start-TokenRaderUsageHistoryRefresh {
         [bool]$PurgeExpired = $false
     )
     if ($script:WindowClosing -or -not [bool]$script:State.IndexCatalogAvailable -or
+        [string]$script:State.UiState -eq 'Starting' -or
+        @($script:State.BackgroundJobs.Values | Where-Object { [string]$_.Kind -eq 'MeasurementBaseline' }).Count -gt 0 -or
         ($script:State.ContainsKey('HistoryBackfillRunning') -and [bool]$script:State.HistoryBackfillRunning)) { return }
     $ownedRequestId = 0L
     try {
@@ -1369,7 +1416,13 @@ function Update-TokenRaderToolBackfillButton {
         '最近7天工具记录已回填'
     } else { '回填最近7天工具记录' }
     $canOperate = [string]$script:State.UiState -in @('Idle', 'Ready', 'Error')
-    $script:BackfillToolUsageButton.IsEnabled = ($canOperate -and [bool]$script:State.IndexReady -and
+    $boundaryBusy = @($script:State.BackgroundJobs.Values | Where-Object { [string]$_.Kind -in @('MeasurementBaseline', 'MeasurementEnd') }).Count -gt 0
+    # History launch/finish already calls this helper; refresh the Start gate
+    # here too so a completed auxiliary query cannot leave it disabled.
+    $script:StartMeasureButton.IsEnabled = ($canOperate -and -not $boundaryBusy -and
+        -not [bool]$script:State.HistoryBackfillRunning -and -not [bool]$script:State.ToolBackfillRunning -and
+        -not [bool]$script:State.UsageHistoryRefreshing)
+    $script:BackfillToolUsageButton.IsEnabled = ($canOperate -and [bool]$script:State.IndexReady -and -not $boundaryBusy -and
         -not [bool]$script:State.ToolBackfillRunning -and -not [bool]$script:State.ToolBackfillCompleted -and
         -not [bool]$script:State.UsageHistoryRefreshing -and -not [bool]$script:State.IndexSyncing -and
         -not [bool]$script:State.HistoryBackfillRunning)
@@ -1420,6 +1473,7 @@ function Start-TokenRaderToolBackfill {
         [bool]$script:State.ToolBackfillCompleted -or -not [bool]$script:State.IndexReady -or
         [bool]$script:State.UsageHistoryRefreshing -or [bool]$script:State.IndexSyncing -or
         [bool]$script:State.HistoryBackfillRunning -or
+        @($script:State.BackgroundJobs.Values | Where-Object { [string]$_.Kind -eq 'MeasurementBaseline' }).Count -gt 0 -or
         [string]$script:State.UiState -notin @('Idle', 'Ready', 'Error')) { return }
     $requestId = New-TokenRaderRequestId
     $script:State.ToolBackfillRequestId = $requestId
@@ -1603,7 +1657,10 @@ function Start-TokenRaderMeasurementBaselineAsync {
         [Parameter(Mandatory = $true)][Int64]$RequestId
     )
     $cancellationSource = [Threading.CancellationTokenSource]::new()
-    $progressState = [hashtable]::Synchronized(@{ Stage = '冻结开始位置'; LastProgressAt = [DateTimeOffset]::Now })
+    $progressState = [hashtable]::Synchronized(@{
+        Stage = '分批补齐最近24小时日志'; HistoryProcessedBytes = [Int64]0
+        RemainingFiles = [Int64]0; RemainingBytes = [Int64]0; LastProgressAt = [DateTimeOffset]::Now
+    })
     [void](Start-TokenRaderBackgroundJob `
         -ScriptBlock $script:MeasurementBaselineScript `
         -Parameters @{
@@ -1619,7 +1676,7 @@ function Start-TokenRaderMeasurementBaselineAsync {
         -RequestId $RequestId `
         -CompletionHandler 'Complete-TokenRaderMeasurementBaselineJob' `
         -FailureHandler 'Fail-TokenRaderMeasurementBaselineJob' `
-        -TimeoutSeconds 30 -ProgressState $progressState -CancellationSource $cancellationSource `
+        -TimeoutSeconds 0 -StallTimeoutSeconds 60 -ProgressState $progressState -CancellationSource $cancellationSource `
         -StopCompletionHandler 'Complete-TokenRaderBoundaryStopJob')
 }
 
@@ -1700,6 +1757,7 @@ function Start-TokenRaderIndexSyncAsync {
     )
     if ($script:WindowClosing -or [bool]$script:State.IndexSyncing -or
         [bool]$script:State.HistoryBackfillRunning -or [bool]$script:State.ToolBackfillRunning -or
+        @($script:State.BackgroundJobs.Values | Where-Object { [string]$_.Kind -eq 'MeasurementBaseline' }).Count -gt 0 -or
         [string]$script:State.UiState -notin @('Idle', 'Ready', 'Error')) { return }
     $requestId = New-TokenRaderRequestId
     $script:State.IndexSyncing = $true
@@ -3081,7 +3139,15 @@ function Complete-TokenRaderMeasurementBaseline {
     $script:State.PendingMeasurementStart = $false
     $script:State.IntervalBaseline = $Baseline
     $script:State.IntervalResult = $null
+    $script:State.IntervalEnd = $null
+    $script:State.IntervalFinalRetry = $null
+    $script:State.WeeklyReferenceEstimate = $null
     $script:State.IntervalCache = $null
+    if ($null -ne $Baseline.PSObject.Properties['HistoryCoverage']) {
+        # This auxiliary label cannot prevent a valid prepared baseline from
+        # entering Measuring if a coverage control fails to render.
+        try { Set-TokenRaderHistoryCoverage -Coverage $Baseline.HistoryCoverage } catch { }
+    }
     Merge-LatestRateLimits -Candidate $Baseline.StartRateLimits
     Retain-TokenRaderQuotaEstimatesForCurrentWindow `
         -RateLimits $Baseline.StartRateLimits `
@@ -3560,6 +3626,7 @@ function Update-ProjectView {
 function Start-IntervalMeasurement {
     if ([string]$script:State.UiState -notin @('Idle', 'Ready', 'Error')) { return }
     if ([bool]$script:State.HistoryBackfillRunning -or [bool]$script:State.ToolBackfillRunning -or
+        [bool]$script:State.UsageHistoryRefreshing -or
         @($script:State.BackgroundJobs.Values | Where-Object { [string]$_.Kind -in @('MeasurementBaseline', 'MeasurementEnd') }).Count -gt 0) { return }
     Reset-MeasurementPricingConfirmation
     $waitForIndex = (-not [bool]$script:State.IndexReady -or [bool]$script:State.IndexSyncing)
@@ -3575,12 +3642,8 @@ function Start-IntervalMeasurement {
     $script:State.IntervalComputePending = $false
     $script:State.IntervalComputePendingRequest = $null
     $script:State.IntervalLastError = ''
-    $script:State.IntervalFinalRetry = $null
-    $script:State.IntervalEnd = $null
-    $script:State.IntervalBaseline = $null
-    $script:State.IntervalResult = $null
-    $script:State.WeeklyReferenceEstimate = $null
-    $script:State.IntervalCache = $null
+    # Keep the last valid result and evidence until recent-history preparation
+    # succeeds. A cancelled or incomplete preparation must not erase them.
     $script:State.PendingMeasurementStart = $waitForIndex
     Retain-TokenRaderQuotaEstimatesForCurrentWindow
     if ($null -eq $script:State.QuotaEstimates) {
@@ -3595,7 +3658,7 @@ function Start-IntervalMeasurement {
         Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '准备中：正在等待后台索引完成，完成后会自动开始计时…'
         return
     }
-    Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '正在后台冻结开始位置…'
+    Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '分批补齐最近24小时日志，完成后冻结开始位置并开始计时；可取消…'
     Start-TokenRaderMeasurementBaselineAsync -Generation $generation -RequestId $requestId
 }
 
@@ -3611,9 +3674,6 @@ function Cancel-TokenRaderMeasurementPreparation {
     $script:State.IntervalActiveScanRateLimits = $false
     $script:State.IntervalComputePending = $false
     $script:State.IntervalComputePendingRequest = $null
-    $script:State.IntervalBaseline = $null
-    $script:State.IntervalResult = $null
-    $script:State.IntervalCache = $null
 
     foreach ($job in @($script:State.BackgroundJobs.Values)) {
         if ([string]$job.Kind -notin @('IndexSync', 'MeasurementBaseline')) { continue }

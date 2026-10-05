@@ -365,10 +365,12 @@ WHERE seq<=1885000;
         Invoke-TestSql $performance 'CREATE INDEX idx_records_source_offset ON token_records(source_path,source_offset_end);'
 
         $starts = @{ 'synthetic://valid' = 0L }
-        foreach ($profile in @(
+        $profiles = @(
             [pscustomobject]@{ Rows = 25815L; MaximumMs = 1000.0 },
             [pscustomobject]@{ Rows = 108010L; MaximumMs = 3000.0 }
-        )) {
+        )
+        $emptyLedgerAggregates = @{}
+        foreach ($profile in $profiles) {
             $watch = [Diagnostics.Stopwatch]::StartNew()
             $aggregate = [TokenRaderIndexer]::AggregateIntervalRecords(
                 $performance, $starts, @{ 'synthetic://valid' = [Int64]$profile.Rows },
@@ -379,7 +381,37 @@ WHERE seq<=1885000;
             Assert-AggregateTest ($watch.Elapsed.TotalMilliseconds -le [double]$profile.MaximumMs) (
                 'streamed aggregate exceeded target: rows={0}, elapsed={1:0.0} ms, target={2:0.0} ms' -f
                     $profile.Rows, $watch.Elapsed.TotalMilliseconds, $profile.MaximumMs)
+            $emptyLedgerAggregates[[Int64]$profile.Rows] = $aggregate
             Write-Output ('AGGREGATE_PERF rows={0} elapsedMs={1:0.0} internalMs={2}' -f
+                $profile.Rows, $watch.Elapsed.TotalMilliseconds, $aggregate.ProcessingMilliseconds)
+        }
+        # A nonempty ledger activates the per-candidate prepared proof lookup.
+        # Keep one valid, older, nonmatching synthetic proof so both production
+        # profiles measure that path without changing any billable result.
+        Add-TestAggregateRelationship $performance 'proof-only' '' 'proof-only' 'synthetic://proof-only'
+        $proofCommand = $performance.CreateCommand()
+        try {
+            $proofCommand.CommandText = "INSERT INTO recent_lineage_evidence(event_key,session_id,timestamp_ticks,source_path,source_offset_end) VALUES('proof-only|1:0:0:0:1:0:0:0','proof-only',@ticks,'synthetic://proof-only',10)"
+            [void]$proofCommand.Parameters.AddWithValue('@ticks', $startedAt.AddDays(-1).UtcDateTime.Ticks)
+            [void]$proofCommand.ExecuteNonQuery()
+        } finally { $proofCommand.Dispose() }
+        foreach ($profile in $profiles) {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $aggregate = [TokenRaderIndexer]::AggregateIntervalRecords(
+                $performance, $starts, @{ 'synthetic://valid' = [Int64]$profile.Rows; 'synthetic://proof-only' = 10L },
+                $startedAt, $thresholds, $none, $null)
+            $watch.Stop()
+            $expected = $emptyLedgerAggregates[[Int64]$profile.Rows]
+            foreach ($field in @('RawEvents', 'CountedEvents', 'ProcessedRows', 'DuplicateEventsDropped',
+                'InheritedEventsDropped', 'TotalInput', 'TotalCached', 'TotalOutput', 'TotalReasoning')) {
+                Assert-AggregateTest ($aggregate.$field -eq $expected.$field) (
+                    'nonempty proof ledger changed {0} for {1} rows' -f $field, $profile.Rows)
+            }
+            Assert-AggregateTest ($aggregate.Buckets.Count -eq $expected.Buckets.Count) ('nonempty proof ledger changed buckets for ' + $profile.Rows)
+            Assert-AggregateTest ($watch.Elapsed.TotalMilliseconds -le [double]$profile.MaximumMs) (
+                'nonempty-proof aggregate exceeded target: rows={0}, elapsed={1:0.0} ms, target={2:0.0} ms' -f
+                    $profile.Rows, $watch.Elapsed.TotalMilliseconds, $profile.MaximumMs)
+            Write-Output ('AGGREGATE_PROOF_PERF rows={0} elapsedMs={1:0.0} internalMs={2}' -f
                 $profile.Rows, $watch.Elapsed.TotalMilliseconds, $aggregate.ProcessingMilliseconds)
         }
         Invoke-TestSql $performance 'CREATE INDEX idx_records_timestamp ON token_records(timestamp);'
