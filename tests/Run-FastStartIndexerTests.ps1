@@ -14,6 +14,21 @@ $none = [Threading.CancellationToken]::None
 $utf8 = [Text.UTF8Encoding]::new($false)
 function Assert([bool]$ok, [string]$why) { if (-not $ok) { throw ('FAST START TEST FAILED: ' + $why) } }
 function Scalar([string]$sql) { $cmd=$db.CreateCommand(); try { $cmd.CommandText=$sql; return $cmd.ExecuteScalar() } finally { $cmd.Dispose() } }
+function SyntheticMetadataSnapshot {
+    $cmd=$db.CreateCommand()
+    try {
+        $cmd.CommandText="SELECT * FROM file_metadata WHERE session_id='synthetic'"
+        $reader=$cmd.ExecuteReader()
+        try {
+            Assert ($reader.Read()) 'synthetic catalog row exists'
+            $row=[ordered]@{}
+            for ($i=0; $i -lt $reader.FieldCount; $i++) {
+                $row[$reader.GetName($i)] = if ($reader.IsDBNull($i)) { $null } else { $reader.GetValue($i) }
+            }
+            return ($row | ConvertTo-Json -Depth 8 -Compress)
+        } finally { $reader.Dispose() }
+    } finally { $cmd.Dispose() }
+}
 function Token([int]$total, [int]$last = -1) {
     $info = @{ total_token_usage=@{ input_tokens=$total; cached_input_tokens=0; output_tokens=0; reasoning_output_tokens=0 } }
     if ($last -ge 0) { $info.last_token_usage=@{ input_tokens=$last; cached_input_tokens=0; output_tokens=0; reasoning_output_tokens=0 } }
@@ -77,11 +92,17 @@ try {
     } while ($batch.RemainingBytes -gt 0)
     Assert (-not $batch.Completed -and $batch.BlockedFiles -gt 0) 'unparsed giant line remains explicitly incomplete'
     Assert ((Scalar 'SELECT COUNT(*) FROM token_records') -eq 4) 'records following giant body still imported'
+    $oldCursor = [long](Scalar "SELECT parsed_offset FROM file_metadata WHERE session_id='synthetic'")
+    $oldMetadata = SyntheticMetadataSnapshot
     [IO.File]::WriteAllText($path, $meta + "`n", $utf8)
     $replaced = [TokenRaderIndexer]::InitializeFromNow($db,$temp,$progress,$none)
     Assert ($replaced.BlockedFiles -ge 1) 'truncated source is explicitly blocked'
     Assert ((Scalar 'SELECT COUNT(*) FROM token_records') -eq 4) 'truncation preserves retained rows'
-    Assert ((Scalar "SELECT parsed_offset FROM file_metadata WHERE session_id='synthetic'") -le ([IO.FileInfo]$path).Length) 'truncation does not retain impossible EOF cursor'
+    Assert ($oldCursor -gt ([IO.FileInfo]$path).Length) 'fixture truncates below the retained cursor'
+    Assert ((Scalar "SELECT parsed_offset FROM file_metadata WHERE session_id='synthetic'") -eq $oldCursor) 'truncation preserves the old-incarnation cursor'
+    Assert ((SyntheticMetadataSnapshot) -eq $oldMetadata) 'truncation preserves old identity, relationships and context'
+    Assert ((Scalar "SELECT COUNT(*) FROM history_gaps WHERE path=(SELECT path FROM file_metadata WHERE session_id='synthetic') AND blocked_reason='source_replaced'") -gt 0) 'replacement guard makes the retained cursor unusable for the new incarnation'
+    Assert (-not $replaced.Completed -and -not ([TokenRaderIndexer]::GetHistoryBackfillStatus($db)).Completed) 'truncation cannot claim complete history'
 
     # Independent edge-case database: only generated fixtures, no real index.
     $db.Dispose()

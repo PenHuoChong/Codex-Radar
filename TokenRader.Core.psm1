@@ -3758,6 +3758,14 @@ function Get-TokenRaderSafeIndexFailure {
     # Only fixed, code-owned descriptions may reach the background status.
     # Arbitrary exception messages can contain source paths or JSON/body text.
     $message = [string]$cause.Message
+    if ($message -match '^最近24小时日志尚未安全补齐：剩余 ([0-9]{1,10}) 个文件，受阻 ([0-9]{1,10}) 个；原因：([^。]*)。') {
+        $remaining = $matches[1]; $blocked = $matches[2]
+        $reasonEntries = @($matches[3] -split '；')
+        $known = @('文件暂时无法读取', '来源变化或历史安全校验未通过', '存在无法安全解析的超大记录',
+            '历史记录未完整写入', '用量记录缺少有效时间', '用量时间晚于冻结时刻', '用量记录格式异常')
+        $reasons = @($known | Where-Object { $reasonEntries -ccontains $_ })
+        return [pscustomobject]@{ Kind = 'history'; Message = ('最近24小时补齐未完成：剩余 {0} 个文件，受阻 {1} 个；已识别原因：{2}' -f $remaining, $blocked, ($reasons -join '；')) }
+    }
     if ($message -match 'Oversized usage/context line cannot be safely indexed') {
         return [pscustomobject]@{ Kind = 'safety'; Message = '超大记录结构未通过安全校验（Oversized usage/context line cannot be safely indexed）；保留原游标，需核对记录类型或完整性' }
     }
@@ -4908,11 +4916,21 @@ function ConvertTo-TokenRaderOffsetMap {
     if ($null -eq $Value) { return $map }
     if ($Value -is [Collections.IDictionary]) {
         foreach ($key in @($Value.Keys)) {
-            try { $map[(ConvertTo-TokenRaderCanonicalPath -Path ([string]$key))] = [Int64]$Value[$key] } catch { }
+            try {
+                # Keep CanonicalPath's exact fallback, without a PowerShell
+                # function invocation for every key in large frozen maps.
+                $path = [string]$key
+                try { $path = [IO.Path]::GetFullPath($path) } catch { }
+                $map[$path] = [Int64]$Value[$key]
+            } catch { }
         }
     } elseif ($null -ne $Value.PSObject) {
         foreach ($property in @($Value.PSObject.Properties)) {
-            try { $map[(ConvertTo-TokenRaderCanonicalPath -Path ([string]$property.Name))] = [Int64]$property.Value } catch { }
+            try {
+                $path = [string]$property.Name
+                try { $path = [IO.Path]::GetFullPath($path) } catch { }
+                $map[$path] = [Int64]$property.Value
+            } catch { }
         }
     }
     return $map
@@ -4949,13 +4967,24 @@ function ConvertFrom-TokenRaderRateLimitRows {
 function Get-TokenRaderIndexedRateLimitsAtOffsets {
     param(
         [Parameter(Mandatory = $true)]$Connection,
-        [Parameter(Mandatory = $true)]$EndOffsets
+        [Parameter(Mandatory = $true)]$EndOffsets,
+        [hashtable]$ProgressState = $null
     )
     $ends = ConvertTo-TokenRaderOffsetMap -Value $EndOffsets
     $starts = New-Object hashtable ([StringComparer]::OrdinalIgnoreCase)
     foreach ($path in @($ends.Keys)) { $starts[$path] = 0L }
     if ($ends.Count -eq 0) { return $null }
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '冻结起点：查询额度快照'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
+    $queryWatch = [Diagnostics.Stopwatch]::StartNew()
     $table = [TokenRaderIndexer]::QueryLatestRateLimitsByOffsets($Connection, $starts, $ends)
+    if ($null -ne $ProgressState) {
+        $ProgressState.QuotaQueryMilliseconds = $queryWatch.ElapsedMilliseconds
+        $ProgressState.Stage = '冻结起点：转换额度快照'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
     return ConvertFrom-TokenRaderRateLimitRows -Table $table -LimitId 'codex'
 }
 
@@ -5123,7 +5152,15 @@ function CaptureMeasurementBaseline {
         $PreparedHistory = $null,
         [Threading.CancellationToken]$CancellationToken = [Threading.CancellationToken]::None
     )
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '冻结起点：打开索引'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
     $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
+    if ($null -ne $ProgressState) {
+        $ProgressState.Stage = '冻结起点：等待索引任务锁'
+        $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+    }
     $gate = [TokenRaderIndexer]::AcquireIndexGate($SessionsRoot)
     try {
         $CancellationToken.ThrowIfCancellationRequested()
@@ -5141,7 +5178,7 @@ function CaptureMeasurementBaseline {
             $index = Sync-TokenRaderMeasurementBoundary -SessionsRoot $SessionsRoot -ProgressState $ProgressState -CancellationToken $CancellationToken
             $startOffsets = Get-TokenRaderCursorOffsets -Connection $index.Connection
         }
-        $startRateLimits = Get-TokenRaderIndexedRateLimitsAtOffsets -Connection $index.Connection -EndOffsets $startOffsets
+        $startRateLimits = Get-TokenRaderIndexedRateLimitsAtOffsets -Connection $index.Connection -EndOffsets $startOffsets -ProgressState $ProgressState
         $files = foreach ($path in @($startOffsets.Keys)) {
             [pscustomobject]@{
                 FilePath = [string]$path
@@ -5155,6 +5192,10 @@ function CaptureMeasurementBaseline {
         # The real timer starts only after synchronization and both snapshots
         # are frozen. Calls generated during Starting are filtered by time.
         $startedAt = [DateTimeOffset]::Now
+        if ($null -ne $ProgressState) {
+            $ProgressState.Stage = '冻结起点：汇总历史覆盖状态'
+            $ProgressState.LastProgressAt = [DateTimeOffset]::Now
+        }
         [pscustomobject]@{
             StartedAt = $startedAt
             SessionsRoot = [string]$index.SessionsRoot

@@ -268,7 +268,7 @@ function Merge-LatestRateLimits {
 }
 function Retain-TokenRaderQuotaEstimatesForCurrentWindow {
     param($RateLimits, $AccountIdentity); $script:AuxiliaryCalls++
-    if ($script:FaultStage -in @('Retain','All')) { throw 'synthetic-Retain-original-cause' }
+    if ($script:FaultStage -in @('Retain','All')) { throw [InvalidOperationException]::new('synthetic-private-body') }
 }
 function Show-EmptyIntervalMeasurement {
     param($Baseline); $script:AuxiliaryCalls++
@@ -296,9 +296,19 @@ foreach ($fault in @('State','Coverage','Merge','Retain','Empty','All')) {
     Assert-RecentUi ($script:AuxiliaryCalls -eq 4) ($fault+' fault prevented independent auxiliary steps')
     $expectedFaults = if ($fault -eq 'All') { @('State','Coverage','Merge','Retain','Empty') } else { @($fault) }
     foreach ($expected in $expectedFaults) {
-        $cause = 'synthetic-'+$expected+'-original-cause'
-        Assert-RecentUi ($script:State.IntervalLastError.Contains($cause) -and
-            $script:State.LastFailureInfo.Contains($cause)) ($expected+' original exception was lost from retry/copy diagnostics')
+        if ($expected -eq 'Retain') {
+            $safeStagePrefix = -join ([char[]]@(0x989D,0x5EA6,0x7ED3,0x679C,0x4FDD,0x7559,0x5931,0x8D25,0xFF1A))
+            $safeCause = [string]::Concat($safeStagePrefix, 'InvalidOperationException')
+            $hasSafeIntervalCause = $script:State.IntervalLastError.Contains($safeCause)
+            $hasSafeCopyCause = $script:State.LastFailureInfo.Contains($safeCause)
+            $hasPrivateBody = $script:State.IntervalLastError.Contains('synthetic-private-body') -or
+                $script:State.LastFailureInfo.Contains('synthetic-private-body')
+            Assert-RecentUi ($hasSafeIntervalCause -and $hasSafeCopyCause -and (-not $hasPrivateBody)) 'Retain diagnostic keeps fixed stage and exception type without the synthetic body'
+        } else {
+            $cause = 'synthetic-'+$expected+'-original-cause'
+            Assert-RecentUi ($script:State.IntervalLastError.Contains($cause) -and
+                $script:State.LastFailureInfo.Contains($cause)) ($expected+' original exception was lost from retry/copy diagnostics')
+        }
     }
     $failureInfo = $script:State.LastFailureInfo
     $calls = $script:AuxiliaryCalls

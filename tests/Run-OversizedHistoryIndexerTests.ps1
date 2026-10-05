@@ -102,6 +102,9 @@ try {
     Complete $true (256*1024)
     Assert (-not $batch.Completed -and $batch.BlockedReasons.Contains('oversized_line')) 'old DFA version cannot bypass stricter role proof'
     [void][TokenRaderIndexer]::PrepareRecentHistory($db,$fixtureRoot,$cutoff.AddMinutes(1),$end.AddMinutes(1),$progress,$none)
+    Assert ((Scalar 'SELECT blocked_reason FROM recent_history_work')-eq'oversized_line') 'unchanged rejected proof stays blocked without automatic repeated scan'
+    [void][TokenRaderIndexer]::ResetRecentHistoryBackfillRetries($db)
+    [void][TokenRaderIndexer]::PrepareRecentHistory($db,$fixtureRoot,$cutoff.AddMinutes(1),$end.AddMinutes(1),$progress,$none)
     Assert ((Scalar 'SELECT cursor_offset FROM recent_history_work')-eq0) 'old DFA rejection retries from original gap boundary'
     Complete $true (256*1024)
     Assert $batch.Completed 'old safe body recovers after version-2 whole-line rescan'
@@ -113,6 +116,7 @@ try {
         Sql "UPDATE history_gaps SET cursor_offset=end_offset,discard_line=0,blocked_reason='oversized_line',body_scan_state=''"
         if($recent) {
             Sql "UPDATE recent_history_work SET cursor_offset=end_offset,discard_line=0,blocked_reason='oversized_line',body_scan_state=''"
+            Sql 'DELETE FROM recent_history_attempt_stamps' # Legacy rows predate attempt stamps.
             [void][TokenRaderIndexer]::PrepareRecentHistory($db,$fixtureRoot,$cutoff.AddMinutes(1),$end.AddMinutes(1),$progress,$none)
             Assert ((Scalar 'SELECT cursor_offset FROM recent_history_work')-eq0) 'old recent blocked state is restarted from gap boundary'
         } else {

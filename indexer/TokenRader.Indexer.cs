@@ -378,7 +378,7 @@ public sealed class TokenRaderHistoryBackfillResult
 ///
 /// 编译：csc /target:library /reference:System.Runtime.Serialization.dll /reference:System.Data.SQLite.dll /optimize+ ...
 /// </summary>
-public static class TokenRaderIndexer
+public static partial class TokenRaderIndexer
 {
     private enum QuotaCycleAttribution
     {
@@ -971,6 +971,10 @@ public static class TokenRaderIndexer
             EnsureHistoryBodyScanColumn(db, "history_gaps");
             EnsureHistoryBodyScanColumn(db, "recent_history_work");
             cmd.CommandText = "CREATE TABLE IF NOT EXISTS recent_history_sources(path TEXT PRIMARY KEY,end_offset INTEGER NOT NULL)";
+            cmd.ExecuteNonQuery();
+            // Observation stamps suppress a repeated failed pass, never prove
+            // coverage or permit a discarded record to enter the index.
+            cmd.CommandText = "CREATE TABLE IF NOT EXISTS recent_history_attempt_stamps(path TEXT PRIMARY KEY,source_length INTEGER NOT NULL,last_write_ticks INTEGER NOT NULL,parser_version INTEGER NOT NULL,cutoff TEXT NOT NULL)";
             cmd.ExecuteNonQuery();
             // Numeric lineage proof is not a token/cost row. It only prevents
             // a recent copy/status refresh from billing an older canonical call.
@@ -1812,6 +1816,18 @@ public static class TokenRaderIndexer
         long processed = 0L;
         using (var tx = db.BeginTransaction())
         {
+            var blockedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var blocked = db.CreateCommand())
+            {
+                blocked.Transaction = tx;
+                blocked.CommandText = "SELECT DISTINCT path FROM history_gaps WHERE blocked_reason='source_replaced'";
+                using (var reader = blocked.ExecuteReader())
+                    while (reader.Read())
+                    {
+                        cancel.ThrowIfCancellationRequested();
+                        blockedPaths.Add(ReadReaderString(reader, 0));
+                    }
+            }
             foreach (string filePath in EnumerateHistoryFiles(sessionsRoot, cancel))
             {
                 cancel.ThrowIfCancellationRequested();
@@ -1831,6 +1847,13 @@ public static class TokenRaderIndexer
                             oldRetained = ReadReaderInt64(reader, 7);
                         }
                 }
+                if (blockedPaths.Contains(path))
+                {
+                    // A refused incarnation must not redefine retained
+                    // identity, relationships, context or its old cursor.
+                    ReportIndexProgress(progress, "FastStart", path, processed, 0L, oldOffset);
+                    continue;
+                }
                 var info = new FileInfo(path);
                 bool unchanged = oldLength == info.Length && oldWrite == info.LastWriteTimeUtc.Ticks && oldRetained != 0L;
                 bool completePrefixProven = false;
@@ -1848,6 +1871,22 @@ public static class TokenRaderIndexer
                 {
                     long length = fs.Length;
                     bool replaced = oldLength >= 0L && (length < oldLength || (length == oldLength && oldWrite != info.LastWriteTimeUtc.Ticks));
+                    if (replaced)
+                    {
+                        // Record the refusal before reading any replacement
+                        // header/tail. Keep the old catalog and all evidence.
+                        using (var blocked = db.CreateCommand())
+                        {
+                            blocked.Transaction = tx;
+                            blocked.CommandText = "INSERT OR IGNORE INTO history_gaps(path,start_offset,end_offset,cursor_offset,blocked_reason) VALUES(@path,0,@end,0,'source_replaced'); UPDATE history_gaps SET blocked_reason='source_replaced' WHERE path=@path";
+                            blocked.Parameters.AddWithValue("@path", path);
+                            blocked.Parameters.AddWithValue("@end", length);
+                            blocked.ExecuteNonQuery();
+                        }
+                        blockedPaths.Add(path);
+                        ReportIndexProgress(progress, "FastStart", path, processed, 0L, oldOffset);
+                        continue;
+                    }
                     int headerLength = oldLength < 0L ? (int)Math.Min(128L * 1024L, length) : 0;
                     byte[] header = ReadBoundedBytes(fs, 0L, headerLength, cancel);
                     long tailStart = Math.Max((long)header.Length, length - 128L * 1024L);
@@ -1990,11 +2029,12 @@ public static class TokenRaderIndexer
         var parents = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var entries = new List<KeyValuePair<string, string>>();
         var knownSessions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var blockedSessions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var previousRoots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         using (var cmd = db.CreateCommand())
         {
             cmd.Transaction = tx;
-            cmd.CommandText = "SELECT path,session_id,COALESCE(NULLIF(parent_thread_id,''),NULLIF(forked_from_id,''),''),root_session_id FROM file_metadata WHERE session_id<>''";
+            cmd.CommandText = "SELECT f.path,f.session_id,COALESCE(NULLIF(f.parent_thread_id,''),NULLIF(f.forked_from_id,''),''),f.root_session_id,EXISTS(SELECT 1 FROM history_gaps g WHERE g.path=f.path AND g.blocked_reason='source_replaced') FROM file_metadata f WHERE f.session_id<>''";
             using (var reader = cmd.ExecuteReader())
                 while (reader.Read())
                 {
@@ -2003,20 +2043,24 @@ public static class TokenRaderIndexer
                     string path = ReadReaderString(reader, 0);
                     entries.Add(new KeyValuePair<string, string>(path, session));
                     knownSessions.Add(session); previousRoots[path] = ReadReaderString(reader, 3);
+                    if (ReadReaderInt64(reader, 4) != 0L) blockedSessions.Add(session);
                     if (!string.IsNullOrWhiteSpace(parent)) parents[session] = parent;
                 }
         }
         foreach (var entry in entries)
         {
             cancel.ThrowIfCancellationRequested();
-            string root = entry.Value, next; bool cycle = false;
+            string root = entry.Value, next; bool cycle = false, blockedChain = false;
+            if (blockedSessions.Contains(previousRoots[entry.Key])) continue;
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            while (parents.TryGetValue(root, out next) && !string.IsNullOrWhiteSpace(next))
+            while (true)
             {
+                if (blockedSessions.Contains(root)) { blockedChain = true; break; }
+                if (!parents.TryGetValue(root, out next) || string.IsNullOrWhiteSpace(next)) break;
                 if (!seen.Add(root)) { cycle = true; break; }
                 root = next;
             }
-            if (cycle) continue;
+            if (cycle || blockedChain) continue;
             // A missing ancestor is not evidence that its child is the root.
             // Keep a previously resolved root rather than downgrade lineage.
             if (!knownSessions.Contains(root) && !string.IsNullOrWhiteSpace(previousRoots[entry.Key]))
@@ -2086,6 +2130,10 @@ public static class TokenRaderIndexer
         SetSettingInTransaction(db, tx, "IndexRevision", revision.ToString(CultureInfo.InvariantCulture)); return revision;
     }
 
+    // Advance intentionally whenever accepted streaming record schemas change.
+    // This is independent of each DFA's continuation serialization protocol.
+    public const int RecentHistoryParserVersion = 7;
+
     /// <summary>Freeze pending gaps once; following batches never chase append EOF.</summary>
     public static TokenRaderHistoryBackfillResult PrepareRecentHistory(SQLiteConnection db,
         string sessionsRoot, DateTimeOffset cutoff, DateTimeOffset frozenEnd,
@@ -2095,7 +2143,8 @@ public static class TokenRaderIndexer
         if (db == null) throw new ArgumentNullException("db");
         cancel.ThrowIfCancellationRequested(); CreateSchema(db);
         DateTimeOffset previousCutoff;
-        bool resumeCompatible = TryParseTimestamp(GetSetting(db,"recent_history_cutoff"),out previousCutoff) && cutoff >= previousCutoff;
+        string previousCutoffText = GetSetting(db,"recent_history_cutoff");
+        bool resumeCompatible = TryParseTimestamp(previousCutoffText,out previousCutoff) && cutoff >= previousCutoff;
         var freezeClock = Stopwatch.StartNew();
         var catalogResult = InitializeFromNow(db, sessionsRoot, progress, cancel, true);
         TimeSpan requestedRange = frozenEnd-cutoff;
@@ -2117,6 +2166,15 @@ public static class TokenRaderIndexer
                 // frozen gap rather than laundering a discarded suffix into coverage.
                 cmd.CommandText = "UPDATE recent_history_work SET "+string.Join(",",assignments.ToArray())+" WHERE blocked_reason='' AND EXISTS(SELECT 1 FROM previous_recent_work p WHERE p.path=recent_history_work.path AND p.start_offset<=recent_history_work.start_offset AND p.cursor_offset>=recent_history_work.cursor_offset AND p.end_offset<=recent_history_work.end_offset AND p.blocked_reason IN ('','io_unavailable') AND (p.discard_line=0 OR p.body_scan_state<>''))";
                 cmd.ExecuteNonQuery();
+                // A completed failed pass may be retained only as a failure.
+                // Exact source/end/version observations avoid rescanning an
+                // unchanged rejected file on every ordinary start. Never use
+                // its post-rejection context as a successful retry baseline.
+                cmd.Parameters.AddWithValue("@parserVersion", RecentHistoryParserVersion);
+                cmd.Parameters.AddWithValue("@previousCutoff", previousCutoffText);
+                cmd.CommandText = "UPDATE recent_history_work SET "+string.Join(",",assignments.ToArray())+" WHERE blocked_reason='' AND EXISTS(SELECT 1 FROM previous_recent_work p JOIN recent_history_attempt_stamps s ON s.path=p.path JOIN file_metadata f ON f.path=p.path WHERE p.path=recent_history_work.path AND p.start_offset=recent_history_work.start_offset AND p.end_offset=recent_history_work.end_offset AND p.cursor_offset=p.end_offset AND p.blocked_reason='oversized_line' AND s.source_length=f.length AND s.last_write_ticks=f.last_write_ticks AND s.parser_version=@parserVersion AND s.cutoff=@previousCutoff)";
+                cmd.ExecuteNonQuery();
+                cmd.Parameters.Clear();
             }
             cmd.CommandText="DROP TABLE temp.previous_recent_work"; cmd.ExecuteNonQuery();
             // Cursor context from a prior partially committed historical batch
@@ -2127,6 +2185,12 @@ public static class TokenRaderIndexer
             SetSettingInTransaction(db, tx, "recent_history_cutoff", cutoff.ToString("o", CultureInfo.InvariantCulture));
             SetSettingInTransaction(db, tx, "recent_history_frozen_at", frozenEnd.ToString("o", CultureInfo.InvariantCulture));
             SetSettingInTransaction(db, tx, "recent_history_coverage_start", "");
+            // Capture the source observation at the start of this attempt, not
+            // later when a rejected line might already have been rewritten.
+            cmd.CommandText = "DELETE FROM recent_history_attempt_stamps; INSERT INTO recent_history_attempt_stamps(path,source_length,last_write_ticks,parser_version,cutoff) SELECT w.path,f.length,f.last_write_ticks,@parserVersion,@cutoff FROM recent_history_work w JOIN file_metadata f ON f.path=w.path";
+            cmd.Parameters.AddWithValue("@parserVersion", RecentHistoryParserVersion);
+            cmd.Parameters.AddWithValue("@cutoff", cutoff.ToString("o", CultureInfo.InvariantCulture));
+            cmd.ExecuteNonQuery();
             cancel.ThrowIfCancellationRequested(); AdvanceRevisionInTransaction(db, tx); tx.Commit();
         }
         var prepared = GetRecentHistoryBackfillStatus(db);
@@ -2279,6 +2343,7 @@ public static class TokenRaderIndexer
     /// <summary>Retry I/O, and re-scan oversized gaps from their original boundary.</summary>
     public static int ResetHistoryBackfillRetries(SQLiteConnection db)
     {
+        int recentChanged = ResetRecentHistoryBackfillRetries(db);
         using (var cmd = db.CreateCommand())
         {
             cmd.CommandText = "UPDATE history_gaps SET blocked_reason=CASE WHEN blocked_reason='io_unavailable' THEN '' ELSE substr(blocked_reason,16) END WHERE blocked_reason='io_unavailable' OR blocked_reason LIKE 'io_unavailable:%'";
@@ -2286,7 +2351,21 @@ public static class TokenRaderIndexer
             // Clearing this diagnosis is permitted only with a full frozen-gap
             // replay: no previous discarded suffix or context can become proof.
             cmd.CommandText = "UPDATE history_gaps SET cursor_offset=start_offset,discard_line=0,body_scan_state='',blocked_reason='',model='',model_source='',model_timestamp='',service_tier='',service_tier_source='',turn_id='',reasoning_effort='' WHERE blocked_reason='oversized_line'";
-            return changed + cmd.ExecuteNonQuery();
+            return recentChanged + changed + cmd.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>
+    /// Explicitly permits one fresh recent-history replay of failed sources.
+    /// It invalidates only repeat suppression; source-replacement guards and
+    /// coverage remain unchanged. The next Prepare resets to the gap boundary.
+    /// </summary>
+    public static int ResetRecentHistoryBackfillRetries(SQLiteConnection db)
+    {
+        using (var cmd = db.CreateCommand())
+        {
+            cmd.CommandText = "DELETE FROM recent_history_attempt_stamps WHERE path IN (SELECT path FROM recent_history_work WHERE blocked_reason='oversized_line')";
+            return cmd.ExecuteNonQuery();
         }
     }
 
@@ -2491,7 +2570,9 @@ public static class TokenRaderIndexer
     private static int ImportFile(SQLiteConnection db, string filePath, long startOffset, long endOffset,
         string rootSessionId, string parentSessionId, long? explicitIndexRevision,
         IDictionary progress, CancellationToken cancel, HistoryGapState history,
-        Stopwatch deadline, int maxMilliseconds, SQLiteTransaction existingTransaction = null)
+        Stopwatch deadline, int maxMilliseconds, SQLiteTransaction existingTransaction = null,
+        Stream suppliedSource = null, Action<int> consumedByte = null, Action<string> completeLineValidator = null,
+        long suppliedSourceIdentity = 0L)
     {
         cancel.ThrowIfCancellationRequested();
         int count = 0;
@@ -2518,7 +2599,7 @@ public static class TokenRaderIndexer
         // source segment rather than blindly using the parent's latest row.
         DateTimeOffset firstImportedEventAt;
         firstImportedEventAt = default(DateTimeOffset);
-        bool hasFirstImportedEventAt = history == null && TryReadFirstEventTimestamp(
+        bool hasFirstImportedEventAt = history == null && suppliedSource == null && TryReadFirstEventTimestamp(
             filePath, startOffset, endOffset, cancel, out firstImportedEventAt);
         DateTimeOffset? inheritedModelCutoff = hasFirstImportedEventAt
             ? (DateTimeOffset?)firstImportedEventAt : null;
@@ -2630,15 +2711,16 @@ public static class TokenRaderIndexer
                 p[i] = prm;
             }
 
-            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete))
+            using (var ownedSource = suppliedSource == null ? new FileStream(filePath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete) : null)
             {
+                Stream fs = suppliedSource ?? ownedSource;
                 long safeStart = Math.Max(0L, startOffset);
                 long requestedEnd = endOffset < 0L ? 0L : endOffset;
                 long effectiveEnd = Math.Min(fs.Length, requestedEnd);
                 if (existingTransaction != null && fs.Length < requestedEnd)
                     throw new IOException("Replacement source shrank before its frozen boundary; prior index retained.");
-                if (existingTransaction != null && requestedEnd > 0L)
+                if (existingTransaction != null && suppliedSource == null && requestedEnd > 0L)
                 {
                     fs.Seek(requestedEnd - 1L, SeekOrigin.Begin);
                     int terminal = fs.ReadByte();
@@ -2648,7 +2730,8 @@ public static class TokenRaderIndexer
                 if (history != null && effectiveEnd < history.End && fs.Length < history.End)
                     throw new IOException("Historical source shrank before its frozen EOF; gap retained.");
                 if (safeStart >= effectiveEnd) { cancel.ThrowIfCancellationRequested(); if (ownedTransaction != null) tx.Commit(); return 0; }
-                long bodySourceCreatedTicks = history == null ? 0L : File.GetCreationTimeUtc(filePath).Ticks;
+                long bodySourceCreatedTicks = history == null ? 0L : suppliedSource != null
+                    ? suppliedSourceIdentity : File.GetCreationTimeUtc(filePath).Ticks;
                 if (history != null && history.Discard && !string.IsNullOrEmpty(history.BodyScanState) &&
                     !BodyScanSourceMatches(history.BodyScanState, bodySourceCreatedTicks))
                 {
@@ -2697,7 +2780,8 @@ public static class TokenRaderIndexer
                 // including the newline, for every inserted token record.
                 using (var lineReader = new Utf8JsonlLineReader(fs, safeStart, effectiveEnd, cancel,
                     progress, deadline, null, history != null && history.Discard, maxMilliseconds,
-                    history != null, history == null ? null : history.BodyScanState, bodySourceCreatedTicks))
+                    history != null, history == null ? null : history.BodyScanState, bodySourceCreatedTicks,
+                    consumedByte, suppliedSource != null))
                 {
                     if (skipPartialLine)
                     {
@@ -2719,13 +2803,30 @@ public static class TokenRaderIndexer
                         // is a still-growing JSON record and must wait for the next
                         // refresh before it can enter the index.
                         if (!lineTerminated) break;
+                        if (completeLineValidator != null && !string.IsNullOrWhiteSpace(line)) completeLineValidator(line);
                         if (lineReader.CommandExecution != null)
                         {
                             DateTimeOffset toolAt;
                             CommandExecutionProjection projection = lineReader.CommandExecution;
+                            if (suppliedSource != null && history != null &&
+                                (!TryParseTimestamp(projection.Timestamp, out toolAt) || toolAt > history.FrozenEnd))
+                                throw new IOException("Verified source tool timestamp is invalid.");
                             if (TryParseTimestamp(projection.Timestamp, out toolAt) &&
                                 (history == null || !history.Recent || toolAt >= history.Cutoff && toolAt <= history.FrozenEnd))
                                 IndexCommandExecution(db, tx, projection, sessionId, effectiveRootSessionId,
+                                    currentModel, sourcePath, lineEndOffset, indexRevision, 0L);
+                            continue;
+                        }
+                        if (lineReader.ToolOutput != null)
+                        {
+                            DateTimeOffset outputAt;
+                            ToolOutputProjection projection = lineReader.ToolOutput;
+                            if (suppliedSource != null && history != null &&
+                                (!TryParseTimestamp(projection.Timestamp, out outputAt) || outputAt > history.FrozenEnd))
+                                throw new IOException("Verified source tool timestamp is invalid.");
+                            if (TryParseTimestamp(projection.Timestamp, out outputAt) &&
+                                (history == null || !history.Recent || outputAt >= history.Cutoff && outputAt <= history.FrozenEnd))
+                                IndexToolOutput(db, tx, projection, sessionId, effectiveRootSessionId,
                                     currentModel, sourcePath, lineEndOffset, indexRevision, 0L);
                             continue;
                         }
@@ -3334,6 +3435,18 @@ public static class TokenRaderIndexer
         TokenRaderJsonRecord record = DeserializeLogRecord(line);
         if (record == null) return 0;
         if (string.Equals(record.Type, "compacted", StringComparison.Ordinal)) return 0;
+        if (string.Equals(record.Type, "response_item", StringComparison.Ordinal) && record.Payload != null &&
+            (string.Equals(record.Payload.Type, "custom_tool_call_output", StringComparison.Ordinal) ||
+             string.Equals(record.Payload.Type, "function_call_output", StringComparison.Ordinal))) {
+            var scan = new ToolOutputBodyScan();
+            foreach (byte value in Encoding.UTF8.GetBytes(line)) scan.Feed(value);
+            if (scan.Complete)
+                return IndexToolOutput(db, transaction, scan.Projection, sessionId, rootSessionId,
+                    currentModel, sourcePath, sourceOffsetEnd, indexRevision, cutoffEventTicks);
+            // Opaque metadata and output-text lookalikes must not fall back
+            // to regex image/tool interpretation when the closed shape fails.
+            return 0;
+        }
         if (string.Equals(record.Type, "event_msg", StringComparison.Ordinal) &&
             record.Payload != null && string.Equals(record.Payload.Type, "item_completed", StringComparison.Ordinal) &&
             line.IndexOf("CommandExecution", StringComparison.Ordinal) >= 0)
@@ -3413,6 +3526,23 @@ public static class TokenRaderIndexer
             BuildToolSourceEventKey(sourcePath, sourceOffsetEnd, "tool_call", "shell"),
             projection.CallId, sessionId, ticks, observedAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
             model, "tool_call", "shell", NormalizeToolStatus(projection.Status), 0,
+            sourcePath, sourceOffsetEnd, rootSessionId, indexRevision);
+        return 1;
+    }
+
+    private static int IndexToolOutput(SQLiteConnection db, SQLiteTransaction transaction,
+        ToolOutputProjection projection, string sessionId, string rootSessionId,
+        string model, string sourcePath, long sourceOffsetEnd, long indexRevision, long cutoffEventTicks)
+    {
+        DateTimeOffset observedAt;
+        if (projection == null || projection.InputImages <= 0 ||
+            !TryParseTimestamp(projection.Timestamp, out observedAt)) return 0;
+        long ticks = observedAt.UtcDateTime.Ticks;
+        if (cutoffEventTicks > 0L && ticks < cutoffEventTicks) return 0;
+        UpsertToolRecord(db, transaction,
+            BuildToolSourceEventKey(sourcePath, sourceOffsetEnd, "image_input", "image_input"),
+            "", sessionId, ticks, observedAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+            model, "image_input", "image_input", "observed", projection.InputImages,
             sourcePath, sourceOffsetEnd, rootSessionId, indexRevision);
         return 1;
     }
@@ -3654,6 +3784,12 @@ public static class TokenRaderIndexer
                     if (lineReader.CommandExecution != null)
                     {
                         detectedInFile += IndexCommandExecution(db, tx, lineReader.CommandExecution, sessionId, rootSessionId,
+                            currentModel, GetCanonicalPath(file.Path), lineEndOffset, indexRevision, cutoffEventTicks);
+                        continue;
+                    }
+                    if (lineReader.ToolOutput != null)
+                    {
+                        detectedInFile += IndexToolOutput(db, tx, lineReader.ToolOutput, sessionId, rootSessionId,
                             currentModel, GetCanonicalPath(file.Path), lineEndOffset, indexRevision, cutoffEventTicks);
                         continue;
                     }
@@ -7232,7 +7368,7 @@ public static class TokenRaderIndexer
     {
         if (string.IsNullOrEmpty(state) || state.Length > 600) return false;
         string[] parts = (state ?? "").Split('|'); long stored;
-        return parts.Length == 3 && (parts[0] == "2" || parts[0] == "3" || parts[0] == "4") &&
+        return parts.Length == 3 && (parts[0] == "2" || parts[0] == "3" || parts[0] == "4" || parts[0] == "5") &&
             long.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out stored) && stored > 0L && stored == createdTicks;
     }
 
@@ -7255,12 +7391,14 @@ public static class TokenRaderIndexer
             new[] { "type", "id", "command", "cwd", "process_id", "source", "status", "exit_code", "duration", "stdout", "stderr", "aggregated_output", "formatted_output", "parsed_cmd" },
             new[] { "secs", "nanos" },
             new string[0],
-            new[] { "type", "cmd" },
+            new[] { "type", "cmd", "name", "path", "query" },
             new string[0] // item.command: array of opaque, validated strings
         };
+        private static readonly string[] ParsedTypes = { "unknown", "read", "list_files", "search" };
         // invalid/depth/done/mode/match/position/escape/unicode/UTF8 bounds,
-        // numeric stage, followed by five kind/stage/seen/key frames.
-        private readonly int[] s = new int[32];
+        // numeric stage, five kind/stage/seen/key frames, then the current
+        // parsed-command variant and null-field mask. No command/path text.
+        private readonly int[] s = new int[34];
         private string timestamp = "", callId = "", status = "";
         public bool CanContinue { get { return s[0] == 0; } }
         public bool Complete { get { return CanContinue && s[1] == 0 && s[2] == 1 && s[3] == 0; } }
@@ -7271,27 +7409,38 @@ public static class TokenRaderIndexer
             string[] p = (saved ?? "").Split('~');
             if (p.Length != 4) { Fail(); return; }
             string[] values = p[0].Split(',');
-            if (values.Length != s.Length + 1 || values[0] != "1") { Fail(); return; }
-            for (int i = 0; i < s.Length; i++)
+            bool legacy = values.Length == 33 && values[0] == "1";
+            if (!legacy && (values.Length != s.Length + 1 || values[0] != "2")) { Fail(); return; }
+            for (int i = 0; i < (legacy ? 32 : s.Length); i++)
                 if (!int.TryParse(values[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || s[i] > 16383) { Fail(); return; }
             try {
                 timestamp = RestoreMetadata(p[1]);
                 callId = RestoreMetadata(p[2]);
                 status = RestoreMetadata(p[3]);
             } catch { Fail(); return; }
-            if (s[0] > 1 || s[1] > 5 || s[2] > 1 || s[3] > 6 || s[5] > 256 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[9] > 255 || s[10] > 255 || s[11] > 3 || timestamp.Length > 48 || callId.Length > 128 || status.Length > 24) { Fail(); return; }
+            if (s[0] > 1 || s[1] > 5 || s[2] > 1 || s[3] > (legacy ? 6 : 7) || s[5] > 256 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[9] > 255 || s[10] > 255 || s[11] > 3 || s[32] > 4 || s[33] > 31 || timestamp.Length > 48 || callId.Length > 128 || status.Length > 24) { Fail(); return; }
             if ((s[3] != 0 && s[1] == 0) || (s[2] == 1 && s[1] != 0)) { Fail(); return; }
             for (int i = 0; i < s[1]; i++) {
                 int f = 12+i*4, kind = s[f];
-                if (kind < 1 || kind > 7 || s[f+1] > 4 || s[f+3] > Keys[kind].Length || (s[f+2] >> Keys[kind].Length) != 0) { Fail(); return; }
+                int keyCount = legacy && kind == 6 ? 2 : kind >= 1 && kind <= 7 ? Keys[kind].Length : 0;
+                if (kind < 1 || kind > 7 || s[f+1] > 4 || s[f+3] > keyCount || (s[f+2] >> keyCount) != 0) { Fail(); return; }
                 if (i < 3 && kind != i+1) { Fail(); return; }
                 if (i == 3 && kind != 4 && kind != 5 && kind != 7) { Fail(); return; }
                 if (i == 4 && (kind != 6 || s[f-4] != 5)) { Fail(); return; }
             }
+            if (legacy && s[1] == 5) {
+                // V1 can only have accepted the unknown variant. Its existing
+                // key matcher remains restricted to type/cmd; a type literal
+                // in progress was already proven to be an unknown prefix.
+                int f = Frame;
+                if (s[3] == 3) { if (s[f+3] != 1 || s[5] > 7) { Fail(); return; } s[3] = 7; s[4] = 1; }
+                else if ((s[f+2] & 1) != 0 && !(s[f+3] == 1 && (s[f+1] == 1 || s[f+1] == 2))) s[32] = 1;
+            }
+            if (s[3] == 7 && (s[1] != 5 || s[Frame] != 6 || s[Frame+3] != 1 || s[4] == 0 || s[4] > 15 || s[5] > 10)) { Fail(); return; }
         }
         public string Save()
         {
-            string[] values = new string[s.Length+1]; values[0] = "1";
+            string[] values = new string[s.Length+1]; values[0] = "2";
             for (int i = 0; i < s.Length; i++) values[i+1] = s[i].ToString(CultureInfo.InvariantCulture);
             return string.Join(",", values) + "~" + Convert.ToBase64String(Encoding.ASCII.GetBytes(timestamp)) + "~" + Convert.ToBase64String(Encoding.ASCII.GetBytes(callId)) + "~" + Convert.ToBase64String(Encoding.ASCII.GetBytes(status));
         }
@@ -7319,7 +7468,7 @@ public static class TokenRaderIndexer
         private string ExpectedType { get { int k = s[Frame]; return k == 1 ? "event_msg" : k == 2 ? "item_completed" : k == 3 ? "CommandExecution" : "unknown"; } }
         private void BeginString(int mode)
         {
-            s[3] = mode; s[4] = mode == 2 ? (1 << Keys[s[Frame]].Length)-1 : 0;
+            s[3] = mode; s[4] = mode == 2 ? (1 << Keys[s[Frame]].Length)-1 : mode == 7 ? 15 : 0;
             s[5] = s[6] = s[7] = s[8] = 0;
         }
         private void Push(int kind)
@@ -7327,11 +7476,19 @@ public static class TokenRaderIndexer
             if (s[1] == 5) { Fail(); return; }
             if (s[1] > 0) s[Frame+1] = 3;
             int f = 12+s[1]*4; s[1]++; s[f] = kind; s[f+1] = s[f+2] = s[f+3] = 0;
+            if (kind == 6) s[32] = s[33] = 0;
         }
         private void Close(int b)
         {
             int f = Frame, kind = s[f];
             int required = kind == 1 ? 11 : kind == 2 ? 33 : kind == 3 ? 67 : kind == 4 ? 3 : kind == 6 ? 3 : 0;
+            if (kind == 6) {
+                // The discriminator may appear last, so enforce each closed
+                // variant shape at object end. Hint strings are discarded.
+                int allowed = s[32] == 1 ? 3 : s[32] == 2 ? 15 : s[32] == 3 ? 11 : s[32] == 4 ? 27 : 0;
+                if (s[32] == 2) required = 15;
+                if (allowed == 0 || (s[f+2] & ~allowed) != 0 || (s[32] == 2 && s[33] != 0)) { Fail(); return; }
+            }
             if (b != (kind == 5 || kind == 7 ? ']' : '}') || (s[f+2] & required) != required) { Fail(); return; }
             s[1]--; if (s[1] == 0) {
                 s[2] = 1;
@@ -7349,6 +7506,12 @@ public static class TokenRaderIndexer
                 s[f+2] |= 1 << key; s[f+3] = key+1; s[f+1] = 1;
             } else {
                 if (mode == 3 && s[5] != ExpectedType.Length) { Fail(); return; }
+                if (mode == 7) {
+                    int variant = 0;
+                    for (int i = 0; i < ParsedTypes.Length; i++) if ((s[4] & (1 << i)) != 0 && ParsedTypes[i].Length == s[5]) { variant = i+1; break; }
+                    if (variant == 0) { Fail(); return; }
+                    s[32] = variant;
+                }
                 s[f+1] = 3;
             }
         }
@@ -7388,6 +7551,10 @@ public static class TokenRaderIndexer
                     s[5]++; if (s[4] == 0) Fail(); return;
                 }
                 if (s[3] == 3) { string expected = ExpectedType; if (s[5] >= expected.Length || expected[s[5]++] != b) Fail(); return; }
+                if (s[3] == 7) {
+                    for (int i = 0; i < ParsedTypes.Length; i++) if ((s[4] & (1 << i)) != 0 && (s[5] >= ParsedTypes[i].Length || ParsedTypes[i][s[5]] != b)) s[4] &= ~(1 << i);
+                    s[5]++; if (s[4] == 0) Fail(); return;
+                }
                 if (s[3] == 4) {
                     // Identity fields are bounded printable ASCII, with no escape
                     // ambiguity. Nonstandard metadata stays conservatively blocked.
@@ -7418,14 +7585,14 @@ public static class TokenRaderIndexer
             else if (stage == 2) {
                 if (kind0 == 3 && key0 == 3 && b == '[') { Push(7); return; }
                 int child = kind0 == 1 && key0 == 4 ? 2 : kind0 == 2 && key0 == 6 ? 3 : kind0 == 3 && key0 == 9 ? 4 : kind0 == 3 && key0 == 14 ? 5 : 0;
-                bool nullable = kind0 == 3 && (key0 == 5 || key0 == 8 || key0 >= 9);
+                bool nullable = kind0 == 3 && (key0 == 5 || key0 == 8 || key0 >= 9) || kind0 == 6 && (key0 == 4 || key0 == 5);
                 if (child > 0 && b == (child == 5 ? '[' : '{')) Push(child);
-                else if (nullable && b == 'n') { s[3] = 6; s[5] = 0; Feed(b); }
+                else if (nullable && b == 'n') { if (kind0 == 6) s[33] |= 1 << (key0-1); s[3] = 6; s[5] = 0; Feed(b); }
                 else if (child > 0) Fail();
                 else {
                     bool numeric = kind0 == 1 && key0 == 3 || kind0 == 2 && (key0 == 4 || key0 == 5) || kind0 == 4 || kind0 == 3 && (key0 == 5 || key0 == 8);
                     bool text = !numeric || kind0 == 3 && key0 == 5;
-                    if (text && b == '"') BeginString((kind0 == 1 && key0 == 2 || kind0 != 1 && key0 == 1) ? 3 : (kind0 == 1 && key0 == 1 || kind0 == 3 && (key0 == 2 || key0 == 7)) ? 4 : 1);
+                    if (text && b == '"') BeginString(kind0 == 6 && key0 == 1 ? 7 : (kind0 == 1 && key0 == 2 || kind0 != 1 && key0 == 1) ? 3 : (kind0 == 1 && key0 == 1 || kind0 == 3 && (key0 == 2 || key0 == 7)) ? 4 : 1);
                     else if (numeric && (b == '-' || b >= '0' && b <= '9')) { s[3] = 5; s[5] = 0; s[11] = b == '-' ? 1 : 0; if (b != '-') Feed(b); }
                     else Fail();
                 }
@@ -7442,7 +7609,7 @@ public static class TokenRaderIndexer
         private static readonly string[][] Keys = {
             new string[0],
             new[] { "timestamp", "type", "ordinal", "payload" },
-            new[] { "compaction_response_id", "first_window_id", "latest_token_usage_record", "message", "previous_window_id", "replacement_history", "replacement_history_metadata", "resume_metadata", "retained_context", "window_id", "window_number" },
+            new[] { "compaction_response_id", "first_window_id", "latest_token_usage_record", "message", "previous_window_id", "replacement_history", "replacement_history_metadata", "resume_metadata", "retained_context", "window_id", "window_number", "guardian_history" },
             new[] { "response_id", "root_turn_id", "session_id", "thread_id", "turn_id", "thread_token_usage", "turn_token_usage", "usage" },
             new[] { "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens", "cache_write_input_tokens" },
             new string[0], new string[0]
@@ -7460,26 +7627,32 @@ public static class TokenRaderIndexer
         public CompactedBodyScan(string saved)
         {
             string[] p = (saved ?? "").Split(',');
-            if (p.Length != s.Length+2 || p[0] != "1" || (saved ?? "").Length > 575) { Fail(); return; }
+            if (p.Length != s.Length+2 || (p[0] != "1" && p[0] != "2") || (saved ?? "").Length > 575) { Fail(); return; }
+            bool legacy = p[0] == "1";
             for (int i = 0; i < s.Length; i++)
-                if (!int.TryParse(p[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || s[i] > 2047) { Fail(); return; }
+                if (!int.TryParse(p[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || s[i] > (legacy ? 2047 : 4095)) { Fail(); return; }
             if (!long.TryParse(p[p.Length-1], NumberStyles.None, CultureInfo.InvariantCulture, out number) || number < 0 || s[0] > 1 || s[1] > MaxDepth || s[2] > 1 || s[3] > 6 || s[5] > 64 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[9] > 255 || s[10] > 255 || s[11] > 8 || s[12] != 0 || s[13] != 0) { Fail(); return; }
             if ((s[3] != 0 && s[1] == 0) || (s[2] == 1 && s[1] != 0)) { Fail(); return; }
             for (int i = 0; i < s[1]; i++) {
                 int f = 14+i*4, k = s[f];
                 if (k < 1 || k > 6 || s[f+1] > 4 || s[f+3] > Keys[k].Length || (s[f+2] >> Keys[k].Length) != 0) { Fail(); return; }
+                if (legacy && k == 2 && s[f+3] > 11) { Fail(); return; }
                 if (i == 0 && k != 1) { Fail(); return; }
                 if (i == 1 && k != 2) { Fail(); return; }
                 if (i > 1) {
                     int parent = s[f-4], key = s[f-1];
-                    bool permitted = parent == 2 && ((key == 3 && k == 3) || ((key == 6 || key == 7) && k == 5) || ((key == 8 || key == 9) && k == 6)) || parent == 3 && key >= 6 && k == 4 || (parent == 5 || parent == 6) && (k == 5 || k == 6);
+                    bool permitted = parent == 2 && ((key == 3 && k == 3) || ((key == 6 || key == 7 || key == 12) && k == 5) || ((key == 8 || key == 9) && k == 6)) || parent == 3 && key >= 6 && k == 4 || (parent == 5 || parent == 6) && (k == 5 || k == 6);
                     if (!permitted) { Fail(); return; }
                 }
             }
+            // Appended key numbers do not reinterpret old frames. An old state
+            // saved just after a payload key quote may match the new key too;
+            // failed/partially rejected legacy states remain rejected.
+            if (legacy && CanContinue && s[1] > 0 && s[3] == 2 && s[5] == 0 && s[Frame] == 2) s[4] |= 2048;
         }
         public string Save()
         {
-            string[] p = new string[s.Length+2]; p[0] = "1";
+            string[] p = new string[s.Length+2]; p[0] = "2";
             for (int i = 0; i < s.Length; i++) p[i+1] = s[i].ToString(CultureInfo.InvariantCulture);
             p[p.Length-1] = number.ToString(CultureInfo.InvariantCulture);
             return string.Join(",",p);
@@ -7520,10 +7693,10 @@ public static class TokenRaderIndexer
         private void BeginValue(int b, bool opaque)
         {
             int k = s[Frame], key = s[Frame+3];
-            int child = opaque ? (b == '{' ? 6 : b == '[' ? 5 : 0) : k == 1 && key == 4 ? 2 : k == 2 && key == 3 ? 3 : k == 2 && (key == 6 || key == 7) ? 5 : k == 2 && (key == 8 || key == 9) ? 6 : k == 3 && key >= 6 ? 4 : 0;
+            int child = opaque ? (b == '{' ? 6 : b == '[' ? 5 : 0) : k == 1 && key == 4 ? 2 : k == 2 && key == 3 ? 3 : k == 2 && (key == 6 || key == 7 || key == 12) ? 5 : k == 2 && (key == 8 || key == 9) ? 6 : k == 3 && key >= 6 ? 4 : 0;
             // An explicitly absent archive contains no events to replay. Keep
             // old compacted records with null optional archives compatible.
-            bool nullable = k == 2 && (key == 3 || key >= 6 && key <= 9) || k == 3 && key <= 5;
+            bool nullable = k == 2 && (key == 1 || key == 3 || key >= 6 && key <= 9) || k == 3 && key <= 5;
             if (child > 0 && b == (child == 5 ? '[' : '{')) { Push(child); return; }
             if ((opaque || nullable) && b == 'n' || opaque && (b == 't' || b == 'f')) { s[3] = 5; s[4] = opaque ? 7 : 4; s[5] = 0; Feed(b); return; }
             if (child > 0) { Fail(); return; }
@@ -7605,16 +7778,251 @@ public static class TokenRaderIndexer
         }
     }
 
+    private sealed class ToolOutputProjection
+    {
+        public string Timestamp;
+        public int InputImages;
+    }
+
+    // Tool outputs are replies to existing calls, not additional tool/usage
+    // events. The closed envelope accepts string output or a closed array of
+    // input_text/input_image parts. Only complete image metadata is projected.
+    // two explicit metadata objects are syntax-checked opaque JSON archives;
+    // their nested names never acquire token/image/tool semantics.
+    private sealed class ToolOutputBodyScan
+    {
+        private static readonly string[][] Keys = {
+            new string[0],
+            new[] { "timestamp", "type", "ordinal", "payload", "metadata" },
+            new[] { "type", "id", "call_id", "output", "internal_chat_message_metadata_passthrough" },
+            new string[0], new string[0], new string[0],
+            new[] { "type", "text", "image_url", "detail" }
+        };
+        private static readonly string[] Types = { "response_item", "custom_tool_call_output", "function_call_output", "input_text", "input_image" };
+        private static readonly string[] Literals = { "true", "false", "null" };
+        private const int MaxDepth = 24;
+        // Numeric enums/counters plus bounded date metadata, never text/URLs.
+        // Save omits inactive frames, leaving room for early candidates.
+        private readonly int[] s = new int[14+MaxDepth*4];
+        private string timestamp = "";
+        private bool timestampValid = true, timestampClosed;
+        public bool CanContinue { get { return s[0] == 0; } }
+        public bool Complete { get { DateTimeOffset observedAt; return CanContinue && s[1] == 0 && s[2] == 1 && s[3] == 0 && (s[12] == 0 || Timestamp(out observedAt)); } }
+        public ToolOutputProjection Projection
+        {
+            get {
+                DateTimeOffset observedAt;
+                if (!Complete || s[12] == 0 || !Timestamp(out observedAt)) return null;
+                return new ToolOutputProjection { Timestamp = observedAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture), InputImages = s[12] };
+            }
+        }
+        private bool Timestamp(out DateTimeOffset observedAt)
+        {
+            observedAt = default(DateTimeOffset);
+            return timestampValid && timestampClosed && timestamp.Length > 0 && TryParseTimestamp(timestamp, out observedAt);
+        }
+        private static bool TimestampCharacter(int b)
+        {
+            return b >= '0' && b <= '9' || b == '-' || b == '+' || b == ':' || b == '.' || b == 'T' || b == 't' || b == 'Z' || b == 'z' || b == ' ';
+        }
+        private int Frame { get { return 14+(s[1]-1)*4; } }
+        public ToolOutputBodyScan() { }
+        public ToolOutputBodyScan(string saved)
+        {
+            string[] parts = (saved ?? "").Split('~');
+            string[] p = parts[0].Split(',');
+            if (p.Length < 15 || (p[0] != "1" && p[0] != "2") || (saved ?? "").Length > 575) { Fail(); return; }
+            if (p[0] == "1") {
+                if (parts.Length != 1) { Fail(); return; }
+                // Older string-only continuations never retained a timestamp.
+                // They may finish text, but must not fabricate image evidence.
+                timestampValid = false;
+            } else {
+                if (parts.Length != 2) { Fail(); return; }
+                string[] metadata = parts[1].Split(',');
+                if (metadata.Length != 3 || (metadata[0] != "0" && metadata[0] != "1") || (metadata[1] != "0" && metadata[1] != "1")) { Fail(); return; }
+                timestampValid = metadata[0] == "1"; timestampClosed = metadata[1] == "1";
+                try { timestamp = Encoding.ASCII.GetString(Convert.FromBase64String(metadata[2])); } catch { Fail(); return; }
+                if (timestamp.Length > 48 || !timestampValid && timestamp.Length != 0) { Fail(); return; }
+                foreach (char value in timestamp) if (!TimestampCharacter(value)) { Fail(); return; }
+            }
+            for (int i = 0; i < 14; i++)
+                if (!int.TryParse(p[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || (i != 12 && s[i] > 255)) { Fail(); return; }
+            if (s[0] > 1 || s[1] > MaxDepth || s[2] > 1 || s[3] > 7 || s[5] > 64 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[11] > 8 || s[13] > 2 || p.Length != 15+s[1]*4) { Fail(); return; }
+            if ((s[3] != 0 && s[1] == 0) || (s[2] == 1 && s[1] != 0)) { Fail(); return; }
+            for (int i = 0; i < s[1]*4; i++)
+                if (!int.TryParse(p[i+15], NumberStyles.None, CultureInfo.InvariantCulture, out s[i+14]) || s[i+14] < 0 || s[i+14] > 31) { Fail(); return; }
+            for (int i = 0; i < s[1]; i++) {
+                int f = 14+i*4, k = s[f];
+                if (k < 1 || k > 6 || s[f+1] > 4 || s[f+3] > Keys[k].Length || (s[f+2] >> Keys[k].Length) != 0) { Fail(); return; }
+                if (i == 0 && k != 1) { Fail(); return; }
+                if (i > 0) {
+                    int parent = s[f-4], key = s[f-1];
+                    bool permitted = parent == 1 && key == 4 && k == 2 || (parent == 1 || parent == 2) && key == 5 && k == 3 || (parent == 3 || parent == 4) && (k == 3 || k == 4) || parent == 2 && key == 4 && k == 5 || parent == 5 && k == 6;
+                    if (!permitted) { Fail(); return; }
+                }
+            }
+        }
+        public string Save()
+        {
+            string[] p = new string[15+s[1]*4]; p[0] = "2";
+            for (int i = 0; i < 14+s[1]*4; i++) p[i+1] = s[i].ToString(CultureInfo.InvariantCulture);
+            return string.Join(",",p) + "~" + (timestampValid ? "1" : "0") + "," + (timestampClosed ? "1" : "0") + "," + Convert.ToBase64String(Encoding.ASCII.GetBytes(timestamp));
+        }
+        private void Fail() { s[0] = 1; }
+        private static bool Space(int b) { return b == 32 || b == 9 || b == 13 || b == 10; }
+        private void Push(int kind)
+        {
+            if (s[1] == MaxDepth) { Fail(); return; }
+            if (s[1] > 0) s[Frame+1] = 3;
+            int f = 14+s[1]*4; s[1]++; s[f] = kind; s[f+1] = s[f+2] = s[f+3] = 0;
+            if (kind == 6) s[13] = 0;
+        }
+        private void Close(int b)
+        {
+            int f = Frame, k = s[f], required = k == 1 ? 10 : k == 2 ? 9 : 0;
+            if (b != (k == 4 || k == 5 ? ']' : '}') || (s[f+2] & required) != required) { Fail(); return; }
+            if (k == 6) {
+                if (s[13] == 1 ? s[f+2] != 3 : s[13] == 2 ? s[f+2] != 5 && s[f+2] != 13 : true) { Fail(); return; }
+                if (s[13] == 2) { if (s[12] == int.MaxValue) { Fail(); return; } s[12]++; }
+                s[13] = 0;
+            }
+            s[1]--; if (s[1] == 0) s[2] = 1;
+        }
+        private void BeginString(int mode)
+        {
+            s[3] = mode;
+            s[4] = mode == 2 ? (1 << Keys[s[Frame]].Length)-1 : mode == 3 ? (s[Frame] == 1 ? 1 : s[Frame] == 2 ? 6 : 24) : 0;
+            s[5] = s[6] = s[7] = s[8] = 0;
+        }
+        private void EndString()
+        {
+            int f = Frame, k = s[f], mode = s[3]; s[3] = 0;
+            if (mode == 2) {
+                int key = -1;
+                for (int i = 0; i < Keys[k].Length; i++) if ((s[4] & (1 << i)) != 0 && Keys[k][i].Length == s[5]) { key = i; break; }
+                if (key < 0 || (s[f+2] & (1 << key)) != 0) { Fail(); return; }
+                s[f+2] |= 1 << key; s[f+3] = key+1; s[f+1] = 1;
+            } else if (mode == 6) s[f+1] = 1;
+            else {
+                if (mode == 3) {
+                    bool exact = false;
+                    for (int i = 0; i < Types.Length; i++) if ((s[4] & (1 << i)) != 0 && Types[i].Length == s[5]) exact = true;
+                    if (!exact) { Fail(); return; }
+                    if (k == 6) s[13] = (s[4] & 8) != 0 ? 1 : 2;
+                }
+                if (mode == 7) timestampClosed = true;
+                s[f+1] = 3;
+            }
+        }
+        private void BeginValue(int b, bool opaque)
+        {
+            int k = s[Frame], key = s[Frame+3];
+            if (k == 2 && key == 4 && b == '[') { Push(5); return; }
+            int child = opaque ? (b == '{' ? 3 : b == '[' ? 4 : 0) : k == 1 && key == 4 ? 2 : (k == 1 || k == 2) && key == 5 ? 3 : k == 5 ? 6 : 0;
+            if (child > 0 && b == (child == 4 ? '[' : '{')) { Push(child); return; }
+            bool nullable = k == 2 && (key == 2 || key == 3);
+            if ((opaque || nullable) && b == 'n' || opaque && (b == 't' || b == 'f')) { s[3] = 5; s[4] = opaque ? 7 : 4; s[5] = 0; Feed(b); return; }
+            if (child > 0) { Fail(); return; }
+            bool numeric = opaque || k == 1 && key == 3;
+            bool text = opaque || k == 1 && key <= 2 || k == 2 && key <= 4 || k == 6;
+            if (text && b == '"') { BeginString(k == 1 && key == 2 || (k == 2 || k == 6) && key == 1 ? 3 : k == 1 && key == 1 ? 7 : 1); return; }
+            if (numeric && (b == '-' || b >= '0' && b <= '9')) {
+                s[3] = 4; s[11] = b == '-' ? 1 : 0;
+                if (b != '-') Feed(b); return;
+            }
+            Fail();
+        }
+        public void Feed(int b)
+        {
+            if (!CanContinue) return;
+            if (s[3] == 4) {
+                int stage = s[11];
+                if (b >= '0' && b <= '9') {
+                    if (stage == 2) { Fail(); return; }
+                    s[11] = stage == 0 || stage == 1 ? (b == '0' ? 2 : 3) : stage == 4 || stage == 5 ? 5 : stage >= 6 ? 8 : 3; return;
+                }
+                if (b == '.' && (stage == 2 || stage == 3)) { s[11] = 4; return; }
+                if ((b == 'e' || b == 'E') && (stage == 2 || stage == 3 || stage == 5)) { s[11] = 6; return; }
+                if ((b == '+' || b == '-') && stage == 6) { s[11] = 7; return; }
+                if (stage != 2 && stage != 3 && stage != 5 && stage != 8) { Fail(); return; }
+                s[3] = 0; s[Frame+1] = 3; Feed(b); return;
+            }
+            if (s[3] == 5) {
+                if (b >= 'a' && b <= 'z') {
+                    for (int i = 0; i < Literals.Length; i++) if ((s[4] & (1 << i)) != 0 && (s[5] >= Literals[i].Length || Literals[i][s[5]] != b)) s[4] &= ~(1 << i);
+                    s[5]++; if (s[4] == 0) Fail(); return;
+                }
+                bool exact = false;
+                for (int i = 0; i < Literals.Length; i++) if ((s[4] & (1 << i)) != 0 && Literals[i].Length == s[5]) exact = true;
+                if (!exact) { Fail(); return; }
+                s[3] = 0; s[Frame+1] = 3; Feed(b); return;
+            }
+            if (s[3] != 0) {
+                if (s[8] > 0) { if (b < s[9] || b > s[10]) Fail(); else { s[8]--; s[9] = 128; s[10] = 191; } return; }
+                if (s[6] == 2) {
+                    if (!((b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F'))) Fail(); else if (--s[7] == 0) s[6] = 0; return;
+                }
+                if (s[6] == 1) {
+                    s[6] = 0;
+                    if (b == 'u') { s[6] = 2; s[7] = 4; }
+                    else if (b != '"' && b != '\\' && b != '/' && b != 'b' && b != 'f' && b != 'n' && b != 'r' && b != 't') Fail();
+                    return;
+                }
+                if (b == '"') { EndString(); return; }
+                if (b < 32) { Fail(); return; }
+                if (s[3] == 2 || s[3] == 3) {
+                    string[] expected = s[3] == 2 ? Keys[s[Frame]] : Types;
+                    for (int i = 0; i < expected.Length; i++) if ((s[4] & (1 << i)) != 0 && (s[5] >= expected[i].Length || expected[i][s[5]] != b)) s[4] &= ~(1 << i);
+                    s[5]++; if (s[4] == 0) Fail(); return;
+                }
+                if (s[3] == 7 && timestampValid) {
+                    if (!TimestampCharacter(b) || timestamp.Length >= 48) { timestampValid = false; timestamp = ""; }
+                    else timestamp += (char)b;
+                }
+                if (b == '\\') { s[6] = 1; return; }
+                if (b < 128) return;
+                s[9] = 128; s[10] = 191;
+                if (b >= 194 && b <= 223) s[8] = 1;
+                else if (b >= 224 && b <= 239) { s[8] = 2; if (b == 224) s[9] = 160; if (b == 237) s[10] = 159; }
+                else if (b >= 240 && b <= 244) { s[8] = 3; if (b == 240) s[9] = 144; if (b == 244) s[10] = 143; }
+                else Fail(); return;
+            }
+            if (Space(b)) return;
+            if (s[1] == 0) { if (s[2] == 0 && b == '{') Push(1); else Fail(); return; }
+            int f0 = Frame, kind = s[f0], stage0 = s[f0+1];
+            if (stage0 == 0 || stage0 == 4) {
+                if (stage0 == 0 && b == (kind == 4 || kind == 5 ? ']' : '}')) { Close(b); return; }
+                if (kind == 4 || kind == 5) BeginValue(b,kind == 4);
+                else if (b == '"') BeginString(kind == 3 ? 6 : 2); else Fail();
+            } else if (stage0 == 1) { if (b == ':') s[f0+1] = 2; else Fail(); }
+            else if (stage0 == 2) BeginValue(b,kind == 3);
+            else if (stage0 == 3) { if (b == ',') s[f0+1] = 4; else Close(b); }
+            else Fail();
+        }
+    }
+
     private sealed class SafeOversizedBodyScan
     {
         private PureTextBodyScan text;
         private CommandExecutionBodyScan command;
         private CompactedBodyScan compacted;
-        public SafeOversizedBodyScan() { text = new PureTextBodyScan(); command = new CommandExecutionBodyScan(); compacted = new CompactedBodyScan(); }
+        private ToolOutputBodyScan toolOutput;
+        public SafeOversizedBodyScan() { text = new PureTextBodyScan(); command = new CommandExecutionBodyScan(); compacted = new CompactedBodyScan(); toolOutput = new ToolOutputBodyScan(); }
         public SafeOversizedBodyScan(string state, string protocol)
         {
             if (protocol == "2") { text = new PureTextBodyScan(state); return; }
             if (string.IsNullOrEmpty(state)) return;
+            if (protocol == "5") {
+                if (state[0] == 'O') { toolOutput = new ToolOutputBodyScan(state.Substring(1)); return; }
+                if (state[0] != 'B') return;
+                string[] combined = state.Substring(1).Split(':');
+                if (combined.Length != 4) return;
+                if (combined[0].Length > 0) text = new PureTextBodyScan(combined[0]);
+                if (combined[1].Length > 0) command = new CommandExecutionBodyScan(combined[1]);
+                if (combined[2].Length > 0) compacted = new CompactedBodyScan(combined[2]);
+                toolOutput = new ToolOutputBodyScan(combined[3]); return;
+            }
             if (protocol == "4") {
                 if (state[0] != 'B') { compacted = new CompactedBodyScan(state); return; }
                 string[] combined = state.Substring(1).Split(':');
@@ -7629,19 +8037,24 @@ public static class TokenRaderIndexer
             else if (state[0] == 'C' && p.Length == 1) command = new CommandExecutionBodyScan(p[0]);
             else if (state[0] == 'B' && p.Length == 2) { text = new PureTextBodyScan(p[0]); command = new CommandExecutionBodyScan(p[1]); }
         }
-        public bool CanContinue { get { return (text != null && text.CanContinue || command != null && command.CanContinue || compacted != null && compacted.CanContinue) && Save().Length <= 575; } }
-        public bool Complete { get { return CanContinue && (text != null && text.Complete || command != null && command.Complete || compacted != null && compacted.Complete); } }
+        public bool CanContinue { get { return (text != null && text.CanContinue || command != null && command.CanContinue || compacted != null && compacted.CanContinue || toolOutput != null && toolOutput.CanContinue) && Save().Length <= 575; } }
+        public bool Complete { get { return CanContinue && (text != null && text.Complete || command != null && command.Complete || compacted != null && compacted.Complete || toolOutput != null && toolOutput.Complete); } }
         public CommandExecutionProjection Projection { get { return command == null ? null : command.Projection; } }
+        public ToolOutputProjection ToolOutput { get { return toolOutput == null ? null : toolOutput.Projection; } }
         // Keep the original numeric v2 rejection state too. A failed command
         // candidate must not change pure-text continuation's storage contract;
         // this does not revive either failed validator or admit its suffix.
-        public bool TextOnly { get { return text != null && (command == null || !command.CanContinue) && (compacted == null || !compacted.CanContinue); } }
+        public bool TextOnly { get { return text != null && (command == null || !command.CanContinue) && (compacted == null || !compacted.CanContinue) && (toolOutput == null || !toolOutput.CanContinue); } }
         public string TextState { get { return text == null ? "" : text.Save(); } }
-        public string Protocol { get { return TextOnly ? "2" : compacted != null && compacted.CanContinue ? "4" : "3"; } }
-        public void Feed(int b) { if (text != null) text.Feed(b); if (command != null) command.Feed(b); if (compacted != null) compacted.Feed(b); }
+        public string Protocol { get { return TextOnly ? "2" : toolOutput != null && toolOutput.CanContinue ? "5" : compacted != null && compacted.CanContinue ? "4" : "3"; } }
+        public void Feed(int b) { if (text != null) text.Feed(b); if (command != null) command.Feed(b); if (compacted != null) compacted.Feed(b); if (toolOutput != null) toolOutput.Feed(b); }
         public string Save()
         {
             bool t = text != null && text.CanContinue, c = command != null && command.CanContinue;
+            if (toolOutput != null && toolOutput.CanContinue) {
+                if (!t && !c && (compacted == null || !compacted.CanContinue)) return "O" + toolOutput.Save();
+                return "B" + (t ? text.Save() : "") + ":" + (c ? command.Save() : "") + ":" + (compacted != null && compacted.CanContinue ? compacted.Save() : "") + ":" + toolOutput.Save();
+            }
             if (compacted != null && compacted.CanContinue) {
                 if (!t && !c) return compacted.Save();
                 return "B" + (t ? text.Save() : "") + ":" + (c ? command.Save() : "") + ":" + compacted.Save();
@@ -7824,6 +8237,8 @@ public static class TokenRaderIndexer
         private bool _discarding;
         private readonly bool _classifyBody;
         private readonly long _bodySourceCreatedTicks;
+        private readonly Action<int> _consumedByte;
+        private readonly bool _strictUtf8;
         private SafeOversizedBodyScan _bodyScan;
         public long Position { get { return _position; } }
         public long IncompleteStart { get; private set; }
@@ -7833,6 +8248,7 @@ public static class TokenRaderIndexer
         public bool BodyScanCanContinue { get { return _bodyScan != null && _bodyScan.CanContinue; } }
         public string BodyScanState { get { return _bodyScan == null ? "" : _bodyScan.Protocol + "|" + _bodySourceCreatedTicks.ToString(CultureInfo.InvariantCulture) + "|" + (_bodyScan.TextOnly ? _bodyScan.TextState : _bodyScan.CanContinue ? _bodyScan.Save() : "X"); } }
         public CommandExecutionProjection CommandExecution { get; private set; }
+        public ToolOutputProjection ToolOutput { get; private set; }
 
         public Utf8JsonlLineReader(Stream stream, long startOffset, long endOffset)
             : this(stream, startOffset, endOffset, CancellationToken.None, null, null, null, false, 0)
@@ -7841,7 +8257,8 @@ public static class TokenRaderIndexer
         public Utf8JsonlLineReader(Stream stream, long startOffset, long endOffset,
             CancellationToken cancel, IDictionary progress, Stopwatch deadline,
             byte[] unusedPending, bool discard, int maxMilliseconds = 0,
-            bool classifyBody = false, string bodyScanState = null, long bodySourceCreatedTicks = 0L)
+            bool classifyBody = false, string bodyScanState = null, long bodySourceCreatedTicks = 0L,
+            Action<int> consumedByte = null, bool strictUtf8 = false)
         {
             _stream = stream;
             _position = Math.Max(0L, startOffset);
@@ -7853,6 +8270,7 @@ public static class TokenRaderIndexer
             _discarding = discard; IncompleteStart = -1L;
             _classifyBody = classifyBody;
             _bodySourceCreatedTicks = bodySourceCreatedTicks;
+            _consumedByte = consumedByte; _strictUtf8 = strictUtf8;
             if (_classifyBody && discard)
             {
                 bool matches = BodyScanSourceMatches(bodyScanState, bodySourceCreatedTicks);
@@ -7866,6 +8284,7 @@ public static class TokenRaderIndexer
             lineEndOffset = _position;
             terminated = false;
             CommandExecution = null;
+            ToolOutput = null;
             _cancel.ThrowIfCancellationRequested();
             if (_deadline != null && _maxMilliseconds > 0 && _deadline.ElapsedMilliseconds >= _maxMilliseconds) return false;
             long lineStart = _position;
@@ -7920,7 +8339,10 @@ public static class TokenRaderIndexer
 
                 lineEndOffset = _position;
                 if (_discarding && terminated && _bodyScan != null && _bodyScan.Complete)
+                {
                     CommandExecution = _bodyScan.Projection;
+                    ToolOutput = _bodyScan.ToolOutput;
+                }
                 if (_discarding && (terminated ? (_bodyScan == null || !_bodyScan.Complete) : !_classifyBody))
                     OversizedPotentialUsage = true;
                 if (bytes.Length == 0 && !terminated && _position >= _endOffset)
@@ -7929,7 +8351,7 @@ public static class TokenRaderIndexer
                     return false;
                 }
                 if (!terminated) IncompleteStart = lineStart;
-                line = _discarding ? "" : Encoding.UTF8.GetString(bytes.ToArray());
+                line = _discarding ? "" : (_strictUtf8 ? new UTF8Encoding(false, true) : Encoding.UTF8).GetString(bytes.ToArray());
                 if (terminated) _discarding = false;
                 return true;
             }
@@ -7948,6 +8370,7 @@ public static class TokenRaderIndexer
             if (!FillBuffer()) return -1;
             int value = _buffer[_bufferIndex++];
             _position++;
+            if (_consumedByte != null) _consumedByte(value);
             return value;
         }
 

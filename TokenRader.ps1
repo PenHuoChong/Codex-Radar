@@ -1934,11 +1934,17 @@ function Start-TokenRaderIndexSyncAsync {
     $script:State.IndexSyncing = $true
     $script:State.IndexSyncStopping = $false
     $script:State.IndexSyncRequestId = $requestId
-    Set-TokenRaderUiState -NewState ([string]$script:State.UiState) -StatusMessage $(if ($Startup) {
-        '正在冻结当前日志位置；历史内容不会自动扫描，可稍后手动补齐…'
-    } elseif ($FullReconcile) {
-        '正在后台核对日志目录；当前界面仍显示已有索引结果…'
-    } else { '正在后台读取新增或修改日志；当前界面仍显示上一次结果…' })
+    $measurementGeneration = [Int64]$script:State.MeasurementGeneration
+    $displayFailure = ''
+    try {
+        Set-TokenRaderUiState -NewState ([string]$script:State.UiState) -StatusMessage $(if ($Startup) {
+            '正在冻结当前日志位置；历史内容不会自动扫描，可稍后手动补齐…'
+        } elseif ($FullReconcile) {
+            '正在后台核对日志目录；当前界面仍显示已有索引结果…'
+        } else { '正在后台读取新增或修改日志；当前界面仍显示上一次结果…' })
+    } catch { $displayFailure = '索引准备状态显示失败：' + $_.Exception.GetType().Name }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $requestId -or
+        [Int64]$script:State.MeasurementGeneration -ne $measurementGeneration) { return }
 
     $coldStart = -not [bool]$script:State.IndexCatalogAvailable
     $progressState = [hashtable]::Synchronized(@{
@@ -1948,7 +1954,8 @@ function Start-TokenRaderIndexSyncAsync {
         LastProgressAt = [DateTimeOffset]::Now
     })
     $cancellationSource = [Threading.CancellationTokenSource]::new()
-    [void](Start-TokenRaderBackgroundJob `
+    try {
+    $launched = [bool](Start-TokenRaderBackgroundJob `
         -ScriptBlock $script:IndexSyncScript `
         -Parameters @{
             SessionsRoot = [string]$script:Paths.SessionsRoot
@@ -1969,6 +1976,29 @@ function Start-TokenRaderIndexSyncAsync {
         -ProgressState $progressState `
         -CancellationSource $cancellationSource `
         -StopCompletionHandler 'Complete-TokenRaderIndexSyncStopJob')
+    } catch {
+        $launchError = '后台索引启动失败：' + $_.Exception.GetType().Name
+        if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $requestId -or
+            [Int64]$script:State.MeasurementGeneration -ne $measurementGeneration) { return }
+        $stopPending = $script:State.BackgroundJobs.ContainsKey($requestId)
+        if ($stopPending) {
+            Request-TokenRaderBackgroundStop -Job $script:State.BackgroundJobs[$requestId]
+        } else { try { $cancellationSource.Dispose() } catch { } }
+        if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $requestId -or
+            [Int64]$script:State.MeasurementGeneration -ne $measurementGeneration) { return }
+        Fail-TokenRaderIndexSyncJob -ErrorMessage $launchError -Generation 0L -RequestId $requestId -Kind 'IndexSync' `
+            -Context @{ Startup = $Startup; ColdStart = $coldStart; StopPending = $stopPending }
+        return
+    }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $requestId -or
+        [Int64]$script:State.MeasurementGeneration -ne $measurementGeneration) { return }
+    if ($launched -and -not [string]::IsNullOrWhiteSpace($displayFailure)) {
+        $message = $displayFailure + ' 后台索引准备已启动，可重试显示。'
+        try { Set-TokenRaderLastFailureInfo -Message $message } catch { }
+        if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $requestId -or
+            [Int64]$script:State.MeasurementGeneration -ne $measurementGeneration) { return }
+        try { $script:StatusText.Text = $message } catch { }
+    }
 }
 
 function Set-EmptyMetrics {
@@ -3342,7 +3372,7 @@ function Complete-TokenRaderMeasurementBaseline {
         Retain-TokenRaderQuotaEstimatesForCurrentWindow `
             -RateLimits $Baseline.StartRateLimits `
             -AccountIdentity $(if ($null -ne $Baseline.PSObject.Properties['AccountIdentity']) { [string]$Baseline.AccountIdentity } else { [string]$script:State.AccountIdentity })
-    } catch { [void]$displayFailures.Add('额度结果保留失败：' + $_.Exception.Message) }
+    } catch { [void]$displayFailures.Add('额度结果保留失败：' + $_.Exception.GetType().Name) }
     try { Show-EmptyIntervalMeasurement -Baseline $Baseline }
     catch { [void]$displayFailures.Add('初始结果显示失败：' + $_.Exception.Message) }
     if ($displayFailures.Count -gt 0) {
@@ -3387,34 +3417,71 @@ function Fail-TokenRaderMeasurementRequest {
         [Parameter(Mandatory = $true)][string]$Message
     )
     if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $Generation) { return }
-    $matches = ([Int64]$script:State.BaselineRequestId -eq $RequestId -or
-                [Int64]$script:State.EndCaptureRequestId -eq $RequestId -or
-                [Int64]$script:State.IntervalComputeRequestId -eq $RequestId)
-    if (-not $matches) { return }
-    $script:State.BaselineRequestId = 0
-    $script:State.EndCaptureRequestId = 0
-    if ([Int64]$script:State.IntervalComputeRequestId -eq $RequestId) {
-        $script:State.IntervalComputeRequestId = 0
+    $ownsBaseline = [Int64]$script:State.BaselineRequestId -eq $RequestId
+    $ownsEnd = [Int64]$script:State.EndCaptureRequestId -eq $RequestId
+    $ownsCompute = [Int64]$script:State.IntervalComputeRequestId -eq $RequestId
+    if (-not ($ownsBaseline -or $ownsEnd -or $ownsCompute)) { return }
+    if ($ownsBaseline) {
+        $script:State.BaselineRequestId = 0L
+        $script:State.PendingMeasurementStart = $false
+    }
+    if ($ownsEnd) { $script:State.EndCaptureRequestId = 0L }
+    if ($ownsCompute) {
+        $script:State.IntervalComputeRequestId = 0L
         $script:State.IntervalComputing = $false
         $script:State.IntervalComputeStopping = $false
         $script:State.IntervalActiveScanRateLimits = $false
+        $script:State.IntervalComputePending = $false
+        $script:State.IntervalComputePendingRequest = $null
     }
-    $script:State.IntervalComputePending = $false
-    $script:State.IntervalComputePendingRequest = $null
-    $script:State.PendingMeasurementStart = $false
     $script:State.QuotaCalibrationMessage = [string]$Message
+    # Restore the owned task before any quota/control rendering. In particular,
+    # a failure-info/display exception cannot leave Starting with no request.
+    # Do not clear a valid baseline, frozen end, result or another owned task.
+    $nextState = if ([string]$script:State.UiState -in @('Measuring', 'Ready')) {
+        [string]$script:State.UiState
+    } else { 'Error' }
+    $script:State.UiState = $nextState
+    $script:State.IsMeasuring = ($nextState -eq 'Measuring')
+    $ownedBaseline = [Int64]$script:State.BaselineRequestId
+    $ownedEnd = [Int64]$script:State.EndCaptureRequestId
+    $ownedCompute = [Int64]$script:State.IntervalComputeRequestId
+    $displayFailures = New-Object System.Collections.Generic.List[string]
     try {
         Retain-TokenRaderQuotaEstimatesForCurrentWindow `
             -RateLimits $(if ($script:State.ContainsKey('RateLimits')) { $script:State.RateLimits } else { $null }) `
             -AccountIdentity $(if ($script:State.ContainsKey('AccountIdentity')) { [string]$script:State.AccountIdentity } else { '' })
-        try { Mark-TokenRaderQuotaEstimatesRetainedAfterFailure } catch { }
-    } catch {
-        $script:State.QuotaEstimates = $null
-        $script:State.QuotaEstimateAccountIdentity = ''
-        if ($script:State.ContainsKey('QuotaDiagnostics')) { $script:State.QuotaDiagnostics = $null }
-    }
-    Set-TokenRaderUiState -NewState 'Error' -StatusMessage ([string]$Message)
-    Update-QuotaCards
+    } catch { [void]$displayFailures.Add('额度结果保留失败：' + $_.Exception.GetType().Name) }
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $Generation -or
+        [Int64]$script:State.BaselineRequestId -ne $ownedBaseline -or
+        [Int64]$script:State.EndCaptureRequestId -ne $ownedEnd -or
+        [Int64]$script:State.IntervalComputeRequestId -ne $ownedCompute) { return }
+    try { Mark-TokenRaderQuotaEstimatesRetainedAfterFailure }
+    catch { [void]$displayFailures.Add('额度诊断显示失败：' + $_.Exception.GetType().Name) }
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $Generation -or
+        [Int64]$script:State.BaselineRequestId -ne $ownedBaseline -or
+        [Int64]$script:State.EndCaptureRequestId -ne $ownedEnd -or
+        [Int64]$script:State.IntervalComputeRequestId -ne $ownedCompute) { return }
+    try { Set-TokenRaderUiState -NewState $nextState -StatusMessage ([string]$Message) }
+    catch { [void]$displayFailures.Add('测量失败状态显示失败：' + $_.Exception.GetType().Name) }
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $Generation -or
+        [Int64]$script:State.BaselineRequestId -ne $ownedBaseline -or
+        [Int64]$script:State.EndCaptureRequestId -ne $ownedEnd -or
+        [Int64]$script:State.IntervalComputeRequestId -ne $ownedCompute) { return }
+    try { Update-QuotaCards }
+    catch { [void]$displayFailures.Add('额度卡显示失败：' + $_.Exception.GetType().Name) }
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $Generation -or
+        [Int64]$script:State.BaselineRequestId -ne $ownedBaseline -or
+        [Int64]$script:State.EndCaptureRequestId -ne $ownedEnd -or
+        [Int64]$script:State.IntervalComputeRequestId -ne $ownedCompute) { return }
+    $statusMessage = [string]$Message
+    if ($displayFailures.Count -gt 0) { $statusMessage += ' ' + ($displayFailures -join '；') }
+    try { Set-TokenRaderLastFailureInfo -Message $statusMessage } catch { }
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $Generation -or
+        [Int64]$script:State.BaselineRequestId -ne $ownedBaseline -or
+        [Int64]$script:State.EndCaptureRequestId -ne $ownedEnd -or
+        [Int64]$script:State.IntervalComputeRequestId -ne $ownedCompute) { return }
+    try { $script:StatusText.Text = $statusMessage } catch { }
 }
 
 function Start-TokenRaderIntervalComputeAsync {
@@ -3846,21 +3913,59 @@ function Start-IntervalMeasurement {
     # Keep the last valid result and evidence until recent-history preparation
     # succeeds. A cancelled or incomplete preparation must not erase them.
     $script:State.PendingMeasurementStart = $waitForIndex
-    Retain-TokenRaderQuotaEstimatesForCurrentWindow
+    $displayFailures = New-Object System.Collections.Generic.List[string]
+    try { Retain-TokenRaderQuotaEstimatesForCurrentWindow }
+    catch { [void]$displayFailures.Add('额度结果保留失败：' + $_.Exception.GetType().Name) }
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $generation -or
+        [Int64]$script:State.BaselineRequestId -ne $requestId) { return }
     if ($null -eq $script:State.QuotaEstimates) {
         $script:State.QuotaCalibrationMessage = '美元总额需通过一次使额度百分比上升的时间段测量进行反推。'
     }
     $script:State.ViewMode = 'interval'
-    Update-QuotaCards
+    try { Update-QuotaCards }
+    catch { [void]$displayFailures.Add('额度卡显示失败：' + $_.Exception.GetType().Name) }
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $generation -or
+        [Int64]$script:State.BaselineRequestId -ne $requestId) { return }
     if ($waitForIndex) {
         if (-not [bool]$script:State.IndexSyncing) {
             Start-TokenRaderIndexSyncAsync -FullReconcile $true -Startup $true
         }
-        Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '准备中：正在等待后台索引完成，完成后会自动开始计时…'
-        return
+        if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $generation -or
+            [Int64]$script:State.BaselineRequestId -ne $requestId) { return }
+        # The index launcher requires an operable old UI state. Only after it
+        # owns a worker (or we wait on one) commit Starting before redrawing.
+        $script:State.UiState = 'Starting'; $script:State.IsMeasuring = $false
+        try { Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '准备中：正在等待后台索引完成，完成后会自动开始计时…' }
+        catch { [void]$displayFailures.Add('准备状态显示失败：' + $_.Exception.GetType().Name) }
+    } else {
+        $script:State.UiState = 'Starting'; $script:State.IsMeasuring = $false
+        try { Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '核对最近24小时已有进度，仅补齐缺少内容；完成后开始计时，可取消…' }
+        catch { [void]$displayFailures.Add('准备状态显示失败：' + $_.Exception.GetType().Name) }
+        if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $generation -or
+            [Int64]$script:State.BaselineRequestId -ne $requestId) { return }
+        try { Start-TokenRaderMeasurementBaselineAsync -Generation $generation -RequestId $requestId }
+        catch {
+            $launchError = '开始计算准备启动失败：' + $_.Exception.GetType().Name
+            if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $generation -or
+                [Int64]$script:State.BaselineRequestId -ne $requestId) { return }
+            if ($script:State.BackgroundJobs.ContainsKey($requestId)) {
+                Request-TokenRaderBackgroundStop -Job $script:State.BackgroundJobs[$requestId]
+            }
+            if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $generation -or
+                [Int64]$script:State.BaselineRequestId -ne $requestId) { return }
+            Fail-TokenRaderMeasurementRequest -Generation $generation -RequestId $requestId -Final $false -Message $launchError
+            return
+        }
     }
-    Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '核对最近24小时已有进度，仅补齐缺少内容；完成后开始计时，可取消…'
-    Start-TokenRaderMeasurementBaselineAsync -Generation $generation -RequestId $requestId
+    if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $generation -or
+        [Int64]$script:State.BaselineRequestId -ne $requestId) { return }
+    if ($displayFailures.Count -gt 0) {
+        $message = ($displayFailures -join '；') + ' 准备任务已启动或正在等待索引，冻结边界与已有结果保留。'
+        try { Set-TokenRaderLastFailureInfo -Message $message } catch { }
+        if ($script:WindowClosing -or [Int64]$script:State.MeasurementGeneration -ne $generation -or
+            [Int64]$script:State.BaselineRequestId -ne $requestId) { return }
+        try { $script:StatusText.Text = $message } catch { }
+    }
 }
 
 function Cancel-TokenRaderMeasurementPreparation {
