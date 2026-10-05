@@ -2719,6 +2719,16 @@ public static class TokenRaderIndexer
                         // is a still-growing JSON record and must wait for the next
                         // refresh before it can enter the index.
                         if (!lineTerminated) break;
+                        if (lineReader.CommandExecution != null)
+                        {
+                            DateTimeOffset toolAt;
+                            CommandExecutionProjection projection = lineReader.CommandExecution;
+                            if (TryParseTimestamp(projection.Timestamp, out toolAt) &&
+                                (history == null || !history.Recent || toolAt >= history.Cutoff && toolAt <= history.FrozenEnd))
+                                IndexCommandExecution(db, tx, projection, sessionId, effectiveRootSessionId,
+                                    currentModel, sourcePath, lineEndOffset, indexRevision, 0L);
+                            continue;
+                        }
                         if (string.IsNullOrWhiteSpace(line)) continue;
                         line = line.TrimStart('\uFEFF');
 
@@ -3235,6 +3245,7 @@ public static class TokenRaderIndexer
     {
         if (string.IsNullOrWhiteSpace(line)) return false;
         return line.IndexOf("function_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            line.IndexOf("CommandExecution", StringComparison.Ordinal) >= 0 ||
             line.IndexOf("custom_tool_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
             line.IndexOf("tool_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
             line.IndexOf("shell_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -3263,6 +3274,20 @@ public static class TokenRaderIndexer
     {
         TokenRaderJsonRecord record = DeserializeLogRecord(line);
         if (record == null) return 0;
+        if (string.Equals(record.Type, "event_msg", StringComparison.Ordinal) &&
+            record.Payload != null && string.Equals(record.Payload.Type, "item_completed", StringComparison.Ordinal) &&
+            line.IndexOf("CommandExecution", StringComparison.Ordinal) >= 0)
+        {
+            var scan = new CommandExecutionBodyScan();
+            foreach (byte value in Encoding.UTF8.GetBytes(line)) scan.Feed(value);
+            CommandExecutionProjection projection = scan.Projection;
+            if (projection != null)
+                return IndexCommandExecution(db, transaction, projection, sessionId, rootSessionId,
+                    currentModel, sourcePath, sourceOffsetEnd, indexRevision, cutoffEventTicks);
+            // Never let output-text lookalikes (input_image, token_count, etc.)
+            // become metadata when this closed tool shape failed validation.
+            return 0;
+        }
         DateTimeOffset observedAt;
         if (!TryParseTimestamp(record.Timestamp, out observedAt)) return 0;
         long eventTicks = observedAt.UtcDateTime.Ticks;
@@ -3313,6 +3338,23 @@ public static class TokenRaderIndexer
             detected++;
         }
         return detected;
+    }
+
+    private static int IndexCommandExecution(SQLiteConnection db, SQLiteTransaction transaction,
+        CommandExecutionProjection projection, string sessionId, string rootSessionId,
+        string model, string sourcePath, long sourceOffsetEnd, long indexRevision, long cutoffEventTicks)
+    {
+        DateTimeOffset observedAt;
+        if (projection == null || !TryParseTimestamp(projection.Timestamp, out observedAt) ||
+            string.IsNullOrWhiteSpace(projection.CallId)) return 0;
+        long ticks = observedAt.UtcDateTime.Ticks;
+        if (cutoffEventTicks > 0L && ticks < cutoffEventTicks) return 0;
+        UpsertToolRecord(db, transaction,
+            BuildToolSourceEventKey(sourcePath, sourceOffsetEnd, "tool_call", "shell"),
+            projection.CallId, sessionId, ticks, observedAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
+            model, "tool_call", "shell", NormalizeToolStatus(projection.Status), 0,
+            sourcePath, sourceOffsetEnd, rootSessionId, indexRevision);
+        return 1;
     }
 
     private static string NormalizeToolStatus(string status)
@@ -3549,6 +3591,12 @@ public static class TokenRaderIndexer
                 while (lineReader.ReadLine(out line, out lineEndOffset, out lineTerminated))
                 {
                     if (!lineTerminated) break;
+                    if (lineReader.CommandExecution != null)
+                    {
+                        detectedInFile += IndexCommandExecution(db, tx, lineReader.CommandExecution, sessionId, rootSessionId,
+                            currentModel, GetCanonicalPath(file.Path), lineEndOffset, indexRevision, cutoffEventTicks);
+                        continue;
+                    }
                     if (string.IsNullOrWhiteSpace(line)) continue;
                     line = line.TrimStart('\uFEFF');
                     TokenRaderJsonRecord metadataRecord;
@@ -7124,8 +7172,239 @@ public static class TokenRaderIndexer
     {
         if (string.IsNullOrEmpty(state) || state.Length > 600) return false;
         string[] parts = (state ?? "").Split('|'); long stored;
-        return parts.Length == 3 && parts[0] == "2" &&
+        return parts.Length == 3 && (parts[0] == "2" || parts[0] == "3") &&
             long.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out stored) && stored > 0L && stored == createdTicks;
+    }
+
+    private sealed class CommandExecutionProjection
+    {
+        public string Timestamp;
+        public string CallId;
+        public string Status;
+    }
+
+    // A closed schema, not a permissive JSON skipper. Output/command/cwd strings
+    // are checked byte by byte and are never captured, including in continuations.
+    // Only the three bounded tool identity/time/status strings survive a batch.
+    private sealed class CommandExecutionBodyScan
+    {
+        private static readonly string[][] Keys = {
+            new string[0],
+            new[] { "timestamp", "type", "ordinal", "payload" },
+            new[] { "type", "thread_id", "turn_id", "started_at_ms", "completed_at_ms", "item" },
+            new[] { "type", "id", "command", "cwd", "process_id", "source", "status", "exit_code", "duration", "stdout", "stderr", "aggregated_output", "formatted_output", "parsed_cmd" },
+            new[] { "secs", "nanos" },
+            new string[0],
+            new[] { "type", "cmd" },
+            new string[0] // item.command: array of opaque, validated strings
+        };
+        // invalid/depth/done/mode/match/position/escape/unicode/UTF8 bounds,
+        // numeric stage, followed by five kind/stage/seen/key frames.
+        private readonly int[] s = new int[32];
+        private string timestamp = "", callId = "", status = "";
+        public bool CanContinue { get { return s[0] == 0; } }
+        public bool Complete { get { return CanContinue && s[1] == 0 && s[2] == 1 && s[3] == 0; } }
+        private int Frame { get { return 12 + (s[1]-1)*4; } }
+        public CommandExecutionBodyScan() { }
+        public CommandExecutionBodyScan(string saved)
+        {
+            string[] p = (saved ?? "").Split('~');
+            if (p.Length != 4) { Fail(); return; }
+            string[] values = p[0].Split(',');
+            if (values.Length != s.Length + 1 || values[0] != "1") { Fail(); return; }
+            for (int i = 0; i < s.Length; i++)
+                if (!int.TryParse(values[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || s[i] > 16383) { Fail(); return; }
+            try {
+                timestamp = RestoreMetadata(p[1]);
+                callId = RestoreMetadata(p[2]);
+                status = RestoreMetadata(p[3]);
+            } catch { Fail(); return; }
+            if (s[0] > 1 || s[1] > 5 || s[2] > 1 || s[3] > 6 || s[5] > 256 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[9] > 255 || s[10] > 255 || s[11] > 3 || timestamp.Length > 48 || callId.Length > 128 || status.Length > 24) { Fail(); return; }
+            if ((s[3] != 0 && s[1] == 0) || (s[2] == 1 && s[1] != 0)) { Fail(); return; }
+            for (int i = 0; i < s[1]; i++) {
+                int f = 12+i*4, kind = s[f];
+                if (kind < 1 || kind > 7 || s[f+1] > 4 || s[f+3] > Keys[kind].Length || (s[f+2] >> Keys[kind].Length) != 0) { Fail(); return; }
+                if (i < 3 && kind != i+1) { Fail(); return; }
+                if (i == 3 && kind != 4 && kind != 5 && kind != 7) { Fail(); return; }
+                if (i == 4 && (kind != 6 || s[f-4] != 5)) { Fail(); return; }
+            }
+        }
+        public string Save()
+        {
+            string[] values = new string[s.Length+1]; values[0] = "1";
+            for (int i = 0; i < s.Length; i++) values[i+1] = s[i].ToString(CultureInfo.InvariantCulture);
+            return string.Join(",", values) + "~" + Convert.ToBase64String(Encoding.ASCII.GetBytes(timestamp)) + "~" + Convert.ToBase64String(Encoding.ASCII.GetBytes(callId)) + "~" + Convert.ToBase64String(Encoding.ASCII.GetBytes(status));
+        }
+        private static string RestoreMetadata(string value)
+        {
+            byte[] bytes = Convert.FromBase64String(value);
+            foreach (byte b in bytes) if (b < 32 || b > 126 || b == '\\') throw new FormatException("Invalid tool continuation metadata.");
+            return Encoding.ASCII.GetString(bytes);
+        }
+        public CommandExecutionProjection Projection
+        {
+            get {
+                DateTimeOffset at;
+                return Complete && !string.IsNullOrWhiteSpace(callId) && TryParseTimestamp(timestamp, out at) && IsCompletionStatus(status)
+                    ? new CommandExecutionProjection { Timestamp = timestamp, CallId = callId, Status = status } : null;
+            }
+        }
+        private static bool IsCompletionStatus(string value)
+        {
+            string normalized = NormalizeToolStatus(value);
+            return normalized == "completed" || normalized == "failed";
+        }
+        private void Fail() { s[0] = 1; }
+        private static bool Space(int b) { return b == 32 || b == 9 || b == 13 || b == 10; }
+        private string ExpectedType { get { int k = s[Frame]; return k == 1 ? "event_msg" : k == 2 ? "item_completed" : k == 3 ? "CommandExecution" : "unknown"; } }
+        private void BeginString(int mode)
+        {
+            s[3] = mode; s[4] = mode == 2 ? (1 << Keys[s[Frame]].Length)-1 : 0;
+            s[5] = s[6] = s[7] = s[8] = 0;
+        }
+        private void Push(int kind)
+        {
+            if (s[1] == 5) { Fail(); return; }
+            if (s[1] > 0) s[Frame+1] = 3;
+            int f = 12+s[1]*4; s[1]++; s[f] = kind; s[f+1] = s[f+2] = s[f+3] = 0;
+        }
+        private void Close(int b)
+        {
+            int f = Frame, kind = s[f];
+            int required = kind == 1 ? 11 : kind == 2 ? 33 : kind == 3 ? 67 : kind == 4 ? 3 : kind == 6 ? 3 : 0;
+            if (b != (kind == 5 || kind == 7 ? ']' : '}') || (s[f+2] & required) != required) { Fail(); return; }
+            s[1]--; if (s[1] == 0) {
+                s[2] = 1;
+                DateTimeOffset at;
+                if (string.IsNullOrWhiteSpace(callId) || !TryParseTimestamp(timestamp, out at) || !IsCompletionStatus(status)) Fail();
+            }
+        }
+        private void EndString()
+        {
+            int f = Frame, kind = s[f], mode = s[3]; s[3] = 0;
+            if (mode == 2) {
+                int key = -1;
+                for (int i = 0; i < Keys[kind].Length; i++) if ((s[4] & (1 << i)) != 0 && Keys[kind][i].Length == s[5]) { key = i; break; }
+                if (key < 0 || (s[f+2] & (1 << key)) != 0) { Fail(); return; }
+                s[f+2] |= 1 << key; s[f+3] = key+1; s[f+1] = 1;
+            } else {
+                if (mode == 3 && s[5] != ExpectedType.Length) { Fail(); return; }
+                s[f+1] = 3;
+            }
+        }
+        public void Feed(int b)
+        {
+            if (!CanContinue) return;
+            if (s[3] == 5) {
+                if (b >= '0' && b <= '9') {
+                    if (s[11] == 2 || ++s[5] > 32) { Fail(); return; }
+                    s[11] = s[11] == 0 || s[11] == 1 ? (b == '0' ? 2 : 3) : 3; return;
+                }
+                if (s[11] < 2) { Fail(); return; }
+                s[3] = 0; s[Frame+1] = 3; Feed(b); return;
+            }
+            if (s[3] == 6) {
+                const string literal = "null";
+                if (s[5] < literal.Length) { if (b != literal[s[5]++]) Fail(); return; }
+                s[3] = 0; s[Frame+1] = 3; Feed(b); return;
+            }
+            if (s[3] != 0) {
+                if (s[8] > 0) { if (b < s[9] || b > s[10]) Fail(); else { s[8]--; s[9] = 128; s[10] = 191; } return; }
+                if (s[6] == 2) {
+                    if (!((b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F'))) Fail();
+                    else if (--s[7] == 0) s[6] = 0; return;
+                }
+                if (s[6] == 1) {
+                    s[6] = 0;
+                    if (b == 'u') { s[6] = 2; s[7] = 4; }
+                    else if (b != '"' && b != '\\' && b != '/' && b != 'b' && b != 'f' && b != 'n' && b != 'r' && b != 't') Fail();
+                    return;
+                }
+                if (b == '"') { EndString(); return; }
+                if (b < 32) { Fail(); return; }
+                if (s[3] == 2) {
+                    string[] candidates = Keys[s[Frame]];
+                    for (int i = 0; i < candidates.Length; i++) if ((s[4] & (1 << i)) != 0 && (s[5] >= candidates[i].Length || candidates[i][s[5]] != b)) s[4] &= ~(1 << i);
+                    s[5]++; if (s[4] == 0) Fail(); return;
+                }
+                if (s[3] == 3) { string expected = ExpectedType; if (s[5] >= expected.Length || expected[s[5]++] != b) Fail(); return; }
+                if (s[3] == 4) {
+                    // Identity fields are bounded printable ASCII, with no escape
+                    // ambiguity. Nonstandard metadata stays conservatively blocked.
+                    if (b > 126 || b == '\\') { Fail(); return; }
+                    int k = s[Frame], key = s[Frame+3];
+                    if (k == 1 && key == 1) { if (timestamp.Length >= 48) Fail(); else timestamp += (char)b; }
+                    else if (key == 2) { if (callId.Length >= 128) Fail(); else callId += (char)b; }
+                    else { if (status.Length >= 24) Fail(); else status += (char)b; }
+                    return;
+                }
+                if (b == '\\') { s[6] = 1; return; }
+                if (b < 128) return;
+                s[9] = 128; s[10] = 191;
+                if (b >= 194 && b <= 223) s[8] = 1;
+                else if (b >= 224 && b <= 239) { s[8] = 2; if (b == 224) s[9] = 160; if (b == 237) s[10] = 159; }
+                else if (b >= 240 && b <= 244) { s[8] = 3; if (b == 240) s[9] = 144; if (b == 244) s[10] = 143; }
+                else Fail(); return;
+            }
+            if (Space(b)) return;
+            if (s[1] == 0) { if (s[2] == 0 && b == '{') Push(1); else Fail(); return; }
+            int f0 = Frame, kind0 = s[f0], stage = s[f0+1], key0 = s[f0+3];
+            if (stage == 0 || stage == 4) {
+                if (stage == 0 && b == (kind0 == 5 || kind0 == 7 ? ']' : '}')) { Close(b); return; }
+                if (kind0 == 5) { if (b == '{') Push(6); else Fail(); }
+                else if (kind0 == 7) { if (b == '"') BeginString(1); else Fail(); }
+                else if (b == '"') BeginString(2); else Fail();
+            } else if (stage == 1) { if (b == ':') s[f0+1] = 2; else Fail(); }
+            else if (stage == 2) {
+                if (kind0 == 3 && key0 == 3 && b == '[') { Push(7); return; }
+                int child = kind0 == 1 && key0 == 4 ? 2 : kind0 == 2 && key0 == 6 ? 3 : kind0 == 3 && key0 == 9 ? 4 : kind0 == 3 && key0 == 14 ? 5 : 0;
+                bool nullable = kind0 == 3 && (key0 == 5 || key0 == 8 || key0 >= 9);
+                if (child > 0 && b == (child == 5 ? '[' : '{')) Push(child);
+                else if (nullable && b == 'n') { s[3] = 6; s[5] = 0; Feed(b); }
+                else if (child > 0) Fail();
+                else {
+                    bool numeric = kind0 == 1 && key0 == 3 || kind0 == 2 && (key0 == 4 || key0 == 5) || kind0 == 4 || kind0 == 3 && (key0 == 5 || key0 == 8);
+                    bool text = !numeric || kind0 == 3 && key0 == 5;
+                    if (text && b == '"') BeginString((kind0 == 1 && key0 == 2 || kind0 != 1 && key0 == 1) ? 3 : (kind0 == 1 && key0 == 1 || kind0 == 3 && (key0 == 2 || key0 == 7)) ? 4 : 1);
+                    else if (numeric && (b == '-' || b >= '0' && b <= '9')) { s[3] = 5; s[5] = 0; s[11] = b == '-' ? 1 : 0; if (b != '-') Feed(b); }
+                    else Fail();
+                }
+            } else if (stage == 3) { if (b == ',') s[f0+1] = 4; else Close(b); }
+            else Fail();
+        }
+    }
+
+    private sealed class SafeOversizedBodyScan
+    {
+        private PureTextBodyScan text;
+        private CommandExecutionBodyScan command;
+        public SafeOversizedBodyScan() { text = new PureTextBodyScan(); command = new CommandExecutionBodyScan(); }
+        public SafeOversizedBodyScan(string state, bool legacy)
+        {
+            if (legacy) { text = new PureTextBodyScan(state); return; }
+            if (string.IsNullOrEmpty(state)) return;
+            string[] p = state.Substring(1).Split(':');
+            if (state[0] == 'T' && p.Length == 1) text = new PureTextBodyScan(p[0]);
+            else if (state[0] == 'C' && p.Length == 1) command = new CommandExecutionBodyScan(p[0]);
+            else if (state[0] == 'B' && p.Length == 2) { text = new PureTextBodyScan(p[0]); command = new CommandExecutionBodyScan(p[1]); }
+        }
+        public bool CanContinue { get { return (text != null && text.CanContinue || command != null && command.CanContinue) && Save().Length <= 575; } }
+        public bool Complete { get { return CanContinue && (text != null && text.Complete || command != null && command.Complete); } }
+        public CommandExecutionProjection Projection { get { return command == null ? null : command.Projection; } }
+        // Keep the original numeric v2 rejection state too. A failed command
+        // candidate must not change pure-text continuation's storage contract;
+        // this does not revive either failed validator or admit its suffix.
+        public bool TextOnly { get { return text != null && (command == null || !command.CanContinue); } }
+        public string TextState { get { return text == null ? "" : text.Save(); } }
+        public void Feed(int b) { if (text != null) text.Feed(b); if (command != null) command.Feed(b); }
+        public string Save()
+        {
+            bool t = text != null && text.CanContinue, c = command != null && command.CanContinue;
+            if (t && c) return "B" + text.Save() + ":" + command.Save();
+            if (t) return "T" + text.Save();
+            if (c) return "C" + command.Save();
+            return "X";
+        }
     }
 
     // Deliberately not a general JSON parser. Only this four-level, pure-text
@@ -7299,14 +7578,15 @@ public static class TokenRaderIndexer
         private bool _discarding;
         private readonly bool _classifyBody;
         private readonly long _bodySourceCreatedTicks;
-        private PureTextBodyScan _bodyScan;
+        private SafeOversizedBodyScan _bodyScan;
         public long Position { get { return _position; } }
         public long IncompleteStart { get; private set; }
         public bool Discarding { get { return _discarding; } }
         public bool SkippedOversizedLine { get; private set; }
         public bool OversizedPotentialUsage { get; private set; }
         public bool BodyScanCanContinue { get { return _bodyScan != null && _bodyScan.CanContinue; } }
-        public string BodyScanState { get { return _bodyScan == null ? "" : "2|" + _bodySourceCreatedTicks.ToString(CultureInfo.InvariantCulture) + "|" + _bodyScan.Save(); } }
+        public string BodyScanState { get { return _bodyScan == null ? "" : (_bodyScan.TextOnly ? "2|" : "3|") + _bodySourceCreatedTicks.ToString(CultureInfo.InvariantCulture) + "|" + (_bodyScan.TextOnly ? _bodyScan.TextState : _bodyScan.CanContinue ? _bodyScan.Save() : "X"); } }
+        public CommandExecutionProjection CommandExecution { get; private set; }
 
         public Utf8JsonlLineReader(Stream stream, long startOffset, long endOffset)
             : this(stream, startOffset, endOffset, CancellationToken.None, null, null, null, false, 0)
@@ -7328,7 +7608,10 @@ public static class TokenRaderIndexer
             _classifyBody = classifyBody;
             _bodySourceCreatedTicks = bodySourceCreatedTicks;
             if (_classifyBody && discard)
-                _bodyScan = new PureTextBodyScan(BodyScanSourceMatches(bodyScanState, bodySourceCreatedTicks) ? bodyScanState.Split('|')[2] : "");
+            {
+                bool matches = BodyScanSourceMatches(bodyScanState, bodySourceCreatedTicks);
+                _bodyScan = new SafeOversizedBodyScan(matches ? bodyScanState.Split('|')[2] : "", matches && bodyScanState.Split('|')[0] == "2");
+            }
         }
 
         public bool ReadLine(out string line, out long lineEndOffset, out bool terminated)
@@ -7336,13 +7619,14 @@ public static class TokenRaderIndexer
             line = null;
             lineEndOffset = _position;
             terminated = false;
+            CommandExecution = null;
             _cancel.ThrowIfCancellationRequested();
             if (_deadline != null && _maxMilliseconds > 0 && _deadline.ElapsedMilliseconds >= _maxMilliseconds) return false;
             long lineStart = _position;
             // History batches must carry parsing state across a partial line.
             // Live imports can defer the DFA until overflow, avoiding its cost
             // for the ordinary <=1 MiB hot path.
-            if (!_discarding) _bodyScan = _classifyBody ? new PureTextBodyScan() : null;
+            if (!_discarding) _bodyScan = _classifyBody ? new SafeOversizedBodyScan() : null;
 
             using (var bytes = new MemoryStream())
             {
@@ -7374,7 +7658,7 @@ public static class TokenRaderIndexer
                                 // metadata, duplicate keys or a late type can
                                 // occur after it. Replay the bounded prefix,
                                 // then validate every remaining byte to EOL.
-                                _bodyScan = new PureTextBodyScan();
+                                _bodyScan = new SafeOversizedBodyScan();
                                 byte[] prefix = bytes.GetBuffer();
                                 for (int i = 0; i < bytes.Length; i++)
                                 {
@@ -7389,6 +7673,8 @@ public static class TokenRaderIndexer
                 }
 
                 lineEndOffset = _position;
+                if (_discarding && terminated && _bodyScan != null && _bodyScan.Complete)
+                    CommandExecution = _bodyScan.Projection;
                 if (_discarding && (terminated ? (_bodyScan == null || !_bodyScan.Complete) : !_classifyBody))
                     OversizedPotentialUsage = true;
                 if (bytes.Length == 0 && !terminated && _position >= _endOffset)

@@ -1994,6 +1994,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-RecentHistoryUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-OversizedHistoryIndexerTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IncrementalOversizedTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-CommandExecutionStreamingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-FailureInfoUiTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-FastStartCoreTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-FastStartIndexerTests.ps1')

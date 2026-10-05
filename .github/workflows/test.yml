@@ -31,6 +31,7 @@ jobs:
         shell: powershell
         run: |
           .\tests\Run-IncrementalOversizedTests.ps1
+          .\tests\Run-CommandExecutionStreamingTests.ps1
           .\tests\Run-BoundaryFailureDiagnosticsTests.ps1
           .\tests\Run-IndexerLoadDiagnosticsTests.ps1
       - name: Run regression tests on Windows PowerShell 5.1
