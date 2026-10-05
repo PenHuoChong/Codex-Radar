@@ -175,7 +175,7 @@ $script:MeasurementBaselineScript = {
     [void](Get-Command -Name CaptureMeasurementBaseline -ErrorAction Stop)
     $CancellationToken.ThrowIfCancellationRequested()
     if ($null -ne $ProgressState) {
-        $ProgressState.Stage = '分批补齐最近24小时日志'
+        $ProgressState.Stage = '核对最近24小时已有进度'
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
     }
     # This preparation owns a fixed recent-history target. Older history is
@@ -188,7 +188,7 @@ $script:MeasurementBaselineScript = {
         throw '最近24小时日志尚未补齐；已提交批次保留，可重试，尚未开始计时。'
     }
     if ($null -ne $ProgressState) {
-        $ProgressState.Stage = '冻结开始位置'
+        $ProgressState.Stage = '读取冻结边界额度快照'
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
     }
     $baseline = CaptureMeasurementBaseline -SessionsRoot $SessionsRoot -PricingDocument $prices -AccountIdentity $AccountIdentity `
@@ -916,8 +916,9 @@ function Start-TokenRaderBackgroundPoller {
                     [string]$script:State.UiState -eq 'Starting' -and
                     ($now - [DateTimeOffset]$job.LastProgressUiAt).TotalMilliseconds -ge 500) {
                     $job.LastProgressUiAt = $now
-                    $stage = [string](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'Stage' -Default '分批补齐最近24小时日志')
+                    $stage = [string](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'Stage' -Default '核对最近24小时已有进度')
                     if ($stage -in @('HistoryBackfill', 'RecentHistoryBackfill')) { $stage = '分批补齐最近24小时日志' }
+                    if ($stage -eq 'FastStart') { $stage = '核对最近24小时已有进度' }
                     $processedBytes = [Int64](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'HistoryProcessedBytes' -Default 0L)
                     $remainingFiles = [Int64](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'RemainingFiles' -Default 0L)
                     $remainingBytes = [Int64](Get-TokenRaderCallbackContextValue -Context $job.ProgressState -Name 'RemainingBytes' -Default 0L)
@@ -1118,12 +1119,14 @@ function Complete-TokenRaderIndexSyncJob {
     param($Payload, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
     if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId) { return }
     $startup = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'Startup' -Default $false)
+    $displayFailures = New-Object System.Collections.Generic.List[string]
     $script:State.IndexSyncing = $false
     $script:State.IndexSyncStopping = $false
-    $script:State.IndexSyncRequestId = 0L
     if ($null -ne $Payload -and $null -ne $Payload.PSObject.Properties['HistoryCoverage']) {
-        Set-TokenRaderHistoryCoverage -Coverage $Payload.HistoryCoverage
+        try { Set-TokenRaderHistoryCoverage -Coverage $Payload.HistoryCoverage }
+        catch { [void]$displayFailures.Add('历史覆盖显示失败：' + $_.Exception.Message) }
     }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId) { return }
     # The worker has already created/migrated the schema. A UI connection must
     # not reacquire its writer lock while another background task is running.
     if ($null -ne $Payload -and $null -ne $Payload.PSObject.Properties['SchemaInitialized'] -and [bool]$Payload.SchemaInitialized) {
@@ -1133,51 +1136,105 @@ function Complete-TokenRaderIndexSyncJob {
     $script:State.IndexCatalogAvailable = $true
     $script:State.ProjectCache = @{}
     $script:State.RateLimitSnapshotCache = @{}
-    Update-TokenRaderToolBackfillButton
+    try { Update-TokenRaderToolBackfillButton }
+    catch { [void]$displayFailures.Add('工具按钮显示失败：' + $_.Exception.Message) }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId) { return }
     if ($null -ne $Payload -and $null -ne $Payload.PSObject.Properties['LatestRateLimits']) {
-        Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits
+        try { Merge-LatestRateLimits -Candidate $Payload.LatestRateLimits }
+        catch { [void]$displayFailures.Add('额度快照合并失败：' + $_.Exception.Message) }
     }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId) { return }
     if ([bool]$script:State.PendingMeasurementStart -and [string]$script:State.UiState -eq 'Starting' -and
         [Int64]$script:State.BaselineRequestId -gt 0) {
-        $script:State.PendingMeasurementStart = $false
-        Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '分批补齐最近24小时日志，完成后冻结开始位置并开始计时；可取消…'
+        $baselineRequestId = [Int64]$script:State.BaselineRequestId
+        $baselineGeneration = [Int64]$script:State.MeasurementGeneration
+        try { Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '核对最近24小时已有进度，仅补齐缺少内容；完成后开始计时，可取消…' }
+        catch { [void]$displayFailures.Add('准备状态显示失败：' + $_.Exception.Message) }
+        if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId -or
+            [Int64]$script:State.BaselineRequestId -ne $baselineRequestId -or
+            [Int64]$script:State.MeasurementGeneration -ne $baselineGeneration) { return }
+        # Keep both request identities until launch returns. A real index-open
+        # or launch exception must still reach its guarded failure callback.
         Start-TokenRaderMeasurementBaselineAsync `
-            -Generation ([Int64]$script:State.MeasurementGeneration) `
-            -RequestId ([Int64]$script:State.BaselineRequestId)
+            -Generation $baselineGeneration -RequestId $baselineRequestId
+        if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId -or
+            [Int64]$script:State.MeasurementGeneration -ne $baselineGeneration) { return }
+        # BeginInvoke failures are handled synchronously by the baseline
+        # helper. Do not overwrite its real error with auxiliary diagnostics.
+        if ([string]$script:State.UiState -eq 'Error' -and [Int64]$script:State.BaselineRequestId -eq 0) {
+            $script:State.IndexSyncRequestId = 0L
+            return
+        }
+        if ([Int64]$script:State.BaselineRequestId -ne $baselineRequestId -or
+            [Int64]$script:State.MeasurementGeneration -ne $baselineGeneration) { return }
+        $script:State.PendingMeasurementStart = $false
     } else {
-        Refresh-Application
-        Set-TokenRaderUiState -NewState ([string]$script:State.UiState) -StatusMessage $(if ($startup) {
-            '后台索引准备完成，可以开始计算。'
-        } else { '新增或修改日志已更新。' })
+        try { Refresh-Application }
+        catch { [void]$displayFailures.Add('索引结果显示失败：' + $_.Exception.Message) }
+        if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId) { return }
+        try {
+            Set-TokenRaderUiState -NewState ([string]$script:State.UiState) -StatusMessage $(if ($startup) {
+                '后台索引准备完成，可以开始计算。'
+            } else { '新增或修改日志已更新。' })
+        } catch { [void]$displayFailures.Add('索引状态显示失败：' + $_.Exception.Message) }
+        if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId) { return }
         Start-TokenRaderUsageHistoryRefresh
+    }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId) { return }
+    $script:State.IndexSyncRequestId = 0L
+    if ($displayFailures.Count -gt 0) {
+        $message = ($displayFailures -join '；') + ' 后台索引已完成，准备任务或现有测量不受影响，可重试显示。'
+        try { Set-TokenRaderLastFailureInfo -Message $message } catch { }
+        try { $script:StatusText.Text = $message } catch { }
     }
 }
 
 function Fail-TokenRaderIndexSyncJob {
     param($ErrorMessage, [Int64]$Generation, [Int64]$RequestId, [string]$Kind, $Context)
     if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $RequestId) { return }
+    $measurementGeneration = [Int64]$script:State.MeasurementGeneration
     $coldStart = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'ColdStart' -Default $false)
     $stopPending = [bool](Get-TokenRaderCallbackContextValue -Context $Context -Name 'StopPending' -Default $false)
     $script:State.IndexSyncStopping = $stopPending
     $script:State.IndexSyncing = $stopPending
-    if (-not $stopPending) { $script:State.IndexSyncRequestId = 0L }
     if ($coldStart) { $script:State.IndexReady = $false }
     if ([bool]$script:State.PendingMeasurementStart) {
         $script:State.PendingMeasurementStart = $false
         $script:State.BaselineRequestId = 0L
     }
     $script:State.QuotaCalibrationMessage = [string]$ErrorMessage
-    # Index availability does not invalidate already priced, frozen evidence.
-    # Reuse it only after the normal account/cycle validation.
-    Retain-TokenRaderQuotaEstimatesForCurrentWindow
-    Mark-TokenRaderQuotaEstimatesRetainedAfterFailure
     $nextState = if ([string]$script:State.UiState -in @('Measuring','Stopping','ComputingFinal','Ready')) {
         [string]$script:State.UiState
     } else { 'Error' }
+    # Restore the owned task before drawing quota/status controls. Rendering
+    # must not leave Starting after the worker has actually failed or stopped.
+    $script:State.UiState = $nextState
+    $script:State.IsMeasuring = ($nextState -eq 'Measuring')
+    if (-not $stopPending) { $script:State.IndexSyncRequestId = 0L }
+    $ownedRequestId = if ($stopPending) { $RequestId } else { 0L }
+    $displayFailures = New-Object System.Collections.Generic.List[string]
+    # Index availability does not invalidate already priced, frozen evidence.
+    # Reuse it only after the normal account/cycle validation.
+    try { Retain-TokenRaderQuotaEstimatesForCurrentWindow }
+    catch { [void]$displayFailures.Add('额度结果保留失败：' + $_.Exception.Message) }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $ownedRequestId -or
+        [Int64]$script:State.MeasurementGeneration -ne $measurementGeneration) { return }
+    try { Mark-TokenRaderQuotaEstimatesRetainedAfterFailure }
+    catch { [void]$displayFailures.Add('额度诊断显示失败：' + $_.Exception.Message) }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $ownedRequestId -or
+        [Int64]$script:State.MeasurementGeneration -ne $measurementGeneration) { return }
     $statusMessage = '后台索引同步失败：' + [string]$ErrorMessage + $(if ($stopPending) { ' 正在停止，退出前不能重新同步。' } else { '' })
-    Set-TokenRaderLastFailureInfo -Message $statusMessage
-    Set-TokenRaderUiState -NewState $nextState -StatusMessage $statusMessage
-    Update-QuotaCards
+    try { Set-TokenRaderUiState -NewState $nextState -StatusMessage $statusMessage }
+    catch { [void]$displayFailures.Add('索引失败状态显示失败：' + $_.Exception.Message) }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $ownedRequestId -or
+        [Int64]$script:State.MeasurementGeneration -ne $measurementGeneration) { return }
+    try { Update-QuotaCards }
+    catch { [void]$displayFailures.Add('额度卡显示失败：' + $_.Exception.Message) }
+    if ($script:WindowClosing -or [Int64]$script:State.IndexSyncRequestId -ne $ownedRequestId -or
+        [Int64]$script:State.MeasurementGeneration -ne $measurementGeneration) { return }
+    if ($displayFailures.Count -gt 0) { $statusMessage += ' ' + ($displayFailures -join '；') }
+    try { Set-TokenRaderLastFailureInfo -Message $statusMessage } catch { }
+    try { $script:StatusText.Text = $statusMessage } catch { }
 }
 
 function Complete-TokenRaderIndexSyncStopJob {
@@ -1772,7 +1829,7 @@ function Start-TokenRaderMeasurementBaselineAsync {
     )
     $cancellationSource = [Threading.CancellationTokenSource]::new()
     $progressState = [hashtable]::Synchronized(@{
-        Stage = '分批补齐最近24小时日志'; HistoryProcessedBytes = [Int64]0
+        Stage = '核对最近24小时已有进度'; HistoryProcessedBytes = [Int64]0
         RemainingFiles = [Int64]0; RemainingBytes = [Int64]0; LastProgressAt = [DateTimeOffset]::Now
     })
     [void](Start-TokenRaderBackgroundJob `
@@ -3249,7 +3306,6 @@ function Complete-TokenRaderMeasurementBaseline {
         Fail-TokenRaderMeasurementRequest -Generation $Generation -RequestId $RequestId -Final $false -Message '开始计算准备结果缺少起始偏移或额度快照。'
         return
     }
-    $script:State.BaselineRequestId = 0
     $script:State.PendingMeasurementStart = $false
     $script:State.IntervalBaseline = $Baseline
     $script:State.IntervalResult = $null
@@ -3257,17 +3313,44 @@ function Complete-TokenRaderMeasurementBaseline {
     $script:State.IntervalFinalRetry = $null
     $script:State.WeeklyReferenceEstimate = $null
     $script:State.IntervalCache = $null
-    if ($null -ne $Baseline.PSObject.Properties['HistoryCoverage']) {
-        # This auxiliary label cannot prevent a valid prepared baseline from
-        # entering Measuring if a coverage control fails to render.
-        try { Set-TokenRaderHistoryCoverage -Coverage $Baseline.HistoryCoverage } catch { }
+    # Commit the valid frozen baseline before auxiliary rendering. A display
+    # exception cannot strand Starting after the completed worker was removed.
+    # Retain ownership until this state handoff finishes, including a failed
+    # control redraw; never clear a newer request from a re-entrant callback.
+    $script:State.UiState = 'Measuring'
+    $script:State.IsMeasuring = $true
+    $displayFailures = New-Object System.Collections.Generic.List[string]
+    try {
+        Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage '开始位置已冻结，正在等待 Codex 新消耗…'
+    } catch {
+        [void]$displayFailures.Add('测量状态显示失败：' + $_.Exception.Message)
+    } finally {
+        if ([Int64]$script:State.MeasurementGeneration -eq $Generation -and
+            [Int64]$script:State.BaselineRequestId -eq $RequestId) {
+            $script:State.BaselineRequestId = 0L
+        }
     }
-    Merge-LatestRateLimits -Candidate $Baseline.StartRateLimits
-    Retain-TokenRaderQuotaEstimatesForCurrentWindow `
-        -RateLimits $Baseline.StartRateLimits `
-        -AccountIdentity $(if ($null -ne $Baseline.PSObject.Properties['AccountIdentity']) { [string]$Baseline.AccountIdentity } else { [string]$script:State.AccountIdentity })
-    Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage '开始位置已冻结，正在等待 Codex 新消耗…'
-    Show-EmptyIntervalMeasurement -Baseline $Baseline
+    if ([Int64]$script:State.MeasurementGeneration -ne $Generation -or
+        -not [object]::ReferenceEquals($script:State.IntervalBaseline, $Baseline)) { return }
+    if ($null -ne $Baseline.PSObject.Properties['HistoryCoverage']) {
+        try { Set-TokenRaderHistoryCoverage -Coverage $Baseline.HistoryCoverage }
+        catch { [void]$displayFailures.Add('历史覆盖显示失败：' + $_.Exception.Message) }
+    }
+    try { Merge-LatestRateLimits -Candidate $Baseline.StartRateLimits }
+    catch { [void]$displayFailures.Add('额度快照合并失败：' + $_.Exception.Message) }
+    try {
+        Retain-TokenRaderQuotaEstimatesForCurrentWindow `
+            -RateLimits $Baseline.StartRateLimits `
+            -AccountIdentity $(if ($null -ne $Baseline.PSObject.Properties['AccountIdentity']) { [string]$Baseline.AccountIdentity } else { [string]$script:State.AccountIdentity })
+    } catch { [void]$displayFailures.Add('额度结果保留失败：' + $_.Exception.Message) }
+    try { Show-EmptyIntervalMeasurement -Baseline $Baseline }
+    catch { [void]$displayFailures.Add('初始结果显示失败：' + $_.Exception.Message) }
+    if ($displayFailures.Count -gt 0) {
+        $message = ($displayFailures -join '；') + ' 测量已开始，冻结起点保留，可再次查看结果重试显示。'
+        $script:State.IntervalLastError = $message
+        try { Set-TokenRaderLastFailureInfo -Message $message } catch { }
+        try { $script:StatusText.Text = $message } catch { }
+    }
 }
 
 function Complete-TokenRaderMeasurementEnd {
@@ -3776,7 +3859,7 @@ function Start-IntervalMeasurement {
         Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '准备中：正在等待后台索引完成，完成后会自动开始计时…'
         return
     }
-    Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '分批补齐最近24小时日志，完成后冻结开始位置并开始计时；可取消…'
+    Set-TokenRaderUiState -NewState 'Starting' -StatusMessage '核对最近24小时已有进度，仅补齐缺少内容；完成后开始计时，可取消…'
     Start-TokenRaderMeasurementBaselineAsync -Generation $generation -RequestId $requestId
 }
 

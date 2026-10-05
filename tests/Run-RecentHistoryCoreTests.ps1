@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -35,6 +35,11 @@ try {
     Initialize-TokenRaderIndexFromNow -SessionsRoot $sessions | Out-Null
     $prepared = Complete-TokenRaderRecentHistory -SessionsRoot $sessions -ProgressState ([hashtable]::Synchronized(@{}))
     Assert-Recent ([bool]$prepared.Completed) 'recent preparation finishes'
+    Assert-Recent ([long]$prepared.ProcessedBytes -gt 0 -and -not $prepared.HistoryReused) 'initial preparation reports actual history work'
+    $repeatProgress = [hashtable]::Synchronized(@{})
+    $repeatPrepared = Complete-TokenRaderRecentHistory -SessionsRoot $sessions -ProgressState $repeatProgress
+    Assert-Recent ($repeatPrepared.Completed -and $repeatPrepared.HistoryReused -and [long]$repeatPrepared.ProcessedBytes -eq 0) 'repeat preparation reuses completed history without scanning body'
+    Assert-Recent ($repeatProgress.Stage -eq '复用已补齐日志，冻结测量起点') 'repeat preparation identifies reused history'
     $index = Get-TokenRaderIndex
     $coverage = Get-TokenRaderHistoryCoverage -Connection $index.Connection
     Assert-Recent (-not $coverage.HistoryComplete) 'old historical gap remains explicit'

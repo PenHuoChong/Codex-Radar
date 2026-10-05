@@ -20,8 +20,10 @@ function Token([string]$at,[int]$total,[int]$last=-1) {
 }
 function Complete {
     $i=0
+    $script:backfillProcessedBytes=0L
     do {
         $script:batch=[TokenRaderIndexer]::BackfillRecentHistoryBatch($db,900,500,$progress,$none)
+        $script:backfillProcessedBytes += [long]$batch.ProcessedBytes
         Assert ($batch.ProcessedBytes-le900) 'bytes bounded'
         $i++; Assert ($i-lt2000) 'bounded work progresses'
     } while(-not $batch.Completed -and $batch.EligibleFiles-gt0)
@@ -125,6 +127,56 @@ try {
     Assert (-not $batch.Completed -and $batch.BlockedFiles-eq1) 'oversized unknown usage never reports completion'
     $retry=[TokenRaderIndexer]::PrepareRecentHistory($db,$hugeRoot,$cutoff.AddMinutes(1),$end.AddMinutes(1),$progress,$none)
     Assert (-not $retry.Completed) 'retry preserves unknown oversized-line rejection'
+    $db.Close(); $db.Dispose()
+
+    # Repeated starts reuse completed proof, including across a new connection.
+    # Keep the synthetic persistent database outside the scanned sessions root.
+    $repeatRoot=Join-Path $temp 'repeat-start'; [void][IO.Directory]::CreateDirectory($repeatRoot)
+    $repeatPath=Join-Path $repeatRoot 'repeat.jsonl'
+    $repeatDbPath=Join-Path $temp 'repeat-start.db'
+    $repeatConnectionString='Data Source='+$repeatDbPath+';Version=3;Pooling=False;'
+    $repeatContent=$meta+"`n"+$context+"`n"+(Token '2026-09-01T00:00:00Z' 100 100)+"`n"+(Token '2026-10-05T02:00:00Z' 125)+"`n"
+    [IO.File]::WriteAllText($repeatPath,$repeatContent,$utf8)
+    $initialLength=([IO.FileInfo]$repeatPath).Length
+    $db=[System.Data.SQLite.SQLiteConnection]::new($repeatConnectionString); $db.Open(); [TokenRaderIndexer]::CreateSchema($db)
+    [void][TokenRaderIndexer]::PrepareRecentHistory($db,$repeatRoot,$cutoff,$end,$progress,$none)
+    Complete
+    $initialScanBytes=$backfillProcessedBytes
+    Assert ($batch.Completed -and $initialScanBytes-eq$initialLength) 'first start scans frozen source exactly once'
+    Assert ((Scalar 'SELECT COUNT(*) FROM token_records')-eq1 -and (Scalar 'SELECT SUM(call_input) FROM token_records')-eq25) 'first start retains only recent event and historical cumulative baseline'
+    $initialCursor=Scalar 'SELECT cursor_offset FROM recent_history_work'
+    $sameConnectionRepeat=[TokenRaderIndexer]::PrepareRecentHistory($db,$repeatRoot,$cutoff.AddMinutes(1),$end.AddMinutes(1),$progress,$none)
+    Assert ($sameConnectionRepeat.Completed -and $sameConnectionRepeat.ProcessedBytes-eq0 -and $sameConnectionRepeat.RemainingBytes-eq0) 'repeated start does not resample unchanged source or backfill old gap'
+    Complete
+    $sameConnectionRepeatBytes=$backfillProcessedBytes
+    Assert ($sameConnectionRepeatBytes-eq0 -and (Scalar 'SELECT cursor_offset FROM recent_history_work')-eq$initialCursor) 'completed repeat processes no body bytes and retains completed cursor'
+    Assert ((Scalar 'SELECT COUNT(*) FROM token_records')-eq1 -and (Scalar 'SELECT SUM(call_input) FROM token_records')-eq25) 'completed repeat does not duplicate events'
+    $db.Close(); $db.Dispose()
+    $db=[System.Data.SQLite.SQLiteConnection]::new($repeatConnectionString); $db.Open()
+    $reopenedRepeat=[TokenRaderIndexer]::PrepareRecentHistory($db,$repeatRoot,$cutoff.AddMinutes(2),$end.AddMinutes(2),$progress,$none)
+    Assert ($reopenedRepeat.Completed -and $reopenedRepeat.ProcessedBytes-eq0 -and $reopenedRepeat.RemainingBytes-eq0) 'new connection reuses persisted completed proof without body scan'
+    Complete
+    $reopenedRepeatBytes=$backfillProcessedBytes
+    Assert ($reopenedRepeatBytes-eq0 -and (Scalar 'SELECT COUNT(*) FROM token_records')-eq1) 'new connection repeat does not duplicate event'
+    $append=(Token '2026-10-05T12:01:00Z' 140 15)+"`n"
+    $appendLength=$utf8.GetByteCount($append)
+    [IO.File]::AppendAllText($repeatPath,$append,$utf8)
+    $appendPrepared=[TokenRaderIndexer]::PrepareRecentHistory($db,$repeatRoot,$cutoff.AddMinutes(3),$end.AddMinutes(3),$progress,$none)
+    Assert (-not $appendPrepared.Completed -and $appendPrepared.RemainingBytes-eq$appendLength) 'small append leaves only appended bytes for body processing'
+    Assert ((Scalar 'SELECT cursor_offset FROM recent_history_work')-eq$initialCursor) 'small append does not rewind previous completed body cursor'
+    # Reopen after preparation as well, so the resume cannot depend on memory.
+    $db.Close(); $db.Dispose()
+    $db=[System.Data.SQLite.SQLiteConnection]::new($repeatConnectionString); $db.Open()
+    Assert ([TokenRaderIndexer]::GetRecentHistoryBackfillStatus($db).RemainingBytes-eq$appendLength) 'append cursor persists across connection restart'
+    Complete
+    $appendScanBytes=$backfillProcessedBytes
+    Assert ($batch.Completed -and $appendScanBytes-eq$appendLength) 'append backfill processes exactly the newly appended body bytes'
+    Assert ((Scalar 'SELECT COUNT(*) FROM token_records')-eq2 -and (Scalar 'SELECT SUM(call_input) FROM token_records')-eq40) 'append adds one event and its delta without duplicate historical usage'
+    $finalRepeat=[TokenRaderIndexer]::PrepareRecentHistory($db,$repeatRoot,$cutoff.AddMinutes(4),$end.AddMinutes(4),$progress,$none)
+    Complete
+    Assert ($finalRepeat.Completed -and $finalRepeat.ProcessedBytes-eq0 -and $backfillProcessedBytes-eq0) 'completed append remains reusable on another start'
+    Assert ((Scalar 'SELECT COUNT(*) FROM token_records')-eq2 -and (Scalar 'SELECT SUM(call_input) FROM token_records')-eq40) 'final repeat keeps event count and cumulative charge unchanged'
+    Write-Output ('Recent repeated-start body bytes: initial={0}; repeat={1}; reopened={2}; append={3}/{4}; final={5}; events=2; call_input=40.' -f $initialScanBytes,$sameConnectionRepeatBytes,$reopenedRepeatBytes,$appendScanBytes,$appendLength,$backfillProcessedBytes)
     $db.Close(); $db.Dispose()
 
     # Old parent numeric proof must survive the timestamp-only import filter.

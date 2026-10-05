@@ -20,7 +20,8 @@ foreach ($name in @('Get-TokenRaderCallbackContextValue', 'New-TokenRaderRequest
     'Invoke-TokenRaderBackgroundHandler', 'Request-TokenRaderBackgroundStop',
     'Start-TokenRaderBackgroundPoller', 'Complete-TokenRaderBoundaryStopJob',
     'Start-TokenRaderIndexSyncAsync', 'Start-TokenRaderHistoryBackfill', 'Start-TokenRaderUsageHistoryRefresh',
-    'Start-TokenRaderToolBackfill', 'Update-TokenRaderToolBackfillButton', 'Set-TokenRaderHistoryCoverage')) {
+    'Start-TokenRaderToolBackfill', 'Update-TokenRaderToolBackfillButton', 'Set-TokenRaderHistoryCoverage',
+    'ConvertTo-TokenRaderCopyableStatusText', 'Set-TokenRaderLastFailureInfo')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     Assert-RecentUi ($null -ne $node) ('missing function ' + $name)
     Invoke-Expression $node.Extent.Text.Replace('$PSScriptRoot', '$script:SyntheticRoot')
@@ -28,6 +29,14 @@ foreach ($name in @('Get-TokenRaderCallbackContextValue', 'New-TokenRaderRequest
 $assignment = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and
     $n.Left.Extent.Text -eq '$script:MeasurementBaselineScript' }, $true)
 Invoke-Expression $assignment.Extent.Text
+$pollerNode = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Start-TokenRaderBackgroundPoller' }, $true)
+$mappingNode = $pollerNode.Find({ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and
+    $n.Clauses[0].Item1.Extent.Text.Contains("'HistoryBackfill'") -and
+    $n.Clauses[0].Item1.Extent.Text.Contains("'RecentHistoryBackfill'") }, $true)
+$localizedNode = $mappingNode.Clauses[0].Item2.Find({ param($n)
+    $n -is [Management.Automation.Language.StringConstantExpressionAst] }, $true)
+$script:BackfillStageText = $localizedNode.Value
 
 # Only production function/scriptblock extraction; no app launch, account read,
 # index open, real log access or DLL build. All core and UI seams are synthetic.
@@ -171,10 +180,10 @@ try {
     Start-TokenRaderBackgroundPoller; Pump-RecentUi
     Assert-RecentUi (-not $cts.IsCancellationRequested -and $null -eq $job.StopAsyncResult -and
         $script:StatusText.Text.Contains('8.0 MB') -and $script:StatusText.Text.Contains('4.0 MB') -and
-        $script:StatusText.Text.Contains($script:WorkerEvents[0])) 'healthy 35s prep timed out or progress/stage hidden'
+        $script:StatusText.Text.Contains($script:BackfillStageText)) 'healthy 35s prep timed out or progress/stage hidden'
     $job.ProgressState.Stage = 'RecentHistoryBackfill'; $job.LastProgressUiAt = [DateTimeOffset]::Now.AddSeconds(-1)
     Pump-RecentUi
-    Assert-RecentUi ($script:StatusText.Text.Contains($script:WorkerEvents[0])) 'recent stage code not localized'
+    Assert-RecentUi ($script:StatusText.Text.Contains($script:BackfillStageText)) 'recent stage code not localized'
     $script:StatusText.Text = 'newer-status'; $job.Generation = 6L
     $job.LastProgressUiAt = [DateTimeOffset]::Now.AddSeconds(-1); Pump-RecentUi
     Assert-RecentUi ($script:StatusText.Text -eq 'newer-status') 'stale job progress rewrote newer UI'
@@ -227,4 +236,90 @@ Assert-RecentUi ([object]::ReferenceEquals($coverage, $script:State.HistoryCover
     $script:HistoryCoverageText.Text.Contains('24')) 'successful preparation omitted scoped coverage label'
 Set-TokenRaderHistoryCoverage ([pscustomobject]@{ HistoryComplete = $true; RecentHistoryComplete = $true; CoverageStart = $null })
 Assert-RecentUi (-not $script:HistoryCoverageText.Text.Contains('24')) 'complete historical coverage was downgraded to recent-only'
+
+# Fault injection around the production completion callback. A completed
+# worker is no longer polled, so neither timeout nor a second failure callback
+# can rescue an early-cleared request stranded in Starting.
+$script:FaultStage = ''
+$script:HandoffRequestSeen = 0L
+$script:AuxiliaryCalls = 0
+function Set-TokenRaderUiState {
+    param($NewState, $StatusMessage = '')
+    $script:HandoffRequestSeen = [Int64]$script:State.BaselineRequestId
+    if ($script:FaultStage -in @('State','All')) { throw 'synthetic-State-original-cause' }
+    if ($script:FaultStage -eq 'Reentrant') {
+        $script:State.MeasurementGeneration = 8L
+        $script:State.BaselineRequestId = 99L
+        $script:State.IntervalBaseline = $script:NewerBaseline
+        $script:State.UiState = 'Starting'; $script:State.IsMeasuring = $false
+        return
+    }
+    $script:State.UiState = $NewState
+    $script:State.IsMeasuring = $NewState -eq 'Measuring'
+    if ($StatusMessage) { $script:StatusText.Text = $StatusMessage }
+}
+function Set-TokenRaderHistoryCoverage {
+    param($Coverage); $script:AuxiliaryCalls++
+    if ($script:FaultStage -in @('Coverage','All')) { throw 'synthetic-Coverage-original-cause' }
+}
+function Merge-LatestRateLimits {
+    param($Candidate); $script:AuxiliaryCalls++
+    if ($script:FaultStage -in @('Merge','All')) { throw 'synthetic-Merge-original-cause' }
+}
+function Retain-TokenRaderQuotaEstimatesForCurrentWindow {
+    param($RateLimits, $AccountIdentity); $script:AuxiliaryCalls++
+    if ($script:FaultStage -in @('Retain','All')) { throw 'synthetic-Retain-original-cause' }
+}
+function Show-EmptyIntervalMeasurement {
+    param($Baseline); $script:AuxiliaryCalls++
+    if ($script:FaultStage -in @('Empty','All')) { throw 'synthetic-Empty-original-cause' }
+    $script:EmptyCalls++
+}
+$frozenBaseline = [pscustomobject]@{
+    StartedAt = [DateTimeOffset]'2026-10-01T01:02:03Z'
+    StartOffsets = @{ synthetic = 123L }; StartRateLimits = $null
+    HistoryCoverage = [pscustomobject]@{ RecentHistoryComplete = $true }
+}
+foreach ($fault in @('State','Coverage','Merge','Retain','Empty','All')) {
+    New-RecentUiState
+    $script:State.UiState = 'Starting'; $script:State.BaselineRequestId = 21L
+    $script:State.LastFailureInfo = ''; $script:FaultStage = $fault
+    $script:AuxiliaryCalls = 0
+    $retainedQuota = $script:State.QuotaEstimates
+    Complete-TokenRaderMeasurementBaseline $frozenBaseline 7L 21L
+    Assert-RecentUi ($script:State.UiState -eq 'Measuring' -and $script:State.IsMeasuring -and
+        $script:State.BaselineRequestId -eq 0L -and $script:HandoffRequestSeen -eq 21L) ($fault+' display fault stranded Starting or cleared ownership before handoff')
+    Assert-RecentUi ([object]::ReferenceEquals($frozenBaseline,$script:State.IntervalBaseline) -and
+        $script:State.IntervalBaseline.StartedAt -eq [DateTimeOffset]'2026-10-01T01:02:03Z' -and
+        $script:State.IntervalBaseline.StartOffsets.synthetic -eq 123L -and
+        [object]::ReferenceEquals($retainedQuota,$script:State.QuotaEstimates)) ($fault+' fault recaptured boundary or cleared valid quota')
+    Assert-RecentUi ($script:AuxiliaryCalls -eq 4) ($fault+' fault prevented independent auxiliary steps')
+    $expectedFaults = if ($fault -eq 'All') { @('State','Coverage','Merge','Retain','Empty') } else { @($fault) }
+    foreach ($expected in $expectedFaults) {
+        $cause = 'synthetic-'+$expected+'-original-cause'
+        Assert-RecentUi ($script:State.IntervalLastError.Contains($cause) -and
+            $script:State.LastFailureInfo.Contains($cause)) ($expected+' original exception was lost from retry/copy diagnostics')
+    }
+    $failureInfo = $script:State.LastFailureInfo
+    $calls = $script:AuxiliaryCalls
+    Complete-TokenRaderMeasurementBaseline $newBaseline 6L 21L
+    Complete-TokenRaderMeasurementBaseline $newBaseline 7L 22L
+    Fail-TokenRaderMeasurementBaselineJob 'synthetic late failure' 7L 21L 'MeasurementBaseline' @{}
+    Assert-RecentUi ($script:State.UiState -eq 'Measuring' -and $script:AuxiliaryCalls -eq $calls -and
+        [object]::ReferenceEquals($frozenBaseline,$script:State.IntervalBaseline) -and
+        $script:State.LastFailureInfo -eq $failureInfo) ($fault+' stale completion/failure affected active measurement')
+    $script:FaultStage = ''
+    Show-EmptyIntervalMeasurement $script:State.IntervalBaseline
+    Set-TokenRaderUiState -NewState 'Measuring' -StatusMessage 'synthetic successful redraw'
+    Assert-RecentUi ($script:State.IsMeasuring -and $script:State.LastFailureInfo -eq $failureInfo) ($fault+' redraw retry stopped measurement or erased latest failure')
+}
+New-RecentUiState
+$script:State.UiState = 'Starting'; $script:State.BaselineRequestId = 21L
+$script:NewerBaseline = [pscustomobject]@{ Marker = 'newer-request' }
+$script:FaultStage = 'Reentrant'; $script:AuxiliaryCalls = 0
+Complete-TokenRaderMeasurementBaseline $frozenBaseline 7L 21L
+Assert-RecentUi ($script:State.MeasurementGeneration -eq 8L -and $script:State.BaselineRequestId -eq 99L -and
+    $script:State.UiState -eq 'Starting' -and $script:AuxiliaryCalls -eq 0 -and
+    [object]::ReferenceEquals($script:NewerBaseline,$script:State.IntervalBaseline)) 'old handoff cleared or rendered a newer preparation'
+$script:FaultStage = ''
 Write-Host ('RECENT_HISTORY_UI_TESTS_PASSED edition={0} version={1}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion)

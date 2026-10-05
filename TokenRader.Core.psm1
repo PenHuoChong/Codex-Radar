@@ -4392,7 +4392,7 @@ function Complete-TokenRaderRecentHistory {
     $index = Open-TokenRaderIndex -SessionsRoot $SessionsRoot
     $at = [DateTimeOffset]::UtcNow
     if ($null -ne $ProgressState) {
-        $ProgressState.Stage = '冻结最近24小时补齐边界'
+        $ProgressState.Stage = '核对最近24小时已有进度'
         $ProgressState.LastProgressAt = $at
     }
     $lease = [TokenRaderIndexer]::AcquireFileLock(([string]$index.DbPath + '.lock'), 10000)
@@ -4448,7 +4448,7 @@ function Complete-TokenRaderRecentHistory {
     $index.LastFullReconcile = $index.LastSync
     $index.SyncComplete = $true
     if ($null -ne $ProgressState) {
-        $ProgressState.Stage = '最近24小时已补齐，冻结测量起点'
+        $ProgressState.Stage = if ($processedBytes -eq 0) { '复用已补齐日志，冻结测量起点' } else { '最近24小时已补齐，冻结测量起点' }
         $ProgressState.ProcessedBytes = $processedBytes
         $ProgressState.HistoryProcessedBytes = $processedBytes
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
@@ -4458,6 +4458,8 @@ function Complete-TokenRaderRecentHistory {
         SessionsRoot = [string]$index.SessionsRoot
         Cutoff = $result.Cutoff
         FrozenAt = $result.FrozenAt
+        ProcessedBytes = $processedBytes
+        HistoryReused = ($processedBytes -eq 0)
         EndOffsets = ConvertTo-TokenRaderOffsetMap -Value $result.EndOffsets
         IndexRevision = [long]$result.IndexRevision
     }
