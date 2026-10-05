@@ -24,12 +24,21 @@ jobs:
           (Get-Culture).Name
           [Environment]::OSVersion.VersionString
       - name: Build launcher and indexer
+        id: build
         shell: powershell
         run: .\Build.ps1
+      - name: Verify indexing failure regressions
+        shell: powershell
+        run: |
+          .\tests\Run-IncrementalOversizedTests.ps1
+          .\tests\Run-BoundaryFailureDiagnosticsTests.ps1
+          .\tests\Run-IndexerLoadDiagnosticsTests.ps1
       - name: Run regression tests on Windows PowerShell 5.1
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: powershell
         run: powershell.exe -NoProfile -STA -File .\tests\Run-Tests.ps1
       - name: Run regression tests on PowerShell 7
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: pwsh
         run: pwsh -NoProfile -STA -File .\tests\Run-Tests.ps1
       - name: Verify UI callbacks on Windows PowerShell 5.1

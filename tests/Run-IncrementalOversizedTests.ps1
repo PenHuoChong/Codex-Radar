@@ -8,6 +8,8 @@ Add-Type -Path (Join-Path $root 'indexer\System.Data.SQLite.dll')
 Add-Type -Path $IndexerDll
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('TokenRader-IncrementalOversizedSynthetic-'+[guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($temp)
+# Match the indexer's canonical paths when CI TEMP contains an 8.3 alias.
+$temp=[IO.Path]::GetFullPath((Get-Item -LiteralPath $temp).FullName)
 $utf8=[Text.UTF8Encoding]::new($false)
 $none=[Threading.CancellationToken]::None
 $db=$null

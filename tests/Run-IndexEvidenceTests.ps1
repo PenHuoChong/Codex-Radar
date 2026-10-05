@@ -151,6 +151,10 @@ if ($null -eq ('System.Data.SQLite.SQLiteConnection' -as [type])) { Add-Type -Pa
 
 $tempRoot = Join-Path $env:TEMP ('token-rader-index-evidence-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
+# Windows PowerShell/.NET Framework can expand a CI TEMP 8.3 alias such as
+# RUNNER~1 during the indexer's Path.GetFullPath. Use that same canonical root
+# for fixture imports and exact SQLite path comparisons.
+$tempRoot = [IO.Path]::GetFullPath((Get-Item -LiteralPath $tempRoot).FullName)
 try {
     if ($null -eq ('TokenRaderIndexer' -as [type])) {
         Add-Type -Path (Join-Path $projectRoot 'indexer\TokenRader.Indexer.dll')
@@ -195,7 +199,9 @@ try {
         $contextEnd = [IO.FileInfo]::new($restartPath).Length
         [void][TokenRaderIndexer]::ImportFile($db, $restartPath, $firstLength, $contextEnd, $restartId, '', 2L)
         $contextMetadata = Get-IndexEvidenceRows $db 'SELECT turn_context_model,turn_context_model_source,turn_context_service_tier FROM file_metadata WHERE path=@path' @{ '@path' = $restartPath }
-        Assert-IndexEvidence ($contextMetadata.Rows.Count -eq 1 -and [string]$contextMetadata.Rows[0]['turn_context_model'] -eq 'gpt-5.6-luna' -and [string]$contextMetadata.Rows[0]['turn_context_service_tier'] -eq '') 'context-only append did not persist model or clear tier'
+        Assert-IndexEvidence ($contextMetadata.Rows.Count -eq 1) 'context-only append metadata row was not found at its canonical source path'
+        Assert-IndexEvidence ([string]$contextMetadata.Rows[0]['turn_context_model'] -eq 'gpt-5.6-luna' -and [string]$contextMetadata.Rows[0]['turn_context_model_source'] -eq 'turn_context') 'context-only append did not persist its explicit model'
+        Assert-IndexEvidence ([string]$contextMetadata.Rows[0]['turn_context_service_tier'] -eq '') 'context-only append did not clear tier'
         Append-IndexEvidenceJsonl $restartPath @(
             (New-IndexEvidenceTurn '2026-09-08T01:00:03Z' 'gpt-5.6-luna' 'priority' 'ultra' 'restart-three'),
             (New-IndexEvidenceToken '2026-09-08T01:00:04Z' 200 100 'restart-r2')

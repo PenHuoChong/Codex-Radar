@@ -31,6 +31,8 @@ $context = '{"timestamp":"2026-10-05T00:00:30Z","type":"turn_context","payload":
 $token = '{"timestamp":"2026-10-05T00:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":1},"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":1}}}}'
 try {
     [void][IO.Directory]::CreateDirectory($temp)
+    # Match the indexer's canonical paths when CI TEMP contains an 8.3 alias.
+    $temp = [IO.Path]::GetFullPath((Get-Item -LiteralPath $temp).FullName)
     # Background synchronization uses ordinary Update, not the measurement
     # boundary helper. A late top-level type must still get whole-line proof.
     $sessions = Join-Path $temp 'pure-text-four-files'
