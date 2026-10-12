@@ -53,12 +53,12 @@ Token Rader 在本机解析这些日志，不要求 API Key，也不会上传提
 | 操作系统 | Windows 10/11；GitHub Actions 使用 `windows-latest` |
 | PowerShell | Windows PowerShell 5.1，或 Windows 版 PowerShell 7 |
 | 图形框架 | WPF（`PresentationFramework`、`PresentationCore`、`WindowsBase`） |
-| 构建启动器 | Windows 自带的 .NET Framework C# 编译器；只有重新构建 EXE 时需要 |
+| 构建索引器 | Windows 自带的 .NET Framework C# 编译器；只有重新构建索引器 DLL 时需要 |
 | Git | 仅克隆仓库时需要 |
 | Python/Node.js | 运行程序不需要；开发者完整回归中的跨项目对照测试需要 Node.js 22+ |
 | OpenAI API Key | 不需要 |
 
-启动器优先使用 PATH 中的 `powershell.exe`，不可用时尝试 `pwsh.exe`。Codex 数据目录优先读取环境变量 `CODEX_HOME`，否则使用当前用户的 `~/.codex`。
+唯一日常入口固定使用 Windows 自带的 Windows PowerShell，不搜索 PATH 或回退到其他宿主。Codex 数据目录优先读取环境变量 `CODEX_HOME`，否则使用当前用户的 `~/.codex`。
 
 ### 硬件环境
 
@@ -76,27 +76,20 @@ Token Rader 在本机解析这些日志，不要求 API Key，也不会上传提
 ```powershell
 git clone https://github.com/lmy1390734971-netizen/Codex-Limit-USD-Radar.git
 Set-Location .\Codex-Limit-USD-Radar
-powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Run-Tests.ps1
-powershell.exe -NoProfile -STA -File .\TokenRader.ps1
+.\Start-TokenRader.cmd
 ```
 
 本项目没有 `requirements.txt`，不需要执行 `pip install`。
 
 ### 直接运行
 
-也可以下载完整项目目录，然后使用任一方式启动：
+下载完整项目目录后，只需双击 **`Start-TokenRader.cmd`**。旧 EXE 启动器已移除；`TokenRader.ps1` 是程序内部主脚本，不是另一个日常启动入口。
 
-1. 双击 `Start-TokenRader.cmd`（推荐的标准脚本入口，不依赖自制 EXE）；
-2. 在系统允许该程序运行的环境下，双击 `TokenRader.exe`；
-3. 在项目目录运行：
+CMD 先调用内部 `launcher/Start-TokenRader.ps1` 引导脚本，再以 `UseShellExecute=false`、`CreateNoWindow=true` 启动无控制台的 STA 仪表盘进程；引导脚本立即退出。只用 Windows 自带 PowerShell。这与仅设置 `-WindowStyle Hidden` 不同：后者可能仍附着 Windows Terminal 的伪控制台。启动批处理时仍可能短暂闪现窗口；已打开的终端或配置为退出后保留标签页的终端不会被程序强行关闭。蓝色 PowerShell 图标可能是 WPF 仪表盘本身，不代表另有控制台。
 
-```powershell
-powershell.exe -NoProfile -STA -File .\TokenRader.ps1
-```
+入口不设置执行策略、不请求提权、不自动切换宿主或解除文件阻止。若引导脚本被本机策略阻止，会停止，不尝试其他宿主。
 
-日常使用建议双击 `Start-TokenRader.cmd`。它通过 Windows 自带 PowerShell 的 `-File -STA -WindowStyle Hidden` 参数启动同目录脚本后立即退出，不经过 `TokenRader.exe`，不保留 CMD/PowerShell 控制台窗口；启动批处理时仍可能短暂闪现控制台。入口不设置执行策略、不请求提权、不自动切换宿主或解除文件阻止。直接运行上面的 PowerShell 命令保留终端，适用于查看调试错误，不会隐藏你已有的终端窗口。
-
-仓库中的启动器没有受信任的代码签名。SmartScreen 提示与 Smart App Control / 应用控制策略拦截不是同一机制：重新编译不能保证解除拦截。标准脚本入口也必须通过本机对脚本、模块和 DLL 的策略检查，不能保证在所有受控机器上运行。若被阻止或处于受限语言模式，请停止，不关闭安全防护、不添加绕过参数；使用符合本机策略的可信签名发行版，或由设备管理员按组织流程处理。隐藏窗口本身不改变信任判断。
+SmartScreen 提示与 Smart App Control / 应用控制策略拦截不是同一机制。标准脚本入口也必须通过本机对脚本、模块和 DLL 的策略检查，不能保证在所有受控机器上运行。若被阻止或处于受限语言模式，请停止，不关闭安全防护、不添加绕过参数；使用符合本机策略的可信签名发行版，或由设备管理员按组织流程处理。隐藏窗口本身不改变信任判断。
 
 可用以下命令验证标准宿主、合成 WPF 窗口、索引器加载及内存数据库；不启动真实仪表盘，不读取账号、日志或真实索引，不改安全策略：
 
@@ -104,7 +97,7 @@ powershell.exe -NoProfile -STA -File .\TokenRader.ps1
 powershell.exe -NoProfile -STA -File .\tests\Test-StandardPowerShellStartup.ps1
 ```
 
-需要验证真实主窗口的打开与正常关闭时，可运行 `tests/Run-StandardStartupIntegrationTests.ps1`。它只复制白名单代码文件和依赖到临时目录，为子进程单独设置空的合成 `CODEX_HOME`；不复制或读取真实日志、账号及项目索引。`tests/Run-LauncherWindowTests.ps1` 默认验证 CMD 标准入口的隐藏控制台和 STA；EXE 仅检查文件结构，实际 EXE 启动测试须显式指定 `-IncludeExe`，仅用于系统允许该 EXE 的环境，不把未测 EXE 宣称为通过。
+需要验证真实主窗口的打开与正常关闭时，可运行 `tests/Run-StandardStartupIntegrationTests.ps1`。它只复制白名单代码文件和依赖到临时目录，为子进程单独设置空的合成 `CODEX_HOME`；不复制或读取真实日志、账号及项目索引。`tests/Run-LauncherWindowTests.ps1` 验证唯一 CMD 入口、引导进程退出，以及子进程确实没有关联控制台并运行于 STA，而不只是窗口不可见。
 
 仅需重新构建时（构建不代表系统会信任产物）：
 
@@ -375,13 +368,13 @@ ALL_TESTS_PASSED
 
 模型名称取决于本机最新日志。如果没有日志，`-Live` 检查会明确失败；这不影响普通合成回归测试。
 
-### 5. 重新构建启动器
+### 5. 重新构建索引器
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
 ```
 
-预期生成项目根目录下的 `TokenRader.exe`。
+预期生成 `indexer/TokenRader.Indexer.dll`。启动入口为脚本，不再构建 EXE。
 
 ### 6. 重新生成合成预览图（可选）
 
@@ -613,7 +606,7 @@ Codex-Limit-USD-Radar/
 │  ├─ TokenRader.Indexer.dll        # 预构建增量索引引擎
 │  └─ System.Data.SQLite.dll        # SQLite 提供程序（构建依赖）
 ├─ launcher/
-│  └─ TokenRader.Launcher.cs        # 无控制台启动器源码
+│  └─ Start-TokenRader.ps1          # 内部无控制台引导脚本
 ├─ tests/
 │  ├─ Run-Tests.ps1                 # 回归测试与可选 Live 检查
 │  ├─ Run-FastStartCoreTests.ps1     # 快速启动、历史补齐及覆盖间隙合成回归
@@ -623,14 +616,13 @@ Codex-Limit-USD-Radar/
 │  ├─ fixtures/                    # 离线 TokenTracker 测试辅助代码及 MIT 许可证
 │  ├─ Run-UiCallbackTests.ps1        # 后台回调、超时与取消测试
 │  └─ Render-Preview.ps1             # 合成预览图生成
-├─ Build.ps1                         # 构建 TokenRader.exe
+├─ Build.ps1                         # 构建索引器 DLL
 ├─ LICENSE                           # MIT 许可证
 ├─ MainWindow.xaml                   # WPF 布局与样式
 ├─ pricing.json                      # 模型价格、阈值和官方来源
 ├─ Start-TokenRader.cmd              # 遵循本机策略的隐藏控制台标准脚本入口
 ├─ THIRD_PARTY_NOTICES.md            # 第三方参考与声明
 ├─ TokenRader.Core.psm1              # 日志解析、去重、计价和额度算法
-├─ TokenRader.exe                    # 预构建启动器
 └─ TokenRader.ps1                    # 主界面和交互流程
 ```
 

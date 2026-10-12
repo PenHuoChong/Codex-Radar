@@ -11,13 +11,6 @@ $compilerCandidates = @(
 $compiler = $compilerCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if ($null -eq $compiler) { throw 'The .NET Framework C# compiler was not found.' }
 
-# Build the launcher (no-console EXE host)
-$launcherSource = Join-Path $PSScriptRoot 'launcher\TokenRader.Launcher.cs'
-$launcherOutput = Join-Path $PSScriptRoot 'TokenRader.exe'
-& $compiler /nologo /target:winexe /optimize+ /reference:System.Windows.Forms.dll /out:$launcherOutput $launcherSource
-if ($LASTEXITCODE -ne 0) { throw "Launcher build failed with exit code $LASTEXITCODE" }
-Write-Output "Built $launcherOutput"
-
 # Build the JSONL indexer library (used by TokenRader.Core.psm1)
 $indexerSource = Join-Path $PSScriptRoot 'indexer\TokenRader.Indexer.cs'
 $repairSource = Join-Path $PSScriptRoot 'indexer\TokenRader.SingleSourceRepair.cs'

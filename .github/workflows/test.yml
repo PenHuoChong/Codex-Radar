@@ -23,7 +23,7 @@ jobs:
           $PSVersionTable.PSVersion.ToString()
           (Get-Culture).Name
           [Environment]::OSVersion.VersionString
-      - name: Build launcher and indexer
+      - name: Build indexer
         id: build
         shell: powershell
         run: .\Build.ps1
