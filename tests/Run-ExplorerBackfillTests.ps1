@@ -9,7 +9,20 @@ $temp=Join-Path ([IO.Path]::GetTempPath()) ('radar-explorer-'+[Guid]::NewGuid().
 function Assert-Backfill([bool]$Ok,[string]$Message) { if (-not $Ok) { throw $Message } }
 try {
     $sessions=Join-Path $temp 'sessions'; [void][IO.Directory]::CreateDirectory($sessions)
-    $paths=[pscustomobject]@{MainIndexPath=(Join-Path $temp 'main.db');ExplorerIndexPath=(Join-Path $temp 'explorer/index.db');SessionsRoot=$sessions;PricingPath=(Join-Path $root 'pricing.json')}
+    $syntheticPricing=[ordered]@{
+        unitTokens=1000000; verifiedAt='synthetic'; priceType='Application subscription USD reference (not billing)'
+        models=@([ordered]@{id='gpt-6-astra';displayName='GPT-6 Astra synthetic';aliases=@();input=10.0;cachedInput=1.0;output=50.0})
+        subscriptionPricing=[ordered]@{
+            verifiedAt='synthetic'; pricingSource='synthetic'; source='synthetic'
+            referenceBasis='subscription_reference_v1'
+            referenceModels=[ordered]@{'gpt-6-astra'=[ordered]@{input=10.0;cachedInput=1.0;output=50.0;verifiedAt='synthetic';basis='synthetic_application_reference'}}
+            fastMultipliers=[ordered]@{'gpt-6-astra'=2.5}
+            ultrafastMultipliers=[ordered]@{'gpt-6-astra'=8.0}
+        }
+    }
+    $pricingPath=Join-Path $temp 'pricing.json'
+    [IO.File]::WriteAllText($pricingPath,($syntheticPricing|ConvertTo-Json -Depth 12 -Compress),[Text.UTF8Encoding]::new($false))
+    $paths=[pscustomobject]@{MainIndexPath=(Join-Path $temp 'main.db');ExplorerIndexPath=(Join-Path $temp 'explorer/index.db');SessionsRoot=$sessions;PricingPath=$pricingPath}
     $sid='11111111-1111-1111-1111-111111111111'
     $path=Join-Path $sessions ('rollout-'+$sid+'.jsonl')
     $meta=@{type='session_meta';timestamp='2026-01-01T00:00:00Z';payload=@{id=$sid;cwd=(Join-Path $temp 'project')}}

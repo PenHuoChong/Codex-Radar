@@ -14,8 +14,8 @@ Assert ($null-ne$price) 'exact new model resolved'
 Near 2 $price.input 'standard input';Near 0.10 $price.cachedInput 'standard cache';Near 2.5 $price.cacheWrite 'standard cache write';Near 10 $price.output 'standard output'
 Near 0.05 ($price.cachedInput/$price.input) 'cached rate is exactly five percent'
 Assert ($price.verifiedAt-eq'2026-10-06') 'new model has its own verification date'
-Assert ($prices.verifiedAt-eq'2026-09-24'-and$prices.subscriptionPricing.verifiedAt-eq'2026-09-26') 'new model verification does not claim full-table revalidation'
-Assert ($prices.subscriptionPricing.modelVerification.'gpt-6.1-sol'.verifiedAt-eq'2026-10-06') 'new subscription multiplier source dated independently'
+Assert ($prices.verifiedAt-eq'2026-09-24'-and$prices.subscriptionPricing.verifiedAt-eq'2026-10-13') 'new model verification does not claim full-table revalidation'
+Assert ($prices.subscriptionPricing.modelVerification.'gpt-6.1-sol'.verifiedAt-eq'2026-10-13') 'new subscription multiplier source dated independently'
 Near 2.5 $prices.subscriptionPricing.fastMultipliers.'gpt-6.1-sol' 'included subscription Fast factor'
 $usage=Usage 200000 100000 10000
 $standard=Get-TokenRaderCost -Usage $usage -Model 'gpt-6.1-sol' -PricingDocument $prices -Scope call -ServiceTier default -CacheCreationTokens 25000 -CacheWriteObservable $true

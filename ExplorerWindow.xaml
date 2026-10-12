@@ -44,11 +44,11 @@
             <DataGridTextColumn Header="未缓存输入" Binding="{Binding Uncached}" Width="95"/>
             <DataGridTextColumn Header="输出" Binding="{Binding Output}" Width="85"/>
             <DataGridTextColumn Header="总 Token" Binding="{Binding Total}" Width="95"/>
-            <DataGridTextColumn Header="美元" Binding="{Binding Cost}" Width="85"/>
+            <DataGridTextColumn Header="套餐折算美元参考" Binding="{Binding Cost}" Width="145"/>
           </DataGrid.Columns>
         </DataGrid>
       </Grid>
     </Grid>
-    <TextBlock x:Name="Status" Grid.Row="3" Margin="0,12,0,0" TextWrapping="Wrap" Text="仅使用本机可观察 Token；美元为 API 等价成本。"/>
+    <TextBlock x:Name="Status" Grid.Row="3" Margin="0,12,0,0" TextWrapping="Wrap" Text="仅使用本机可观察 Token；套餐折算美元是本应用参考，非官方订阅单价或账单，不含缓存写入溢价。"/>
   </Grid>
 </Window>

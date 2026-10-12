@@ -16,7 +16,7 @@ Import-Module (Join-Path $PSScriptRoot 'TokenRader.Core.psm1') -Force
 . (Join-Path $PSScriptRoot 'TokenRader.Explorer.UI.ps1')
 
 $script:Paths = Get-TokenRaderPaths -ProjectRoot $PSScriptRoot
-$script:Prices = Get-TokenRaderPrices -PricingPath $script:Paths.PricingPath
+$script:Prices = Get-TokenRaderPrices -PricingPath $script:Paths.PricingPath -SubscriptionReference
 $script:State = @{
     Refreshing = $false
     CurrentPriceUrl = ''
@@ -111,12 +111,11 @@ $script:IntervalComputeScript = {
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
     try {
-    $prices = Get-TokenRaderPrices -PricingPath $PricingPath
+    $prices = Get-TokenRaderPrices -PricingPath $PricingPath -SubscriptionReference
     $prices | Add-Member -NotePropertyName ManualServiceTiers -NotePropertyValue $ManualServiceTiers -Force
     $prices | Add-Member -NotePropertyName QuotaPlanSelection -NotePropertyValue $QuotaPlanSelection -Force
-    # Opt in from this UI generation only. An already-running old window
-    # may load the updated core in a worker, but must retain its API basis.
-    $prices | Add-Member -NotePropertyName QuotaPricingBasis -NotePropertyValue 'plan_standard_api_reference' -Force
+    # This UI generation explicitly opts all dollar surfaces into the same
+    # subscription reference. Older windows retain their original API basis.
     if ($null -ne $ProgressState) {
         $ProgressState.Stage = '同步增量日志'
         $ProgressState.LastProgressAt = [DateTimeOffset]::Now
@@ -171,7 +170,7 @@ $script:MeasurementBaselineScript = {
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
     try {
-    $prices = Get-TokenRaderPrices -PricingPath $PricingPath
+    $prices = Get-TokenRaderPrices -PricingPath $PricingPath -SubscriptionReference
     [void](Get-Command -Name CaptureMeasurementBaseline -ErrorAction Stop)
     $CancellationToken.ThrowIfCancellationRequested()
     if ($null -ne $ProgressState) {
@@ -322,7 +321,7 @@ $script:UsageHistoryScript = {
     $ErrorActionPreference = 'Stop'
     Import-Module $ModulePath -Force
     try {
-        $prices = Get-TokenRaderPrices -PricingPath $PricingPath
+        $prices = Get-TokenRaderPrices -PricingPath $PricingPath -SubscriptionReference
         Get-TokenRaderUsageHistoryWindow `
             -SessionsRoot $SessionsRoot `
             -PricingDocument $prices `
@@ -3270,7 +3269,7 @@ function Show-IntervalResult {
 
     Set-ResultPricing -Result $Result
     $script:FormulaText.Text = '时间段始终统计全部项目和全部 Codex 会话，不受项目下拉框影响；区间内同一任务树的复制记录只计算一次。'
-    $script:CaveatText.Text = ('项目选择已忽略。已检查 {0:N0} 条记录，计入 {1:N0} 次唯一调用；去除共享重复 {2:N0} 条、基线前继承 {3:N0} 条。每次调用按当时模型分别计价，仍是 API 等价估算，不是套餐实际账单。' -f
+    $script:CaveatText.Text = ('项目选择已忽略。已检查 {0:N0} 条记录，计入 {1:N0} 次唯一调用；去除共享重复 {2:N0} 条、基线前继承 {3:N0} 条。每次调用按当时模型及模式计算套餐折算美元参考；非官方美元单价或账单，不含缓存写入溢价。' -f
         [Int64]$Result.RawEvents,
         [Int64]$Result.CountedEvents,
         [Int64]$Result.DuplicateEventsDropped,
@@ -4030,7 +4029,7 @@ function Update-ProjectView {
     Set-ResultPricing -Result $Result
 
     $script:FormulaText.Text = '项目累计 = cwd 与所选目录一致的全部本地会话；逐调用汇总，并在同一任务树内去除复制记录。'
-    $script:CaveatText.Text = ('共扫描 {0:N0} 条 Token 记录，计入 {1:N0} 条唯一记录，去除任务树重复 {2:N0} 条；覆盖 {3:N0} 个有用量的日志。金额为官方 API 等价估算，不是 Codex 套餐实际账单。' -f
+    $script:CaveatText.Text = ('共扫描 {0:N0} 条 Token 记录，计入 {1:N0} 条唯一记录，去除任务树重复 {2:N0} 条；覆盖 {3:N0} 个有用量的日志。金额为套餐折算美元参考，非官方美元单价或 Codex 套餐实际账单，不含缓存写入溢价。' -f
         [Int64]$result.RawEvents,
         [Int64]$result.CountedEvents,
         [Int64]$result.DuplicateEventsDropped,
@@ -4244,7 +4243,7 @@ function Set-MeasurementPricingConfirmation {
     $clean = @{}
     foreach ($model in $Selections.Keys) {
         $tier = ConvertTo-TokenRaderServiceTier ([string]$Selections[$model])
-        if ($tier -notin @('default', 'priority')) { continue }
+        if ($tier -notin @('default', 'priority', 'ultrafast')) { continue }
         $basePrice = Resolve-TokenRaderPrice -Model ([string]$model) -PricingDocument $script:Prices
         if ($null -eq $basePrice) { continue }
         if ($null -eq (Resolve-TokenRaderServiceTierPrice -Price $basePrice -ServiceTier $tier)) { return $false }
@@ -4294,7 +4293,7 @@ function Show-MeasurementPricingDialog {
     $panel.Margin = '16'
     $dialog.Content = $panel
     $note = New-Object Windows.Controls.TextBlock
-    $note.Text = '按你的设置，各模型默认确认为普通模式，需要时可分别改为 Fast。设置仅补足本次测量及额度校准区间中的缺失模式；明确的日志模式优先。不修改日志或周期历史。开始新测量后恢复全部普通模式。'
+    $note.Text = '各模型默认确认为普通模式；可改为支持的 Fast（2.5×，GPT-5.4 为 2×）或 Ultrafast（8×，仅 GPT-6 Astra / GPT-6.1 Sol）。套餐折算参考单价已包含模式倍率，不再叠加 API 快速倍率，采用平坦参考费率，不按上下文加价。Ultrafast 不是推理强度 ultra。仅补足本次测量及校准的缺失模式，明确日志模式优先；不修改日志或周期历史，新测量恢复普通模式。'
     $note.TextWrapping = 'Wrap'
     $note.Margin = '0,0,0,14'
     [Windows.Controls.DockPanel]::SetDock($note, 'Top')
@@ -4334,8 +4333,8 @@ function Show-MeasurementPricingDialog {
         [void]$row.Children.Add($label)
         $combo = New-Object Windows.Controls.ComboBox
         $combo.Width = 240
-        foreach ($choice in @(@('', '未确认（普通价参考）'), @('default', '确认普通模式'), @('priority', '确认 Fast 模式'))) {
-            if ($choice[0] -eq 'priority' -and $null -eq (Resolve-TokenRaderServiceTierPrice -Price $price -ServiceTier 'priority')) { continue }
+        foreach ($choice in @(@('', '未确认（普通价参考）'), @('default', '确认普通模式'), @('priority', '确认 Fast 模式'), @('ultrafast', '确认 Ultrafast 模式（8×）'))) {
+            if ($choice[0] -in @('priority', 'ultrafast') -and $null -eq (Resolve-TokenRaderServiceTierPrice -Price $price -ServiceTier ([string]$choice[0]))) { continue }
             $item = New-Object Windows.Controls.ComboBoxItem
             $item.Tag = $choice[0]
             $item.Content = $choice[1]
@@ -4364,6 +4363,7 @@ function Get-ServiceTierLabel {
     param([string]$ServiceTier = '')
     switch (ConvertTo-TokenRaderServiceTier $ServiceTier) {
         'priority' { return '快速 Fast' }
+        'ultrafast' { return '超快速 Ultrafast' }
         'default' { return '普通' }
         '' { return '模式未知（普通价参考）' }
         default { return $ServiceTier }
@@ -4391,6 +4391,7 @@ function Get-ResultServiceTierSummary {
         }
     }
     if ($manualEvents -gt 0) { $parts += '模式人工确认 {0:N0} 次' -f $manualEvents }
+    $parts += '平坦参考费率（不按上下文加价）'
     return ($parts -join ' · ')
 }
 
@@ -4433,7 +4434,7 @@ function Set-PricingTable {
         }
     }
     $script:PricingDataGrid.ItemsSource = @($rows)
-    $script:PricingVerifiedText.Text = ('USD / 1M tokens · 官方页面核对于 {0}' -f [string]$script:Prices.verifiedAt)
+    $script:PricingVerifiedText.Text = ('美元参考 / 1M tokens · 订阅规则核对于 {0} · 非官方美元单价' -f [string]$script:Prices.verifiedAt)
 }
 
 function Update-UsageView {
@@ -4542,11 +4543,9 @@ function Update-UsageView {
         }
         $taskModels = @($taskResult.Models)
         Set-ResultPricing -Result $taskResult
-        $longCalls = @($taskResult.Items | Where-Object { $_.LongContext })
-        $script:LongContextText.Text = if ($longCalls.Count -gt 0) { ('逐调用长上下文加价：{0} 组' -f $longCalls.Count) } else { '逐调用标准上下文费率' }
-        $script:LongContextText.Text += ' · ' + (Get-ResultServiceTierSummary -Result $taskResult)
+        $script:LongContextText.Text = Get-ResultServiceTierSummary -Result $taskResult
         $script:FormulaText.Text = '整次任务按每次调用的实际模型分别计价，再汇总未缓存输入、缓存输入和输出金额。'
-        $script:CaveatText.Text = '整次任务已逐调用识别模型和 272K 长上下文；金额按日志模式对应的 API 价格折算，不含工具调用、区域处理或 Batch/Flex。日志提供缓存写入 token 时按未缓存输入价的 1.25 倍计入；字段缺失时不猜测。账号切换前的历史日志仍无法仅凭日志可靠归属。'
+        $script:CaveatText.Text = '整次任务逐调用识别模型和模式，金额为套餐折算美元参考，采用本应用平坦参考费率，不按上下文加价。Fast / Ultrafast 倍率已包含，不叠加 API 快速倍率；不含缓存写入溢价、工具调用、区域处理或 Batch/Flex，非官方美元单价或账单。账号切换前的历史仍无法仅凭日志可靠归属。'
         $script:StatusText.Text = ('已读取 {0:N0} 次唯一调用 · {1} · 本地处理完成' -f $taskResult.CountedEvents, $scopeLabel)
         Update-QuotaCards
         return
@@ -4559,7 +4558,7 @@ function Update-UsageView {
         -CacheWriteObservable $(if ($null -ne $snapshot.PSObject.Properties['CacheWriteObservable']) { [bool]$snapshot.CacheWriteObservable } else { $false }) -ServiceTier ([string]$snapshot.ServiceTier)
     if (-not $cost.Known) {
         $script:UsdCostText.Text = '无法估算'
-        $script:CostBreakdownText.Text = '该模型或服务模式没有匹配到公开 API 价格'
+        $script:CostBreakdownText.Text = '该模型或服务模式没有匹配到套餐折算参考价格'
         if ($cost.PricingReason -eq 'missing_request_input') {
             $script:CostBreakdownText.Text = '缺少单次输入证据，无法确定长上下文价格'
         }
@@ -4582,18 +4581,12 @@ function Update-UsageView {
         $script:OutputPriceText.Text = ('$' + ([double]$price.output).ToString('0.###'))
         $script:State.CurrentPriceUrl = [string]$price.source
         $script:OpenPricingButton.IsEnabled = $true
-        if ($cost.LongContextApplied) {
-            $script:LongContextText.Text = ('长上下文：输入 ×{0:0.#}，输出 ×{1:0.#}' -f $cost.InputMultiplier, $cost.OutputMultiplier)
-        } elseif ($scope -eq 'task') {
-            $script:LongContextText.Text = '标准价汇总（不推断逐调用长上下文）'
-        } else {
-            $script:LongContextText.Text = '标准上下文费率'
-        }
-        $script:FormulaText.Text = '费用 = 未缓存输入 × 输入价 + 缓存输入 × 缓存价 + 输出 × 输出价；输入计数本身已包含缓存输入。'
+        $script:LongContextText.Text = '平坦参考费率（不按上下文加价）'
+        $script:FormulaText.Text = '美元参考 = 未缓存输入 × 参考输入价 + 缓存输入 × 参考缓存价 + 输出 × 参考输出价；模式倍率已包含，输入计数本身已包含缓存输入，不含缓存写入溢价。'
     }
     $script:LongContextText.Text = (Get-ServiceTierLabel ([string]$snapshot.ServiceTier)) + ' · ' + $script:LongContextText.Text
 
-    $script:CaveatText.Text = '最后一次调用使用 last_token_usage；若该次输入超过模型公布的 272K 阈值，会应用官方长上下文倍率。快速/普通模式使用对应 API 价格，估算不包含工具调用、区域处理或 Batch/Flex。日志提供缓存写入 token 时按未缓存输入价的 1.25 倍计入；字段缺失时不猜测。'
+    $script:CaveatText.Text = '最后一次调用使用 last_token_usage，按模型及模式计算套餐折算美元参考，采用本应用平坦参考费率，不按上下文加价。Fast / Ultrafast 倍率已包含，不叠加 API 快速倍率；不含缓存写入溢价、工具调用、区域处理或 Batch/Flex，非官方美元单价或账单。'
     $script:StatusText.Text = ('已读取 {0} · {1} · 本地处理完成' -f $model, $scopeLabel)
     Update-QuotaCards
 }

@@ -1968,6 +1968,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-ServiceTierTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-PlanPricingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-Gpt61SolPricingTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-SubscriptionReferenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-PlanQuotaEvidenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-WeeklyReferenceBoundaryTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaEndpointRefreshTests.ps1')
@@ -2050,7 +2051,7 @@ try {
         throw 'UI CONTRACT FAILED: tool/image usage card or one-time recent backfill action is incomplete'
     }
     $xamlSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'MainWindow.xaml'))
-    if ([regex]::Matches($xamlSource, 'API 等价美元（仅可观察 Token）').Count -lt 2 -or
+    if ([regex]::Matches($xamlSource, '套餐折算美元参考（仅可观察 Token）').Count -lt 2 -or
         [string]$window.FindName('UnpricedUsageText').Text -ne '未单独计价：工具 0 次 · 输入图片 0 张 · 生成图片 0 张') {
         throw 'UI CONTRACT FAILED: observable-token dollars and separately unpriced tool/image usage are not semantically separated'
     }

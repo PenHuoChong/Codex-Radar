@@ -11,7 +11,17 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $dbPath) -Force | Out-Nul
 $pricing = [ordered]@{
     unitTokens = 1000000
     verifiedAt = 'synthetic'
-    models = @([ordered]@{ id='gpt-5.5'; aliases=@(); input=1.0; cachedInput=0.5; output=2.0 })
+    priceType = 'Application subscription USD reference (not billing)'
+    models = @([ordered]@{ id='gpt-5.5'; displayName='GPT-5.5 synthetic'; aliases=@(); input=1.0; cachedInput=0.5; output=2.0 })
+    subscriptionPricing = [ordered]@{
+        verifiedAt = 'synthetic'; pricingSource = 'synthetic'; source = 'synthetic'
+        referenceBasis = 'subscription_reference_v1'
+        referenceModels = [ordered]@{
+            'gpt-5.5' = [ordered]@{ input=1.0; cachedInput=0.5; output=2.0; verifiedAt='synthetic'; basis='synthetic_application_reference' }
+        }
+        fastMultipliers = [ordered]@{ 'gpt-5.5'=2.5 }
+        ultrafastMultipliers = [ordered]@{}
+    }
 }
 [IO.File]::WriteAllText((Join-Path $projectRoot 'pricing.json'), ($pricing | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
 

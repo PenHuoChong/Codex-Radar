@@ -4,9 +4,31 @@
   "verifiedAt": "2026-09-24",
   "priceType": "OpenAI API Standard processing",
   "subscriptionPricing": {
-    "verifiedAt": "2026-09-26",
+    "verifiedAt": "2026-10-13",
     "source": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+    "pricingSource": "https://learn.chatgpt.com/docs/pricing",
     "basis": "standard_api_normalized_reference",
+    "referenceBasis": "subscription_reference_v1",
+    "referenceRatePolicy": "Explicit application USD reference units, not official subscription USD prices or a credit-to-USD conversion. Flat reference rates do not inherit API long-context or cache-write premiums; historical model entries do not establish present subscription availability.",
+    "referenceModels": {
+      "gpt-6-astra": { "input": 10.0, "cachedInput": 1.0, "output": 50.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit" },
+      "gpt-6.1-sol": { "input": 2.0, "cachedInput": 0.1, "output": 10.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit", "longContextPolicy": "user_confirmed_flat_reference" },
+      "gpt-6-sol": { "input": 2.0, "cachedInput": 0.2, "output": 10.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit" },
+      "gpt-6-luna": { "input": 0.1, "cachedInput": 0.01, "output": 0.5, "verifiedAt": "2026-10-13", "basis": "application_reference_unit" },
+      "gpt-5.6-sol": { "input": 4.0, "cachedInput": 0.4, "output": 20.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit" },
+      "gpt-5.6-terra": { "input": 2.0, "cachedInput": 0.2, "output": 12.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit" },
+      "gpt-5.6-luna": { "input": 0.2, "cachedInput": 0.02, "output": 1.2, "verifiedAt": "2026-10-13", "basis": "application_reference_unit" },
+      "gpt-5.6-cyber": { "input": 12.5, "cachedInput": 1.25, "output": 75.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit" },
+      "gpt-5.5": { "input": 5.0, "cachedInput": 0.5, "output": 30.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit" },
+      "gpt-5.4-mini": { "input": 0.75, "cachedInput": 0.075, "output": 4.5, "basis": "historical_application_reference_unit" },
+      "gpt-5.4": { "input": 2.5, "cachedInput": 0.25, "output": 15.0, "basis": "historical_application_reference_unit" },
+      "gpt-5.3-codex": { "input": 1.75, "cachedInput": 0.175, "output": 14.0, "basis": "historical_application_reference_unit" },
+      "gpt-5.2-codex": { "input": 1.75, "cachedInput": 0.175, "output": 14.0, "basis": "historical_application_reference_unit" },
+      "gpt-5.2": { "input": 1.75, "cachedInput": 0.175, "output": 14.0, "basis": "historical_application_reference_unit" },
+      "gpt-5-codex": { "input": 1.25, "cachedInput": 0.125, "output": 10.0, "basis": "historical_application_reference_unit" },
+      "gpt-5-mini": { "input": 0.25, "cachedInput": 0.025, "output": 2.0, "basis": "historical_application_reference_unit" },
+      "gpt-5": { "input": 1.25, "cachedInput": 0.125, "output": 10.0, "basis": "historical_application_reference_unit" }
+    },
     "fastMultipliers": {
       "gpt-6-astra": 2.5,
       "gpt-6.1-sol": 2.5,
@@ -18,11 +40,17 @@
       "gpt-5.5": 2.5,
       "gpt-5.4": 2.0
     },
+    "ultrafastMultipliers": {
+      "gpt-6-astra": 8.0,
+      "gpt-6.1-sol": 8.0
+    },
+    "historicalFastMultipliers": ["gpt-5.4"],
     "modelVerification": {
       "gpt-6.1-sol": {
-        "verifiedAt": "2026-10-06",
+        "verifiedAt": "2026-10-13",
         "source": "https://learn.chatgpt.com/docs/pricing",
-        "fastMultiplierBasis": "included_subscription_usage"
+        "fastMultiplierBasis": "included_subscription_usage",
+        "ultrafastMultiplierBasis": "included_subscription_usage"
       }
     },
     "cacheWritePremium": false,

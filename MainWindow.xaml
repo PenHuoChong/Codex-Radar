@@ -155,7 +155,7 @@
                 </Border>
                 <StackPanel Grid.Column="1" Margin="14,0,0,0" VerticalAlignment="Center">
                     <TextBlock Text="Token Rader" FontSize="23" FontWeight="SemiBold"/>
-                    <TextBlock Text="本地 Codex 会话用量 · API 等价成本" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0"/>
+                    <TextBlock Text="本地 Codex 会话用量 · 套餐折算美元参考" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0"/>
                 </StackPanel>
                 <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
                     <CheckBox x:Name="AutoRefreshCheckBox" Content="每 5 分钟自动刷新" IsChecked="True" Margin="0,0,15,0"/>
@@ -372,12 +372,12 @@
                                 <ColumnDefinition Width="Auto"/>
                             </Grid.ColumnDefinitions>
                             <StackPanel>
-                                <TextBlock Text="API 等价美元（仅可观察 Token）" Foreground="#A8C7C0" FontSize="12"/>
+                                <TextBlock Text="套餐折算美元参考（仅可观察 Token）" Foreground="#A8C7C0" FontSize="12"/>
                                 <TextBlock x:Name="UsdCostText" Text="$0.0000" Foreground="{StaticResource AccentBrush}" FontSize="36" FontWeight="SemiBold" Margin="0,5,0,0"/>
                                 <TextBlock x:Name="CostBreakdownText" Text="未缓存 $0 · 缓存 $0 · 输出 $0" Foreground="#8FA9A5" FontSize="11" Margin="0,4,0,0"/>
                             </StackPanel>
                             <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
-                                <TextBlock x:Name="LongContextText" Text="标准上下文费率" Foreground="#D7E7E3" FontSize="11" Margin="0,5,0,0" HorizontalAlignment="Right"/>
+                                <TextBlock x:Name="LongContextText" Text="平坦参考费率（不按上下文加价）" Foreground="#D7E7E3" FontSize="11" Margin="0,5,0,0" HorizontalAlignment="Right"/>
                             </StackPanel>
                         </Grid>
                     </Border>
@@ -478,7 +478,7 @@
                             </Border>
                             <Border Grid.Column="4" Background="#102C29" BorderBrush="#28554C" BorderThickness="1" CornerRadius="10" Padding="14">
                                 <StackPanel VerticalAlignment="Center">
-                                    <TextBlock Text="API 等价美元（仅可观察 Token）" Foreground="#A8C7C0" FontSize="10"/>
+                                    <TextBlock Text="套餐折算美元参考（仅可观察 Token）" Foreground="#A8C7C0" FontSize="10"/>
                                     <TextBlock x:Name="UsageHistoryUsdText" Text="$0.0000" Foreground="{StaticResource AccentBrush}" FontSize="25" FontWeight="SemiBold" Margin="0,7,0,0"/>
                                     <TextBlock x:Name="UsageHistoryStatusText" Text="等待汇总" Foreground="#7FA39B" FontSize="9" Margin="0,3,0,0"/>
                                     <TextBlock x:Name="UsageHistoryCoverageText" Text="历史覆盖状态等待索引" Foreground="#D7B778" FontSize="9" TextWrapping="Wrap" Margin="0,3,0,0"/>
@@ -491,7 +491,7 @@
                                     <DataGridTextColumn Header="未缓存输入" Binding="{Binding Uncached}" Width="105"/>
                                     <DataGridTextColumn Header="输出" Binding="{Binding Output}" Width="95"/>
                                     <DataGridTextColumn Header="总 Token" Binding="{Binding Total}" Width="105"/>
-                                    <DataGridTextColumn Header="API 等价美元（Token）" Binding="{Binding Cost}" Width="145"/>
+                                    <DataGridTextColumn Header="套餐折算美元参考" Binding="{Binding Cost}" Width="145"/>
                                 </DataGrid.Columns>
                             </DataGrid>
                         </Grid>
@@ -561,10 +561,10 @@
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
                                 <StackPanel>
-                                    <TextBlock Text="当前模型官方 API 标准价" FontSize="16" FontWeight="SemiBold"/>
-                                    <TextBlock x:Name="PricingVerifiedText" Text="USD / 1M tokens" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,3,0,0"/>
+                                    <TextBlock Text="当前模型套餐折算参考单价" FontSize="16" FontWeight="SemiBold"/>
+                                    <TextBlock x:Name="PricingVerifiedText" Text="美元参考 / 1M tokens · 非官方订阅单价" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,3,0,0" TextWrapping="Wrap"/>
                                 </StackPanel>
-                                <Button x:Name="OpenPricingButton" Grid.Column="1" Content="查看官方价格" Padding="10,6" FontSize="11"/>
+                                <Button x:Name="OpenPricingButton" Grid.Column="1" Content="查看订阅规则来源" Padding="10,6" FontSize="11"/>
                             </Grid>
                             <UniformGrid Columns="3" Margin="0,14,0,0">
                                 <Border Background="#101B22" CornerRadius="10" Padding="14" Margin="0,0,6,0">
@@ -586,16 +586,16 @@
                                     </StackPanel>
                                 </Border>
                             </UniformGrid>
-                            <TextBlock x:Name="FormulaText" Text="费用 = 未缓存输入 × 输入价 + 缓存输入 × 缓存价 + 输出 × 输出价"
+                            <TextBlock x:Name="FormulaText" Text="美元参考 = 未缓存输入 × 参考输入价 + 缓存输入 × 参考缓存价 + 输出 × 参考输出价"
                                        Foreground="#8399A2" FontSize="10" Margin="0,13,0,0" TextWrapping="Wrap"/>
                         </StackPanel>
                     </Border>
 
                     <Border Style="{StaticResource CardStyle}" Margin="4,6,4,8" Padding="16">
                         <StackPanel>
-                            <TextBlock Text="内置官方价格表" FontSize="15" FontWeight="SemiBold"/>
-                            <TextBlock Text="标准处理价格；单位均为 USD / 1M tokens。价格可在 pricing.json 更新。"
-                                       Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,3,0,10"/>
+                            <TextBlock Text="套餐折算美元参考价格表" FontSize="15" FontWeight="SemiBold"/>
+                            <TextBlock Text="单位为美元参考 / 1M tokens。模式倍率已包含：支持的 Fast 为 2.5×（GPT-5.4 为 2×），Ultrafast 为 8×；不叠加 API 快速倍率，不含缓存写入溢价，统一采用本应用平坦参考费率。非官方美元单价或账单；参考规则保存在 pricing.json 的 subscriptionPricing 中。"
+                                       Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,3,0,10" TextWrapping="Wrap"/>
                             <DataGrid x:Name="PricingDataGrid" AutoGenerateColumns="False" Height="218" AlternationCount="2">
                                 <DataGrid.Columns>
                                     <DataGridTextColumn Header="模型" Binding="{Binding Model}" Width="*"/>

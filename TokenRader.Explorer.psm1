@@ -157,8 +157,8 @@ function Get-ExplorerSessionSelection {
 function Get-ExplorerPricing {
     param([Parameter(Mandatory)]$Paths)
     $core = Get-ExplorerCore
-    if (Test-Path -LiteralPath $Paths.PricingPath -PathType Leaf) { return Get-TokenRaderPrices -PricingPath $Paths.PricingPath }
-    return [pscustomobject]@{ models = @(); verifiedAt = ''; unitTokens = 1000000 }
+    if (Test-Path -LiteralPath $Paths.PricingPath -PathType Leaf) { return Get-TokenRaderPrices -PricingPath $Paths.PricingPath -SubscriptionReference }
+    return [pscustomobject]@{ models = @(); verifiedAt = ''; unitTokens = 1000000; PricingBasis = 'subscription_reference_v1'; QuotaPricingBasis = 'plan_standard_api_reference' }
 }
 
 function New-ExplorerUsage {

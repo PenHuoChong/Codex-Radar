@@ -87,7 +87,7 @@ function Complete-ExplorerWork {
         $c.Status.Text='项目列表已更新。选择项目或展开后选择对话；全部时间仅覆盖本机保留的日志。'
     } else {
         $partial=if ($Result.PricingComplete) {''} else {'（部分）'}
-        $c.Summary.Text=('总 Token：{0}    API 等价美元：{1}{2}' -f (Format-TokenRaderNumber $Result.Usage.Total),(Format-TokenRaderUsd $Result.TotalCost),$partial)
+        $c.Summary.Text=('总 Token：{0}    套餐折算美元参考：{1}{2}' -f (Format-TokenRaderNumber $Result.Usage.Total),(Format-TokenRaderUsd $Result.TotalCost),$partial)
         $c.Coverage.Text=[string]$Result.CoverageMessage
         if ($null -ne $Result.PSObject.Properties['Coverage'] -and $null -ne $Result.Coverage.PSObject.Properties['BackfillCompletedAt'] -and
             -not [string]::IsNullOrWhiteSpace([string]$Result.Coverage.BackfillCompletedAt)) {
@@ -99,7 +99,7 @@ function Complete-ExplorerWork {
             [pscustomobject]@{Model=([string]$item.Model+' '+$tier);Cached=Format-TokenRaderNumber $item.Usage.Cached;Uncached=Format-TokenRaderNumber $item.Usage.Uncached;Output=Format-TokenRaderNumber $item.Usage.Output;Total=Format-TokenRaderNumber $item.Usage.Total;Cost=Format-TokenRaderUsd $cost}
         })
         $c.Models.ItemsSource=$rows
-        $c.Status.Text='查询完成。模式缺失按普通价；此独立历史查询不使用主测量的临时 Fast 选择。'
+        $c.Status.Text='查询完成。套餐折算美元仅为参考，非官方美元单价或账单，不含缓存写入溢价；模式缺失按普通价，此历史查询不使用主测量的临时 Fast / Ultrafast 选择。'
     }
 }
 
