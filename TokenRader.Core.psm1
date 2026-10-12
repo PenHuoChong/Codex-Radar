@@ -2166,7 +2166,7 @@ function Get-TokenRaderPrices {
             throw 'Subscription reference pricing metadata is missing or unsupported.'
         }
         # Never mutate or inherit API prices: these independently declared
-        # reference units have their own flat-context and cache-write policy.
+        # reference units have their own explicit context and cache-write policy.
         $projectedModels = @()
         foreach ($model in @($document.models)) {
             $canonicalId = ([string]$model.id).ToLowerInvariant()
@@ -2183,6 +2183,24 @@ function Get-TokenRaderPrices {
                     throw "Invalid subscription reference rate: $canonicalId/$name"
                 }
                 $rates[$name] = $rate
+            }
+            $contextThreshold = 0L
+            $contextInputMultiplier = 1.0
+            $contextOutputMultiplier = 1.0
+            $contextPolicy = if ($null -ne $reference.PSObject.Properties['longContextPolicy']) { [string]$reference.longContextPolicy } else { 'flat_reference' }
+            if ($contextPolicy -eq 'user_confirmed_api_style_reference') {
+                foreach ($field in @('longContextThreshold', 'longContextInputMultiplier', 'longContextOutputMultiplier')) {
+                    [double]$value = 0
+                    if ($null -eq $reference.PSObject.Properties[$field] -or
+                        -not [double]::TryParse([string]$reference.$field, [Globalization.NumberStyles]::Float,
+                            [Globalization.CultureInfo]::InvariantCulture, [ref]$value) -or
+                        [double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -le 0) {
+                        throw "Invalid subscription context reference: $canonicalId/$field"
+                    }
+                }
+                $contextThreshold = [Int64]$reference.longContextThreshold
+                $contextInputMultiplier = [double]$reference.longContextInputMultiplier
+                $contextOutputMultiplier = [double]$reference.longContextOutputMultiplier
             }
             $tiers = [ordered]@{}
             foreach ($mode in @(
@@ -2203,8 +2221,9 @@ function Get-TokenRaderPrices {
                 $tiers[[string]$mode.Tier] = [pscustomobject]@{
                     input = $rates.input * $factor; cachedInput = $rates.cachedInput * $factor
                     output = $rates.output * $factor; cacheWrite = $rates.input * $factor
-                    cacheWriteMultiplier = 1.0; longContextThreshold = 0L
-                    longContextInputMultiplier = 1.0; longContextOutputMultiplier = 1.0
+                    cacheWriteMultiplier = 1.0; longContextThreshold = $contextThreshold
+                    longContextInputMultiplier = $contextInputMultiplier; longContextOutputMultiplier = $contextOutputMultiplier
+                    longContextPolicy = $contextPolicy
                     PricingBasis = 'subscription_reference_v1'; referenceModeMultiplier = $factor
                     source = [string]$metadata.source
                 }
@@ -2214,7 +2233,8 @@ function Get-TokenRaderPrices {
                 input = $rates.input; cachedInput = $rates.cachedInput; output = $rates.output
                 cacheWrite = $rates.input; cacheWriteMultiplier = 1.0
                 contextWindow = if ($null -ne $model.PSObject.Properties['contextWindow']) { [Int64]$model.contextWindow } else { 0L }
-                longContextThreshold = 0L; longContextInputMultiplier = 1.0; longContextOutputMultiplier = 1.0
+                longContextThreshold = $contextThreshold; longContextInputMultiplier = $contextInputMultiplier; longContextOutputMultiplier = $contextOutputMultiplier
+                longContextPolicy = $contextPolicy
                 serviceTiers = [pscustomobject]$tiers; PricingBasis = 'subscription_reference_v1'
                 referenceModeMultiplier = 1.0; referenceRateBasis = [string]$reference.basis
                 verifiedAt = if ($null -ne $reference.PSObject.Properties['verifiedAt']) { [string]$reference.verifiedAt } else { '' }
@@ -2291,17 +2311,17 @@ function Resolve-TokenRaderLongContextPricing {
         [Nullable[bool]]$LongContextApplied = $null
     )
     $subscriptionReference = $null -ne $Price.PSObject.Properties['PricingBasis'] -and [string]$Price.PricingBasis -eq 'subscription_reference_v1'
-    $threshold = if ($subscriptionReference) { 0L } elseif ($LongContextThreshold -gt 0) { $LongContextThreshold } elseif ($null -ne $Price.PSObject.Properties['longContextThreshold']) { [Int64]$Price.longContextThreshold } else { 0L }
+    $threshold = if (-not $subscriptionReference -and $LongContextThreshold -gt 0) { $LongContextThreshold } elseif ($null -ne $Price.PSObject.Properties['longContextThreshold']) { [Int64]$Price.longContextThreshold } else { 0L }
     # An indexed API classification is evidence of request size, not authority
     # to introduce an API surcharge into a different pricing basis.
-    $applied = if ($subscriptionReference) { $false } elseif ($null -ne $LongContextApplied) { [bool]$LongContextApplied } else {
+    $applied = if ($subscriptionReference -and $threshold -le 0) { $false } elseif ($null -ne $LongContextApplied) { [bool]$LongContextApplied } else {
         $Scope -eq 'call' -and $threshold -gt 0L -and [Int64]$Usage.Input -gt $threshold
     }
     [pscustomobject]@{
         Applied = $applied
         Threshold = if ($threshold -gt 0L) { $threshold } else { $null }
         ContextWindow = if ($ModelContextWindow -gt 0L) { $ModelContextWindow } else { $null }
-        Source = if ($subscriptionReference) { 'subscription_reference_flat' } elseif ($threshold -gt 0L) { 'pricing_threshold' } else { 'no_threshold' }
+        Source = if ($subscriptionReference) { if ($threshold -gt 0) { 'subscription_reference_assumption' } else { 'subscription_reference_flat' } } elseif ($threshold -gt 0L) { 'pricing_threshold' } else { 'no_threshold' }
         InputMultiplier = if ($applied) { if ($null -ne $Price.PSObject.Properties['longContextInputMultiplier']) { [double]$Price.longContextInputMultiplier } else { 2.0 } } else { 1.0 }
         OutputMultiplier = if ($applied) { if ($null -ne $Price.PSObject.Properties['longContextOutputMultiplier']) { [double]$Price.longContextOutputMultiplier } else { 1.5 } } else { 1.0 }
     }
@@ -3290,7 +3310,7 @@ function Get-TokenRaderIntervalResult {
             ModeAssumptionApplied = $itemAssumption
             ManualServiceTierApplied = $itemAssumption
             ServiceTierSource = [string]$cost.ServiceTierSource
-            LongContext = if ([string]$cost.PricingBasis -eq 'subscription_reference_v1') { $false } else { [bool]$bucket.LongContext }
+            LongContext = if ([string]$cost.PricingBasis -eq 'subscription_reference_v1') { [bool]$cost.LongContextApplied } else { [bool]$bucket.LongContext }
             RequestInputObservable = [bool]$bucket.RequestInputObservable
             LongContextPricingUncertain = [bool]$bucket.LongContextPricingUncertain
             Usage = $bucketUsage
@@ -5531,7 +5551,7 @@ function ConvertFrom-TokenRaderPricedAggregate {
             ModeAssumptionApplied = $itemAssumption
             ManualServiceTierApplied = $itemAssumption
             ServiceTierSource = if ($itemAssumption) { 'manual_confirmation' } elseif ($itemTier -eq '') { [string]$cost.ServiceTierSource } elseif ($null -ne $bucket.PSObject.Properties['ServiceTierSource'] -and -not [string]::IsNullOrWhiteSpace([string]$bucket.ServiceTierSource)) { [string]$bucket.ServiceTierSource } else { [string]$cost.ServiceTierSource }
-            LongContext = if ([string]$cost.PricingBasis -eq 'subscription_reference_v1') { $false } else { [bool]$bucket.LongContext }
+            LongContext = if ([string]$cost.PricingBasis -eq 'subscription_reference_v1') { [bool]$cost.LongContextApplied } else { [bool]$bucket.LongContext }
             RequestInputObservable = if ($null -ne $bucket.PSObject.Properties['RequestInputObservable']) { [bool]$bucket.RequestInputObservable } else { $true }
             LongContextPricingUncertain = if ($null -ne $bucket.PSObject.Properties['LongContextPricingUncertain']) { [bool]$bucket.LongContextPricingUncertain } else { $false }
             Usage = $bucketUsage
@@ -6085,6 +6105,7 @@ function Get-TokenRaderPricingCacheKey {
             $(if ($null -ne $entry.PSObject.Properties['PricingBasis']) { [string]$entry.PricingBasis } else { '' }),
             $(if ($null -ne $entry.PSObject.Properties['contextWindow']) { [string]$entry.contextWindow } else { '' }),
             $(if ($null -ne $entry.PSObject.Properties['longContextThreshold']) { [string]$entry.longContextThreshold } else { '' }),
+            $(if ($null -ne $entry.PSObject.Properties['longContextPolicy']) { [string]$entry.longContextPolicy } else { '' }),
             $(if ($null -ne $entry.PSObject.Properties['longContextInputMultiplier']) { [string]$entry.longContextInputMultiplier } else { '' }),
             $(if ($null -ne $entry.PSObject.Properties['longContextOutputMultiplier']) { [string]$entry.longContextOutputMultiplier } else { '' }),
             $(if ($null -ne $entry.PSObject.Properties['serviceTiers']) { ConvertTo-Json -InputObject $entry.serviceTiers -Depth 8 -Compress } else { '' })
@@ -6323,7 +6344,7 @@ function Get-TokenRaderUsageHistoryWindow {
             $serviceTierSource = if ($serviceTierSourceProvided) { [string]$bucket.ServiceTierSource } else { $null }
             # Keep history on the same per-call/bucket pricing path as the
             # interval and quota views. API documents keep their premiums;
-            # subscription-reference documents retain their independent flat
+            # subscription-reference documents retain their independent
             # context and cache-write policy even for persisted API buckets.
             $costArgs = @{
                 Usage = $bucketUsage; Model = $model; PricingDocument = $historyPricingDocument
@@ -6373,7 +6394,7 @@ function Get-TokenRaderUsageHistoryWindow {
             $modelTotal.Events += [Int64]$bucket.Events
             $modelTotal.CacheCreationTokens += [Int64]$bucket.CacheCreationTokens
             if (-not [bool]$bucket.CacheWriteObservable) { $modelTotal.CacheWriteObservable = $false }
-            if (-not $subscriptionReference -and [bool]$bucket.LongContext) {
+            if ([bool]$cost.LongContextApplied) {
                 $modelTotal.LongContextEvents += [Int64]$bucket.Events
                 $modelTotal.LongContextInput += [Int64]$bucket.Input
                 $modelTotal.LongContextOutput += [Int64]$bucket.Output
@@ -6430,11 +6451,11 @@ function Get-TokenRaderUsageHistoryWindow {
         $snapshot.ProcessedRows = [Int64]$aggregate.ProcessedRows
         $snapshot.CacheCreationTokens = [Int64]$aggregate.CacheCreationTokens
         $snapshot.CacheWriteObservable = [bool]$aggregate.CacheWriteObservable
-        $snapshot.StandardContextEvents = if ($subscriptionReference) { [Int64]$aggregate.CountedEvents } else { [Int64]$aggregate.StandardContextEvents }
-        $snapshot.LongContextEvents = if ($subscriptionReference) { 0L } else { [Int64]$aggregate.LongContextEvents }
-        $snapshot.StandardContextInput = if ($subscriptionReference) { [Int64]$aggregate.TotalInput } else { [Int64]$aggregate.StandardContextInput }
-        $snapshot.LongContextInput = if ($subscriptionReference) { 0L } else { [Int64]$aggregate.LongContextInput }
-        $snapshot.LongContextOutput = if ($subscriptionReference) { 0L } else { [Int64]$aggregate.LongContextOutput }
+        $snapshot.StandardContextEvents = [Int64]$aggregate.StandardContextEvents
+        $snapshot.LongContextEvents = [Int64]$aggregate.LongContextEvents
+        $snapshot.StandardContextInput = [Int64]$aggregate.StandardContextInput
+        $snapshot.LongContextInput = [Int64]$aggregate.LongContextInput
+        $snapshot.LongContextOutput = [Int64]$aggregate.LongContextOutput
         $snapshot.LongContextExtraCost = $longContextExtraCost
         $modelSnapshots = foreach ($modelTotal in @($modelTotals.Values | Sort-Object Model)) {
             $modelSnapshot = New-Object TokenRaderUsageHistoryModelSnapshot
@@ -6559,6 +6580,7 @@ function Remove-TokenRaderUsageHistory {
 }
 
 Export-ModuleMember -Function ConvertTo-TokenRaderServiceTier, Resolve-TokenRaderServiceTierPrice
+Export-ModuleMember -Function Resolve-TokenRaderLongContextPricing
 Export-ModuleMember -Function Get-TokenRaderPlanNormalizedCost
 Export-ModuleMember -Function Initialize-TokenRaderIndexFromNow, Invoke-TokenRaderHistoryBackfillBatch, Get-TokenRaderHistoryCoverage
 Export-ModuleMember -Function Complete-TokenRaderRecentHistory

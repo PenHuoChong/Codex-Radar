@@ -138,14 +138,14 @@ $script:PricingPath = Join-Path $projectRoot 'pricing.json'
 $script:Prices = Get-TokenRaderPrices -PricingPath $script:PricingPath -SubscriptionReference
 $script:PricingDocument = $script:Prices
 
-# Import only the two production functions under test. Parsing the file avoids
+# Import only the production functions under test. Parsing the file avoids
 # running the dashboard launcher or reading any local logs or private data.
 $mainWindowPath = Join-Path $projectRoot 'TokenRader.ps1'
 $tokens = $null
 $parseErrors = $null
 $mainAst = [System.Management.Automation.Language.Parser]::ParseFile($mainWindowPath, [ref]$tokens, [ref]$parseErrors)
 Assert-PricingStandards (@($parseErrors).Count -eq 0) 'TokenRader.ps1 parses successfully'
-foreach ($functionName in @('Get-ServiceTierLabel', 'Set-PricingTable', 'Show-MeasurementPricingDialog')) {
+foreach ($functionName in @('Get-ServiceTierLabel', 'Set-PricingTable', 'Set-ResultPricing', 'Show-MeasurementPricingDialog')) {
     $functionAst = $mainAst.Find({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
@@ -196,6 +196,9 @@ foreach ($historicalId in @('gpt-5.4', 'gpt-5.3-codex')) {
         ('historical price remains available for resolution: ' + $historicalId)
     Assert-PricingStandards ([bool]$historicalCost.Known -and [double]$historicalCost.TotalCost -gt 0) `
         ('historical call still computes using retained pricing: ' + $historicalId)
+    Assert-PricingStandards ([Int64]$historicalPrice.longContextThreshold -eq 0L -and
+        [double]$historicalPrice.longContextInputMultiplier -eq 1.0 -and [double]$historicalPrice.longContextOutputMultiplier -eq 1.0) `
+        ('historical pricing stays flat rather than acquiring a new model-availability/context policy: ' + $historicalId)
 }
 
 $manualPickerAst = $mainAst.Find({
@@ -284,6 +287,76 @@ foreach ($category in @('Input', 'Cached', 'Output', 'CacheWrite')) {
     Assert-PricingStandardsNear 8.0 ($ultrafastRate / $standardRate) 0.000001 ('GPT-6.1 Sol Ultrafast factor is applied exactly once: ' + $category)
 }
 
+# Check the declared model policy separately from table/core equality: a shared
+# bug in both display and calculation must not make all models appear flat.
+foreach ($modelId in @('gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.6-cyber','gpt-5.5')) {
+    $priceModel = Resolve-TokenRaderPrice -Model $modelId -PricingDocument $script:PricingDocument
+    $isFlat = $modelId -eq 'gpt-5.6-sol'
+    foreach ($tier in @('default') + @($priceModel.serviceTiers.PSObject.Properties | ForEach-Object { [string]$_.Name })) {
+        $modeLabel = Get-ServiceTierLabel $tier
+        $shortRow = Get-PricingStandardsRow -Rows $rows -DisplayName ([string]$priceModel.displayName) -ModeLabel $modeLabel -ContextLabel $contextNormal
+        $longRow = Get-PricingStandardsRow -Rows $rows -DisplayName ([string]$priceModel.displayName) -ModeLabel $modeLabel -ContextLabel $contextLong
+        $standardShortRow = Get-PricingStandardsRow -Rows $rows -DisplayName ([string]$priceModel.displayName) -ModeLabel $standardLabel -ContextLabel $contextNormal
+        $standardLongRow = Get-PricingStandardsRow -Rows $rows -DisplayName ([string]$priceModel.displayName) -ModeLabel $standardLabel -ContextLabel $contextLong
+        $modeFactor = if ($tier -eq 'default') { 1.0 } else { [double]$priceModel.serviceTiers.$tier.referenceModeMultiplier }
+        foreach ($category in @('Input','Cached','Output','CacheWrite')) {
+            $contextFactor = if ($isFlat) { 1.0 } elseif ($category -eq 'Output') { 1.5 } else { 2.0 }
+            $shortRate = ConvertFrom-PricingDisplayRate ([string]$shortRow.$category) ($modelId + '/' + $tier + '/short/' + $category)
+            $longRate = ConvertFrom-PricingDisplayRate ([string]$longRow.$category) ($modelId + '/' + $tier + '/long/' + $category)
+            $standardShortRate = ConvertFrom-PricingDisplayRate ([string]$standardShortRow.$category) ($modelId + '/standard/short/' + $category)
+            $standardLongRate = ConvertFrom-PricingDisplayRate ([string]$standardLongRow.$category) ($modelId + '/standard/long/' + $category)
+            Assert-PricingStandardsNear ($shortRate * $contextFactor) $longRate 0.000501 ($modelId + '/' + $tier + '/' + $category + ' context rule is visible')
+            Assert-PricingStandardsNear ($standardShortRate * $modeFactor) $shortRate 0.000501 ($modelId + '/' + $tier + '/' + $category + ' short mode factor appears once')
+            Assert-PricingStandardsNear ($standardLongRate * $modeFactor) $longRate 0.000501 ($modelId + '/' + $tier + '/' + $category + ' long mode factor appears once')
+        }
+    }
+}
+
+# Result rate labels must describe the same effective projected context tier
+# as the amount, and must not display one misleading price for mixed contexts.
+$script:InputPriceText = [pscustomobject]@{ Text='' }
+$script:CachedPriceText = [pscustomobject]@{ Text='' }
+$script:OutputPriceText = [pscustomobject]@{ Text='' }
+$script:OpenPricingButton = [pscustomobject]@{ IsEnabled=$false }
+$script:State = [pscustomobject]@{ CurrentPriceUrl='' }
+foreach ($modelId in @('gpt-6-astra','gpt-6.1-sol','gpt-5.6-sol')) {
+    $priceModel = Resolve-TokenRaderPrice -Model $modelId -PricingDocument $script:PricingDocument
+    foreach ($tier in @('default') + @($priceModel.serviceTiers.PSObject.Properties | ForEach-Object { [string]$_.Name })) {
+        foreach ($longContext in @($false,$true)) {
+            $usage = New-PricingStandardsUsage -InputTokens $(if ($longContext) { 272001L } else { 272000L }) -CachedTokens 100000 -OutputTokens 20000
+            $cost = Get-TokenRaderCost -Usage $usage -Model $modelId -PricingDocument $script:PricingDocument -Scope call -ServiceTier $tier -LongContextApplied $longContext
+            $result = [pscustomobject]@{
+                Models=@($modelId)
+                Items=@([pscustomobject]@{ ServiceTier=$tier; LongContext=[bool]$cost.LongContextApplied; Cost=$cost })
+            }
+            Set-ResultPricing -Result $result
+            foreach ($category in @('Input','Cached','Output')) {
+                $controlName = $category + 'PriceText'
+                $displayControl = Get-Variable -Name $controlName -Scope Script -ValueOnly
+                $displayRate = ConvertFrom-PricingDisplayRate ([string]$displayControl.Text) ($modelId + '/result/' + $tier + '/' + $category)
+                $expectedRate = Get-PricingStandardsRateFromCost -PriceModel $priceModel -ServiceTier $tier -Category $category `
+                    -LongContext $longContext -PricingDocument $script:PricingDocument
+                Assert-PricingStandardsNear $expectedRate $displayRate 0.000501 ($modelId + '/result/' + $tier + '/' + $category + ' effective rate matches cost')
+            }
+            Assert-PricingStandards ([bool]$script:OpenPricingButton.IsEnabled) ($modelId + '/result/' + $tier + ' known single-context rates keep source link enabled')
+        }
+    }
+}
+$mixedResult = [pscustomobject]@{
+    Models=@('gpt-6-astra')
+    Items=@(
+        [pscustomobject]@{ ServiceTier='priority'; LongContext=$false; Cost=[pscustomobject]@{ Known=$true } },
+        [pscustomobject]@{ ServiceTier='priority'; LongContext=$true; Cost=[pscustomobject]@{ Known=$true } }
+    )
+}
+Set-ResultPricing -Result $mixedResult
+$mixedContextLabel = -join (@(0x6DF7,0x5408,0x4E0A,0x4E0B,0x6587) | ForEach-Object { [char]$_ })
+Assert-PricingStandards ([string]$script:InputPriceText.Text -eq $mixedContextLabel -and
+    [string]$script:CachedPriceText.Text -eq $mixedContextLabel -and [string]$script:OutputPriceText.Text -eq $mixedContextLabel) `
+    'mixed contexts show a clear mixed label rather than a misleading single dollar rate'
+Assert-PricingStandards (-not [bool]$script:OpenPricingButton.IsEnabled -and [string]$script:State.CurrentPriceUrl -eq '') `
+    'mixed-context result does not expose a single-context price source as its rate'
+
 # A deliberately odd in-memory tier proves the table reads the projected
 # serviceTiers rates instead of rebuilding known factors in UI code.
 $syntheticTierModel = Resolve-TokenRaderPrice -Model 'gpt-6.1-sol' -PricingDocument $script:PricingDocument
@@ -299,6 +372,18 @@ Assert-PricingStandardsRowMatchesCore -Row $mutatedFast -PriceModel $syntheticTi
     -LongContext $false -PricingDocument $script:PricingDocument -Label 'synthetic projected Fast tier'
 Assert-PricingStandardsNear 7.125 (ConvertFrom-PricingDisplayRate ([string]$mutatedFast.Input) 'synthetic Fast input') `
     -Message 'Fast table row follows the projected serviceTiers rate rather than a hardcoded factor'
+
+# Use nonstandard context factors in memory to ensure long rows use the same
+# tier projection as costing, rather than a second hardcoded 2x/1.5x table.
+$syntheticContextModel = Resolve-TokenRaderPrice -Model 'gpt-6-astra' -PricingDocument $script:PricingDocument
+$syntheticContextModel.serviceTiers.priority.longContextInputMultiplier = 2.125
+$syntheticContextModel.serviceTiers.priority.longContextOutputMultiplier = 1.625
+Set-PricingTable
+$mutatedContextRows = @($script:PricingDataGrid.ItemsSource)
+$mutatedLongFast = Get-PricingStandardsRow -Rows $mutatedContextRows -DisplayName ([string]$syntheticContextModel.displayName) `
+    -ModeLabel $fastLabel -ContextLabel $contextLong
+Assert-PricingStandardsRowMatchesCore -Row $mutatedLongFast -PriceModel $syntheticContextModel -ServiceTier 'priority' `
+    -LongContext $true -PricingDocument $script:PricingDocument -Label 'synthetic projected long-context Fast tier'
 
 # Validate the real WPF markup without creating a window. The pricing grid and
 # its named verification label must remain together in one pricing card.
@@ -316,11 +401,8 @@ Assert-PricingStandards ($cardXml.Contains('x:Name="PricingDataGrid"')) 'pricing
 Assert-PricingStandards ($cardXml.Contains('x:Name="PricingVerifiedText"')) 'pricing card contains the named verification label'
 Assert-PricingStandards ($cardXml.Contains('Binding="{Binding Context}"')) 'pricing card binds the context column'
 Assert-PricingStandards ($cardXml.Contains('Binding="{Binding CacheWrite}"')) 'pricing card binds the cache-write column'
-$longContextMultiplierCaveat = ([string][char]0x957F) + ([string][char]0x4E0A) + ([string][char]0x4E0B) +
-    ([string][char]0x6587) + ([string][char]0x5B98) + ([string][char]0x65B9) + ([string][char]0x8BA2) +
-    ([string][char]0x9605) + ([string][char]0x500D) + ([string][char]0x7387) + ([string][char]0x672A) +
-    ([string][char]0x786E) + ([string][char]0x8BA4)
+$longContextMultiplierCaveat = -join (@(0x957F,0x4E0A,0x4E0B,0x6587,0xFF1A,0x47,0x50,0x54,0x2D,0x36,0x2E,0x31,0x20,0x53,0x6F,0x6C,0x3001,0x47,0x50,0x54,0x2D,0x35,0x2E,0x36,0x20,0x53,0x6F,0x6C,0x20,0x8BA2,0x9605,0x4E0D,0x9644,0x52A0,0x500D,0x7387,0xFF1B,0x5176,0x4ED6,0x5DF2,0x914D,0x7F6E,0x6A21,0x578B,0x6309,0x7528,0x6237,0x786E,0x8BA4,0x7684,0x20,0x41,0x50,0x49,0x20,0x957F,0x4E0A,0x4E0B,0x6587,0x500D,0x7387,0x4F30,0x7B97,0xFF08,0x975E,0x5B98,0x65B9,0x8BA2,0x9605,0x500D,0x7387,0xFF09) | ForEach-Object { [char]$_ })
 Assert-PricingStandards ($cardXml.Contains($longContextMultiplierCaveat)) `
-    'pricing caveat distinguishes the application long-context reference from an unconfirmed official subscription multiplier'
+    'pricing caveat names both flat exemptions and identifies the other model context multipliers as user-confirmed estimates, not official subscription multipliers'
 
 Write-Output 'PRICING_STANDARDS_TESTS_PASSED'

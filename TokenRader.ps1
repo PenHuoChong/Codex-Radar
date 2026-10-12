@@ -4293,7 +4293,7 @@ function Show-MeasurementPricingDialog {
     $panel.Margin = '16'
     $dialog.Content = $panel
     $note = New-Object Windows.Controls.TextBlock
-    $note.Text = '各模型默认确认为普通模式；可改为支持的 Fast（2.5×，GPT-5.4 为 2×）或 Ultrafast（8×，仅 GPT-6 Astra / GPT-6.1 Sol）。套餐折算参考单价已包含模式倍率，不再叠加 API 快速倍率，采用平坦参考费率，不按上下文加价。Ultrafast 不是推理强度 ultra。仅补足本次测量及校准的缺失模式，明确日志模式优先；不修改日志或周期历史，新测量恢复普通模式。'
+    $note.Text = '各模型默认确认为普通模式；可改为支持的 Fast（2.5×，GPT-5.4 为 2×）或 Ultrafast（8×，仅 GPT-6 Astra / GPT-6.1 Sol）。套餐折算参考单价已包含模式倍率，不再叠加 API 快速倍率；长上下文按下方逐模型规则估算。Ultrafast 不是推理强度 ultra。仅补足本次测量及校准的缺失模式，明确日志模式优先；不修改日志或周期历史，新测量恢复普通模式。'
     $note.TextWrapping = 'Wrap'
     $note.Margin = '0,0,0,14'
     [Windows.Controls.DockPanel]::SetDock($note, 'Top')
@@ -4392,7 +4392,7 @@ function Get-ResultServiceTierSummary {
         }
     }
     if ($manualEvents -gt 0) { $parts += '模式人工确认 {0:N0} 次' -f $manualEvents }
-    $parts += '平坦参考费率（不按上下文加价）'
+    $parts += '逐模型订阅参考规则'
     return ($parts -join ' · ')
 }
 
@@ -4401,16 +4401,25 @@ function Set-ResultPricing {
     $items = @($Result.Items)
     $tiers = @($items | ForEach-Object { if ($null -ne $_.PSObject.Properties['ServiceTier']) { ConvertTo-TokenRaderServiceTier ([string]$_.ServiceTier) } else { '' } } | Sort-Object -Unique)
     $price = $null
+    $inputMultiplier = 1.0
+    $outputMultiplier = 1.0
+    $contextKinds = @($items | ForEach-Object { if ($null -ne $_.PSObject.Properties['LongContext']) { [bool]$_.LongContext } else { $false } } | Sort-Object -Unique)
     $label = if (@($Result.Models).Count -eq 0) { '等待调用' } elseif (@($Result.Models).Count -gt 1) { '多模型' } elseif ($tiers.Count -gt 1) { '混合模式' } else { '未公布' }
     $unpricedItems = @($items | Where-Object { $null -ne $_.PSObject.Properties['Cost'] -and $null -ne $_.Cost -and -not [bool]$_.Cost.Known })
     if (@($Result.Models).Count -eq 1 -and $tiers.Count -le 1 -and $unpricedItems.Count -eq 0) {
         $tier = if ($tiers.Count -eq 1) { [string]$tiers[0] } else { '' }
         $basePrice = Resolve-TokenRaderPrice -Model ([string]$Result.Models[0]) -PricingDocument $script:Prices
         $price = Resolve-TokenRaderServiceTierPrice -Price $basePrice -ServiceTier $tier
+        if ($contextKinds.Count -gt 1) { $price = $null; $label = '混合上下文' }
+        elseif ($null -ne $price -and $contextKinds.Count -eq 1 -and $contextKinds[0]) {
+            $rule = Resolve-TokenRaderLongContextPricing -Price $price -Usage ([pscustomobject]@{ Input = 0L }) -Scope call -LongContextApplied $true
+            $inputMultiplier = [double]$rule.InputMultiplier
+            $outputMultiplier = [double]$rule.OutputMultiplier
+        }
     }
-    $script:InputPriceText.Text = if ($null -ne $price) { '$' + ([double]$price.input).ToString('0.###') } else { $label }
-    $script:CachedPriceText.Text = if ($null -ne $price) { '$' + ([double]$price.cachedInput).ToString('0.###') } else { $label }
-    $script:OutputPriceText.Text = if ($null -ne $price) { '$' + ([double]$price.output).ToString('0.###') } else { $label }
+    $script:InputPriceText.Text = if ($null -ne $price) { '$' + ([double]$price.input * $inputMultiplier).ToString('0.###') } else { $label }
+    $script:CachedPriceText.Text = if ($null -ne $price) { '$' + ([double]$price.cachedInput * $inputMultiplier).ToString('0.###') } else { $label }
+    $script:OutputPriceText.Text = if ($null -ne $price) { '$' + ([double]$price.output * $outputMultiplier).ToString('0.###') } else { $label }
     $script:State.CurrentPriceUrl = if ($null -ne $price) { [string]$price.source } else { '' }
     $script:OpenPricingButton.IsEnabled = $null -ne $price
 }
@@ -4429,14 +4438,16 @@ function Set-PricingTable {
         }
         foreach ($mode in $modes) {
             foreach ($context in $contexts) {
+                $contextUsage = [pscustomobject]@{ Input = $(if ($context.StartsWith('>')) { 272001L } else { 272000L }) }
+                $contextRule = Resolve-TokenRaderLongContextPricing -Price $mode.Price -Usage $contextUsage -Scope call
                 [pscustomobject]@{
                     Model = ([string]$entry.displayName) + ' · ' + $mode.Label
                     Context = $context
-                    ContextEvidence = if ($subscriptionReference) { '应用参考同价；官方倍率未确认' } else { 'API 兼容规则' }
-                    Input = '$' + ([double]$mode.Price.input).ToString('0.###')
-                    Cached = '$' + ([double]$mode.Price.cachedInput).ToString('0.###')
-                    Output = '$' + ([double]$mode.Price.output).ToString('0.###')
-                    CacheWrite = if ($subscriptionReference) { '$' + ([double]$mode.Price.input).ToString('0.###') } else { '见 API 规则' }
+                    ContextEvidence = if (-not $subscriptionReference) { 'API 兼容规则' } elseif ($entry.longContextPolicy -eq 'subscription_no_surcharge') { '订阅长上下文不附加倍率；Token 数仍影响消耗' } elseif ($entry.longContextThreshold -gt 0) { '用户确认的 API 式长上下文估算；非官方订阅倍率' } else { '应用参考同价；无已配置附加倍率' }
+                    Input = '$' + ([double]$mode.Price.input * $contextRule.InputMultiplier).ToString('0.###')
+                    Cached = '$' + ([double]$mode.Price.cachedInput * $contextRule.InputMultiplier).ToString('0.###')
+                    Output = '$' + ([double]$mode.Price.output * $contextRule.OutputMultiplier).ToString('0.###')
+                    CacheWrite = if ($subscriptionReference) { '$' + ([double]$mode.Price.input * $contextRule.InputMultiplier).ToString('0.###') } else { '见 API 规则' }
                 }
             }
         }
@@ -4553,7 +4564,7 @@ function Update-UsageView {
         Set-ResultPricing -Result $taskResult
         $script:LongContextText.Text = Get-ResultServiceTierSummary -Result $taskResult
         $script:FormulaText.Text = '整次任务按每次调用的实际模型分别计价，再汇总未缓存输入、缓存输入和输出金额。'
-        $script:CaveatText.Text = '整次任务逐调用识别模型和模式，金额为套餐折算美元参考，采用本应用平坦参考费率，不按上下文加价。Fast / Ultrafast 倍率已包含，不叠加 API 快速倍率；不含缓存写入溢价、工具调用、区域处理或 Batch/Flex，非官方美元单价或账单。账号切换前的历史仍无法仅凭日志可靠归属。'
+        $script:CaveatText.Text = '整次任务逐调用识别模型、模式和上下文，金额为套餐折算美元参考，长上下文规则见计费标准。Fast / Ultrafast 倍率已包含，不叠加 API 快速倍率；不含缓存写入溢价、工具调用、区域处理或 Batch/Flex，非官方美元单价或账单。账号切换前的历史仍无法仅凭日志可靠归属。'
         $script:StatusText.Text = ('已读取 {0:N0} 次唯一调用 · {1} · 本地处理完成' -f $taskResult.CountedEvents, $scopeLabel)
         Update-QuotaCards
         return
@@ -4584,17 +4595,17 @@ function Update-UsageView {
             (Format-TokenRaderUsd ([double]$cost.CachedCost)),
             (Format-TokenRaderUsd ([double]$cost.OutputCost)))
         $price = $cost.Price
-        $script:InputPriceText.Text = ('$' + ([double]$price.input).ToString('0.###'))
-        $script:CachedPriceText.Text = ('$' + ([double]$price.cachedInput).ToString('0.###'))
-        $script:OutputPriceText.Text = ('$' + ([double]$price.output).ToString('0.###'))
+        $script:InputPriceText.Text = ('$' + ([double]$price.input * $cost.InputMultiplier).ToString('0.###'))
+        $script:CachedPriceText.Text = ('$' + ([double]$price.cachedInput * $cost.InputMultiplier).ToString('0.###'))
+        $script:OutputPriceText.Text = ('$' + ([double]$price.output * $cost.OutputMultiplier).ToString('0.###'))
         $script:State.CurrentPriceUrl = [string]$price.source
         $script:OpenPricingButton.IsEnabled = $true
-        $script:LongContextText.Text = '平坦参考费率（不按上下文加价）'
+        $script:LongContextText.Text = if ($cost.LongContextApplied) { '长上下文估算：输入×2 / 输出×1.5' } else { '本次无长上下文附加倍率' }
         $script:FormulaText.Text = '美元参考 = 未缓存输入 × 参考输入价 + 缓存输入 × 参考缓存价 + 输出 × 参考输出价；模式倍率已包含，输入计数本身已包含缓存输入，不含缓存写入溢价。'
     }
     $script:LongContextText.Text = (Get-ServiceTierLabel ([string]$snapshot.ServiceTier)) + ' · ' + $script:LongContextText.Text
 
-    $script:CaveatText.Text = '最后一次调用使用 last_token_usage，按模型及模式计算套餐折算美元参考，采用本应用平坦参考费率，不按上下文加价。Fast / Ultrafast 倍率已包含，不叠加 API 快速倍率；不含缓存写入溢价、工具调用、区域处理或 Batch/Flex，非官方美元单价或账单。'
+    $script:CaveatText.Text = '最后一次调用使用 last_token_usage，按模型、模式及计费标准中的上下文规则计算套餐折算美元参考。Fast / Ultrafast 倍率已包含，不叠加 API 快速倍率；不含缓存写入溢价、工具调用、区域处理或 Batch/Flex，非官方美元单价或账单。'
     $script:StatusText.Text = ('已读取 {0} · {1} · 本地处理完成' -f $model, $scopeLabel)
     Update-QuotaCards
 }

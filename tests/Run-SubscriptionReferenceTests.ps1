@@ -55,7 +55,8 @@ function New-SubscriptionTokenRecord {
 }
 
 function Write-SubscriptionSession {
-    param([string]$Path, [string]$SessionId, [string]$ProjectPath, [string]$ParentId = '', [object[]]$TokenRecords)
+    param([string]$Path, [string]$SessionId, [string]$ProjectPath, [string]$ParentId = '', [object[]]$TokenRecords,
+        [string]$Model = 'gpt-6.1-sol', [string]$ServiceTier = 'priority')
     $records = [System.Collections.Generic.List[object]]::new()
     $meta = [ordered]@{
         timestamp = '2026-10-12T11:59:59Z'
@@ -70,7 +71,7 @@ function Write-SubscriptionSession {
     $records.Add([ordered]@{
         timestamp = '2026-10-12T12:00:00Z'
         type = 'turn_context'
-        payload = [ordered]@{ model = 'gpt-6.1-sol'; service_tier = 'priority' }
+        payload = [ordered]@{ model = $Model; service_tier = $ServiceTier }
     })
     foreach ($record in @($TokenRecords)) { $records.Add($record) }
     $lines = @($records | ForEach-Object { ConvertTo-Json -InputObject $_ -Depth 14 -Compress })
@@ -142,6 +143,58 @@ Assert-SubscriptionReference ([bool]$planFast.Known -and [string]$planFast.Prici
 Assert-SubscriptionNear ([double]$refFast.TotalCost) ([double]$planFast.TotalCost) 'plan-normalized path does not multiply projected Fast twice'
 Assert-SubscriptionNear 2.5 ([double]$planFast.Multiplier) 'informational Fast multiplier stays 2.5x'
 
+# Long-context reference rules are independent model declarations, not API
+# inheritance. Only the explicitly exempt Sol models and historical references
+# stay flat; the other configured models use the user-confirmed assumption.
+$longReferenceIds = @('gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-5.6-terra','gpt-5.6-luna','gpt-5.6-cyber','gpt-5.5')
+foreach ($modelId in $longReferenceIds) {
+    $price = Resolve-TokenRaderPrice -Model $modelId -PricingDocument $subscription
+    Assert-SubscriptionReference ([Int64]$price.longContextThreshold -eq 272000L -and
+        [double]$price.longContextInputMultiplier -eq 2.0 -and [double]$price.longContextOutputMultiplier -eq 1.5) `
+        ($modelId + ' declares the independent 272K user-assumed long-context rule')
+    Assert-SubscriptionReference ($null -ne $price.PSObject.Properties['longContextPolicy'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$price.longContextPolicy)) ($modelId + ' carries its long-context policy provenance')
+    $expectedShort = (([double]$atThresholdUsage.Uncached * [double]$price.input) +
+        ([double]$atThresholdUsage.Cached * [double]$price.cachedInput) +
+        ([double]$atThresholdUsage.Output * [double]$price.output)) / 1000000.0
+    $expectedLong = (([double]$aboveThresholdUsage.Uncached * [double]$price.input) * 2.0 +
+        ([double]$aboveThresholdUsage.Cached * [double]$price.cachedInput) * 2.0 +
+        ([double]$aboveThresholdUsage.Output * [double]$price.output) * 1.5) / 1000000.0
+    $short = Get-TokenRaderCost -Usage $atThresholdUsage -Model $modelId -PricingDocument $subscription -Scope call -ServiceTier default
+    $long = Get-TokenRaderCost -Usage $aboveThresholdUsage -Model $modelId -PricingDocument $subscription -Scope call -ServiceTier default `
+        -CacheCreationTokens 50000 -CacheWriteObservable $true
+    Assert-SubscriptionReference ([bool]$short.Known -and -not [bool]$short.LongContextApplied) ($modelId + ' exactly 272000 input is short')
+    Assert-SubscriptionReference ([bool]$long.Known -and [bool]$long.LongContextApplied) ($modelId + ' 272001 input is long')
+    Assert-SubscriptionNear $expectedShort ([double]$short.TotalCost) ($modelId + ' threshold uses ordinary reference rates')
+    Assert-SubscriptionNear $expectedLong ([double]$long.TotalCost) ($modelId + ' long call applies input/cache 2x and output 1.5x')
+    Assert-SubscriptionNear ((50000.0 * [double]$price.input * 2.0) / 1000000.0) ([double]$long.CacheCreationCost) `
+        ($modelId + ' long cache writes remain an ordinary-input subset without 1.25x premium')
+    foreach ($tier in @('priority','ultrafast')) {
+        if ($null -eq $price.serviceTiers.PSObject.Properties[$tier]) { continue }
+        $factor = [double]$price.serviceTiers.$tier.referenceModeMultiplier
+        Assert-SubscriptionReference ([Int64]$price.serviceTiers.$tier.longContextThreshold -eq 272000L -and
+            [double]$price.serviceTiers.$tier.longContextInputMultiplier -eq 2.0 -and
+            [double]$price.serviceTiers.$tier.longContextOutputMultiplier -eq 1.5) ($modelId + '/' + $tier + ' carries the same context rule')
+        $modeCost = Get-TokenRaderCost -Usage $aboveThresholdUsage -Model $modelId -PricingDocument $subscription -Scope call -ServiceTier $tier `
+            -CacheCreationTokens 50000 -CacheWriteObservable $true
+        $modePlan = Get-TokenRaderPlanNormalizedCost -Usage $aboveThresholdUsage -Model $modelId -PricingDocument $subscription -ServiceTier $tier -LongContextApplied $true
+        Assert-SubscriptionNear ($expectedLong * $factor) ([double]$modeCost.TotalCost) ($modelId + '/' + $tier + ' mode and context factors apply once')
+        Assert-SubscriptionNear ([double]$modeCost.TotalCost) ([double]$modePlan.TotalCost) ($modelId + '/' + $tier + ' normalized path does not repeat either factor')
+    }
+}
+foreach ($flatModel in @($subscription.models | Where-Object {
+    [string]$_.id -in @('gpt-6.1-sol','gpt-5.6-sol') -or [string]$_.referenceRateBasis -eq 'historical_application_reference_unit'
+})) {
+    Assert-SubscriptionReference ([Int64]$flatModel.longContextThreshold -eq 0L -and
+        [double]$flatModel.longContextInputMultiplier -eq 1.0 -and [double]$flatModel.longContextOutputMultiplier -eq 1.0) `
+        ([string]$flatModel.id + ' flat exemption/historical rule does not inherit API context pricing')
+    foreach ($tier in @('default') + @($flatModel.serviceTiers.PSObject.Properties | ForEach-Object { [string]$_.Name })) {
+        $flatCost = Get-TokenRaderCost -Usage $aboveThresholdUsage -Model ([string]$flatModel.id) -PricingDocument $subscription -Scope call -ServiceTier $tier -LongContextApplied $true
+        Assert-SubscriptionReference ([bool]$flatCost.Known -and -not [bool]$flatCost.LongContextApplied) `
+            ([string]$flatModel.id + '/' + $tier + ' persisted classification cannot defeat a flat exemption')
+    }
+}
+
 $smallUsage = New-SubscriptionUsage -InputTokens 100000 -CachedTokens 25000 -OutputTokens 10000
 foreach ($modelId in @('gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-6.1-sol','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.5','gpt-5.4')) {
     $expectedFactor = if ($modelId -eq 'gpt-5.4') { 2.0 } else { 2.5 }
@@ -175,6 +228,24 @@ Assert-SubscriptionReference (-not [bool]$partial.PricingComplete -and -not [boo
 Assert-SubscriptionReference ([bool]$partial.Items[0].Cost.Known -and -not [bool]$partial.Items[1].Cost.Known) 'unsupported tier does not erase the known model amount or become free'
 Assert-SubscriptionReference ($partial.UnknownModels -contains 'gpt-6-sol') 'partial diagnostic names the unsupported model'
 
+$classifiedAggregate = [pscustomobject]@{
+    Buckets = @(
+        [pscustomobject]@{ Model='gpt-6-astra'; ServiceTier='priority'; Input=300000L; Cached=100000L; Output=20000L; Reasoning=0L; Events=2L; LongContext=$false; CacheCreationTokens=50000L; CacheWriteObservable=$true; RequestInputObservable=$true; LongContextPricingUncertain=$false; ModelContextWindow=1050000L; ServiceTierSource='response'; ServiceTierEvidenceComplete=$true },
+        [pscustomobject]@{ Model='gpt-6-astra'; ServiceTier='priority'; Input=272001L; Cached=100000L; Output=20000L; Reasoning=0L; Events=1L; LongContext=$true; CacheCreationTokens=50000L; CacheWriteObservable=$true; RequestInputObservable=$true; LongContextPricingUncertain=$false; ModelContextWindow=1050000L; ServiceTierSource='response'; ServiceTierEvidenceComplete=$true }
+    )
+    Models = @('gpt-6-astra'); TotalInput=572001L; TotalCached=200000L; TotalOutput=40000L; TotalReasoning=0L
+}
+$classified = & $module { param($a,$p) ConvertFrom-TokenRaderPricedAggregate -Aggregate $a -PricingDocument $p } $classifiedAggregate $subscription
+$expectedShortBucket = ((200000.0 * [double]$refAstra.input) + (100000.0 * [double]$refAstra.cachedInput) + (20000.0 * [double]$refAstra.output)) * 2.5 / 1000000.0
+$expectedLongBucket = ((172001.0 * [double]$refAstra.input) * 2.0 + (100000.0 * [double]$refAstra.cachedInput) * 2.0 + (20000.0 * [double]$refAstra.output) * 1.5) * 2.5 / 1000000.0
+Assert-SubscriptionReference ([bool]$classified.PricingComplete -and [bool]$classified.PlanPricingComplete) 'preclassified mixed-context aggregate stays fully priced'
+Assert-SubscriptionNear $expectedShortBucket ([double]$classified.Items[0].Cost.TotalCost) 'sum of two short requests above 272K cannot be reclassified as a long request'
+Assert-SubscriptionNear $expectedLongBucket ([double]$classified.Items[1].Cost.TotalCost) 'preclassified long bucket retains its context factor'
+Assert-SubscriptionReference (-not [bool]$classified.Items[0].LongContext -and [bool]$classified.Items[1].LongContext) 'displayed bucket context follows the effective subscription rule'
+Assert-SubscriptionReference ([Int64]$classified.StandardContextEvents -eq 2L -and [Int64]$classified.LongContextEvents -eq 1L) 'aggregate context counters preserve per-request classification'
+Assert-SubscriptionNear ($expectedShortBucket + $expectedLongBucket) ([double]$classified.TotalCost) 'mixed aggregate sums only individually classified costs'
+Assert-SubscriptionNear ([double]$classified.TotalCost) ([double]$classified.PlanNormalizedTotalCost) 'mixed-context plan path uses the same projected total'
+
 $rawKey = Get-SubscriptionPricingCacheKey -PricingDocument $raw -CoreModule $module
 $subscriptionKey = Get-SubscriptionPricingCacheKey -PricingDocument $subscription -CoreModule $module
 Assert-SubscriptionReference ($rawKey -ne $subscriptionKey) 'raw API and projected subscription caches are separate'
@@ -188,6 +259,22 @@ $changedVerifiedSol = Resolve-TokenRaderPrice -Model 'gpt-6.1-sol' -PricingDocum
 $changedVerifiedSol.verifiedAt = '2099-01-01'
 $changedVerificationKey = Get-SubscriptionPricingCacheKey -PricingDocument $changedVerification -CoreModule $module
 Assert-SubscriptionReference ($subscriptionKey -ne $changedVerificationKey) 'cache key changes when per-model reference verification changes'
+foreach ($ruleChange in @(
+    [pscustomobject]@{ Name='longContextThreshold'; Value=271999L },
+    [pscustomobject]@{ Name='longContextInputMultiplier'; Value=2.01 },
+    [pscustomobject]@{ Name='longContextOutputMultiplier'; Value=1.51 },
+    [pscustomobject]@{ Name='longContextPolicy'; Value='synthetic_changed_reference_policy' }
+)) {
+    $changedRuleProjection = Copy-SubscriptionObject $subscription
+    $changedRuleModel = Resolve-TokenRaderPrice -Model 'gpt-6-astra' -PricingDocument $changedRuleProjection
+    $changedRuleModel | Add-Member -MemberType NoteProperty -Name $ruleChange.Name -Value $ruleChange.Value -Force
+    $changedRuleKey = Get-SubscriptionPricingCacheKey -PricingDocument $changedRuleProjection -CoreModule $module
+    Assert-SubscriptionReference ($subscriptionKey -ne $changedRuleKey) ('cache key isolates a changed projected ' + $ruleChange.Name)
+}
+$changedRuleVersion = Copy-SubscriptionObject $subscription
+$changedRuleVersion.subscriptionPricing | Add-Member -MemberType NoteProperty -Name 'contextRuleVersion' -Value 'synthetic_context_rule_v999' -Force
+$changedRuleVersionKey = Get-SubscriptionPricingCacheKey -PricingDocument $changedRuleVersion -CoreModule $module
+Assert-SubscriptionReference ($subscriptionKey -ne $changedRuleVersionKey) 'cache key changes when independent subscription context rule version changes'
 
 # A single synthetic parent/child log tree exercises the same projected prices
 # through interval, project, history and Explorer queries. Child copied history
@@ -262,6 +349,65 @@ try {
         -StartAt ([DateTimeOffset]::Parse('2026-10-12T00:00:00Z')) -EndAt ([DateTimeOffset]::Parse('2026-10-13T00:00:00Z'))
     Assert-SubscriptionReference ([Int64]$explorerResult.Count -eq 2L -and [Int64]$explorerResult.DuplicateEventsDropped -ge 1L) 'Explorer still deduplicates copied parent events'
     Assert-SubscriptionNear ([double]$interval.TotalCost) ([double]$explorerResult.TotalCost) 'Explorer uses the same projected USD reference'
+    # Explorer imports Core in its own module scope; restore the test's public
+    # Core command scope before opening the second isolated fixture.
+    $module = Import-Module -Name $corePath -Force -PassThru -Global
+
+    # A separate synthetic index covers real request classification through
+    # every view: two short Astra requests merge above 272K, then one long
+    # request is priced with the explicit assumption rather than that sum.
+    $mixedRoot = Join-Path $tempRoot 'Mixed Context Fixture'
+    $mixedSessions = Join-Path $mixedRoot 'sessions'
+    $mixedProjectPath = Join-Path $mixedRoot 'Synthetic Astra Project'
+    [void][IO.Directory]::CreateDirectory($mixedSessions)
+    [void][IO.Directory]::CreateDirectory($mixedProjectPath)
+    $mixedPath = Join-Path $mixedSessions 'rollout-30000000-0000-0000-0000-000000000001.jsonl'
+    $mixedRecords = @(
+        (New-SubscriptionTokenRecord -Timestamp '2026-10-12T12:00:01Z' -TotalInput 150000 -TotalCached 50000 -TotalOutput 10000 -CallInput 150000 -CallCached 50000 -CallOutput 10000 -CacheCreationTokens 25000),
+        (New-SubscriptionTokenRecord -Timestamp '2026-10-12T12:00:02Z' -TotalInput 300000 -TotalCached 100000 -TotalOutput 20000 -CallInput 150000 -CallCached 50000 -CallOutput 10000 -CacheCreationTokens 25000),
+        (New-SubscriptionTokenRecord -Timestamp '2026-10-12T12:00:03Z' -TotalInput 572001 -TotalCached 200000 -TotalOutput 40000 -CallInput 272001 -CallCached 100000 -CallOutput 20000 -CacheCreationTokens 50000)
+    )
+    Write-SubscriptionSession -Path $mixedPath -SessionId '30000000-0000-0000-0000-000000000001' -ProjectPath $mixedProjectPath `
+        -Model 'gpt-6-astra' -ServiceTier 'priority' -TokenRecords $mixedRecords
+    Close-TokenRaderIndex
+    $mixedDbPath = Join-Path $mixedRoot 'data\private\main.db'
+    $env:TOKEN_RADER_INDEX_DB = $mixedDbPath
+    New-TokenRaderIndex -SessionsRoot $mixedSessions -Force | Out-Null
+    $mixedOffsets = @{}
+    $mixedOffsets[$mixedPath] = [Int64](Get-Item -LiteralPath $mixedPath).Length
+    $mixedBaseline = [pscustomobject]@{
+        StartedAt=[DateTimeOffset]::MinValue; SessionsRoot=$mixedSessions; StartOffsets=@{}
+        Files=@(); RateLimits=$null; StartRateLimits=$null
+    }
+    $mixedExpected = $expectedShortBucket + $expectedLongBucket
+    $mixedInterval = Get-TokenRaderIndexedIntervalResult -Baseline $mixedBaseline -PricingDocument $subscription `
+        -EndOffsets $mixedOffsets -EndedAt $anchor -ScanRateLimits:$false
+    Assert-SubscriptionReference ([bool]$mixedInterval.PricingComplete -and [Int64]$mixedInterval.CountedEvents -eq 3L) 'mixed fixture interval includes exactly three synthetic requests'
+    Assert-SubscriptionNear $mixedExpected ([double]$mixedInterval.TotalCost) 'indexed mixed fixture honors separate short/long requests'
+    Assert-SubscriptionReference ([Int64]$mixedInterval.StandardContextEvents -eq 2L -and [Int64]$mixedInterval.LongContextEvents -eq 1L) 'indexed mixed fixture reports effective subscription context counts'
+    $mixedProject = [pscustomobject]@{ FilePaths=@($mixedPath); ProjectPath=$mixedProjectPath; ProjectName='Synthetic Astra Project' }
+    $mixedProjectResult = Get-TokenRaderProjectResult -Project $mixedProject -SessionsRoot $mixedSessions -PricingDocument $subscription
+    Assert-SubscriptionNear $mixedExpected ([double]$mixedProjectResult.TotalCost) 'project mixed-context pricing matches interval'
+    $mixedHistory = Get-TokenRaderUsageHistoryWindow -SessionsRoot $mixedSessions -PricingDocument $subscription -AnchorAt $anchor -ForceRefresh
+    Assert-SubscriptionNear $mixedExpected ([double]$mixedHistory.TotalCost) 'history mixed-context pricing matches interval'
+    Assert-SubscriptionReference ([Int64]$mixedHistory.LongContextEvents -eq 1L -and [Int64]$mixedHistory.StandardContextEvents -eq 2L) 'history retains effective mixed-context counters'
+    $mixedCachedHistory = Get-TokenRaderUsageHistoryWindow -SessionsRoot $mixedSessions -PricingDocument $subscription -AnchorAt $anchor
+    Assert-SubscriptionNear $mixedExpected ([double]$mixedCachedHistory.TotalCost) 'cached history uses the same independent context rule'
+    Assert-SubscriptionReference ([Int64]$mixedCachedHistory.LongContextEvents -eq 1L) 'cached history does not reset subscription long-context counters'
+    Close-TokenRaderIndex
+    Get-TokenRaderIndex -SessionsRoot $mixedSessions | Out-Null
+    $mixedReopenedHistory = Get-TokenRaderUsageHistoryWindow -SessionsRoot $mixedSessions -PricingDocument $subscription -AnchorAt $anchor
+    Assert-SubscriptionNear $mixedExpected ([double]$mixedReopenedHistory.TotalCost) 'reopened index uses persisted independent context-rule history pricing'
+    Assert-SubscriptionReference ([Int64]$mixedReopenedHistory.LongContextEvents -eq 1L -and [Int64]$mixedReopenedHistory.StandardContextEvents -eq 2L) 'reopened history preserves effective short/long counters'
+    $mixedExplorerPaths = [pscustomobject]@{
+        MainIndexPath=$mixedDbPath; ExplorerIndexPath=(Join-Path $mixedRoot 'explorer\index.db')
+        SessionsRoot=$mixedSessions; PricingPath=$pricingCopyPath
+    }
+    Update-TokenRaderExplorerIndex -ProjectRoot $mixedRoot -Paths $mixedExplorerPaths | Out-Null
+    $mixedExplorer = Get-TokenRaderExplorerResult -ProjectRoot $mixedRoot -Paths $mixedExplorerPaths -ProjectPath $mixedProjectPath `
+        -StartAt ([DateTimeOffset]::Parse('2026-10-12T00:00:00Z')) -EndAt ([DateTimeOffset]::Parse('2026-10-13T00:00:00Z'))
+    Assert-SubscriptionReference ([Int64]$mixedExplorer.Count -eq 3L) 'Explorer includes all three mixed-context requests'
+    Assert-SubscriptionNear $mixedExpected ([double]$mixedExplorer.TotalCost) 'Explorer mixed-context pricing matches interval and display projection'
 
     Write-Output 'SUBSCRIPTION_REFERENCE_TESTS_PASSED'
 } finally {

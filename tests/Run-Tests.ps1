@@ -2090,9 +2090,9 @@ try {
     $standardUiItem = [pscustomobject]@{ ServiceTier = 'default'; Events = 1L; LongContext = $false; Cost = [pscustomobject]@{ Known = $true } }
     $fastUiResult = [pscustomobject]@{ Models = @('gpt-6-astra'); Items = @($fastUiItem) }
     Set-ResultPricing -Result $fastUiResult
-    Assert-Equal '$20' $script:InputPriceText.Text 'UI uses Fast input price'
-    Assert-Equal '$2' $script:CachedPriceText.Text 'UI uses Fast cached price'
-    Assert-Equal '$100' $script:OutputPriceText.Text 'UI uses Fast output price'
+    Assert-Equal '$40' $script:InputPriceText.Text 'UI uses effective Fast long-context input price'
+    Assert-Equal '$4' $script:CachedPriceText.Text 'UI uses effective Fast long-context cached price'
+    Assert-Equal '$150' $script:OutputPriceText.Text 'UI uses effective Fast long-context output price'
     Assert-Equal $true $script:OpenPricingButton.IsEnabled 'UI Fast price source remains available'
     $mixedUiResult = [pscustomobject]@{ Models = @('gpt-6-astra'); Items = @($fastUiItem, $standardUiItem) }
     Set-ResultPricing -Result $mixedUiResult
