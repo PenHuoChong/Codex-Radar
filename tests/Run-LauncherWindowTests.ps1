@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch]$IncludeExe
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -17,7 +19,7 @@ function Get-LauncherWindowSmokeReport {
         if (Test-Path -LiteralPath $ReportPath -PathType Leaf) {
             try {
                 $report = [IO.File]::ReadAllText($ReportPath)
-                if ($report -match '^console=(?:true|false);apartment=(?:STA|MTA|Unknown)$') { return $report }
+                if ($report -match '^consoleVisible=(?:true|false);apartment=(?:STA|MTA|Unknown)$') { return $report }
             } catch { }
         }
         [Threading.Thread]::Sleep(50)
@@ -28,7 +30,7 @@ function Get-LauncherWindowSmokeReport {
 function Assert-SyntheticHiddenStaReport {
     param([string]$ReportPath, [string]$PathDescription)
     $report = Get-LauncherWindowSmokeReport -ReportPath $ReportPath
-    Assert-LauncherWindow ($report -eq 'console=false;apartment=STA') ($PathDescription + ' must run without a console window in STA; report=[' + $report + ']')
+    Assert-LauncherWindow ($report -eq 'consoleVisible=false;apartment=STA') ($PathDescription + ' must have no visible console window in STA; report=[' + $report + ']')
 }
 
 function Get-LauncherWindowPolicyBlockInfo {
@@ -53,13 +55,24 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $cmdPath = Join-Path $projectRoot 'Start-TokenRader.cmd'
 $launcherPath = Join-Path $projectRoot 'TokenRader.exe'
 $launcherSourcePath = Join-Path $projectRoot 'launcher\TokenRader.Launcher.cs'
+$uiSourcePath = Join-Path $projectRoot 'TokenRader.ps1'
 $syntheticScriptPath = Join-Path $PSScriptRoot 'fixtures\launcher\TokenRader.ps1'
 
 $cmdSource = [IO.File]::ReadAllText($cmdPath)
-Assert-LauncherWindow ($cmdSource -match '(?im)^\s*start\s+""\s+"%~dp0TokenRader\.exe"\s*$') '.cmd must asynchronously dispatch the adjacent GUI launcher through START'
+$expectedCmdStart = '(?im)^\s*start\s+""\s+"%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe"\s+-NoProfile\s+-STA\s+-WindowStyle\s+Hidden\s+-File\s+"%~dp0TokenRader\.ps1"\s*$'
+Assert-LauncherWindow ($cmdSource -match $expectedCmdStart) '.cmd must start the adjacent source script in hidden STA Windows PowerShell'
+Assert-LauncherWindow ([regex]::Matches($cmdSource, '(?im)^\s*start\s+').Count -eq 1) '.cmd must have exactly one asynchronous start command'
 Assert-LauncherWindow ($cmdSource -notmatch '(?i)\s/wait(?:\s|$)') '.cmd must not wait for the dashboard process'
-Assert-LauncherWindow ($cmdSource -notmatch '(?i)\b(?:powershell|pwsh)(?:\.exe)?\b') '.cmd must not run PowerShell directly in the foreground or as a fallback'
-Assert-LauncherWindow ($cmdSource -notmatch '(?im)^\s*(?:call\s+)?"?%~dp0TokenRader\.exe"?(?:\s|$)') '.cmd must not invoke the GUI launcher as a foreground command'
+Assert-LauncherWindow ($cmdSource -notmatch '(?i)(?:-ExecutionPolicy|-ep\b|\bBypass\b|\bUnblock(?:-File)?\b|\bEncodedCommand\b|-enc\b|Set-ExecutionPolicy)') '.cmd must not change execution policy, unblock files, or use encoded commands'
+$cmdCommandLines = @($cmdSource -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object {
+    $_.Length -gt 0 -and $_ -notmatch '^(?:@?echo\b|rem\b|::)'
+})
+$cmdStartLines = @($cmdCommandLines | Where-Object { $_ -match '(?i)(?:^|\s)start\s+' })
+Assert-LauncherWindow ($cmdStartLines.Count -eq 1) '.cmd must contain exactly one process-start command; preflight and error text are not counted as launches'
+$otherHostLaunchLines = @($cmdCommandLines | Where-Object {
+    $_ -match '(?i)(?:^|[&|]\s*|\s)\s*(?:call\s+)?(?:"?%~dp0TokenRader\.exe"?|powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd(?:\.exe)?)(?:\s|$)'
+})
+Assert-LauncherWindow ($otherHostLaunchLines.Count -eq 0) '.cmd must not launch another host or executable outside the expected START command'
 
 $launcherSource = [IO.File]::ReadAllText($launcherSourcePath)
 $processStartInfo = [regex]::Match($launcherSource, '(?s)new\s+ProcessStartInfo\s*\{(?<body>.*?)\}\s*;')
@@ -70,9 +83,12 @@ Assert-LauncherWindow ($startInfoBody -match '(?m)\bCreateNoWindow\s*=\s*true\s*
 Assert-LauncherWindow ($startInfoBody -match '(?m)\bWindowStyle\s*=\s*ProcessWindowStyle\.Hidden\s*(?:,|$)') 'launcher must request a hidden child window'
 Assert-LauncherWindow ($startInfoBody -match '(?i)\-WindowStyle\s+Hidden') 'PowerShell child arguments must request a hidden window'
 Assert-LauncherWindow ($launcherSource -match '\[assembly:\s*AssemblyTitle\("Token Rader"\)\]') 'launcher source must remain the Token Rader GUI host'
-$uiSource = [IO.File]::ReadAllText((Join-Path $projectRoot 'TokenRader.ps1'))
+$uiSource = [IO.File]::ReadAllText($uiSourcePath)
 Assert-LauncherWindow ($uiSource -match '(?s)GetApartmentState\(\)\s*-ne\s*\[Threading\.ApartmentState\]::STA\).*?Start-Process\s+-FilePath\s+\$hostExecutable\s+-ArgumentList\s+\$arguments\s+-WindowStyle\s+Hidden') 'MTA-to-STA relaunch must also hide the PowerShell host window'
 
+# Keep validating the existing launcher as a GUI PE, but never execute it by
+# default. Runtime execution is opt-in because local Application Control may
+# block this unsigned launcher.
 $launcherBytes = [IO.File]::ReadAllBytes($launcherPath)
 Assert-LauncherWindow ($launcherBytes.Length -ge 128) 'built launcher must be a complete PE image'
 Assert-LauncherWindow ([BitConverter]::ToUInt16($launcherBytes, 0) -eq 0x5A4D) 'built launcher must have an MZ header'
@@ -85,21 +101,10 @@ Assert-LauncherWindow ($optionalHeaderMagic -eq 0x10b -or $optionalHeaderMagic -
 $subsystem = [BitConverter]::ToUInt16($launcherBytes, $optionalHeaderOffset + 68)
 Assert-LauncherWindow ($subsystem -eq 2) ('built launcher PE subsystem must be Windows GUI (2), not console (' + $subsystem + ')')
 
-# Exercise a copied launcher only from a disposable fixture directory whose
-# adjacent script is synthetic. The real application script is never run.
-$powerShellFound = $false
-foreach ($executable in @('powershell.exe', 'pwsh.exe')) {
-    foreach ($rawDirectory in @(([string]$env:PATH).Split([IO.Path]::PathSeparator))) {
-        $directory = $rawDirectory.Trim().Trim('"')
-        if ($directory.Length -eq 0) { continue }
-        if (Test-Path -LiteralPath (Join-Path $directory $executable) -PathType Leaf) {
-            $powerShellFound = $true
-            break
-        }
-    }
-    if ($powerShellFound) { break }
-}
-Assert-LauncherWindow $powerShellFound 'synthetic smoke requires PowerShell on PATH, as the launcher contract does'
+$standardPowerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$cmdHostPath = Join-Path $env:SystemRoot 'System32\cmd.exe'
+Assert-LauncherWindow (Test-Path -LiteralPath $standardPowerShellPath -PathType Leaf) 'synthetic CMD smoke requires the standard Windows PowerShell host'
+Assert-LauncherWindow (Test-Path -LiteralPath $cmdHostPath -PathType Leaf) 'synthetic CMD smoke requires cmd.exe'
 
 $tempParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
 $fixtureRoot = Join-Path $tempParent ('Token Rader Launcher Window Tests ' + [Guid]::NewGuid().ToString('N'))
@@ -108,60 +113,76 @@ Assert-LauncherWindow ($fixtureFullPath.StartsWith($tempParent + [IO.Path]::Dire
 [void][IO.Directory]::CreateDirectory($fixtureFullPath)
 
 try {
-    Copy-Item -LiteralPath $launcherPath -Destination (Join-Path $fixtureFullPath 'TokenRader.exe')
     Copy-Item -LiteralPath $cmdPath -Destination (Join-Path $fixtureFullPath 'Start-TokenRader.cmd')
     Copy-Item -LiteralPath $syntheticScriptPath -Destination (Join-Path $fixtureFullPath 'TokenRader.ps1')
 
-    $launcherStart = New-Object System.Diagnostics.ProcessStartInfo
-    $launcherStart.FileName = Join-Path $fixtureFullPath 'TokenRader.exe'
-    $launcherStart.WorkingDirectory = $fixtureFullPath
-    $launcherStart.UseShellExecute = $false
-    $launcherStart.CreateNoWindow = $true
-    $launcherStart.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
-    try {
-        $launcherProcess = [Diagnostics.Process]::Start($launcherStart)
-    } catch {
-        $policyBlock = Get-LauncherWindowPolicyBlockInfo $_
-        if ($null -ne $policyBlock) {
-            $nativeErrorText = if ($null -eq $policyBlock.NativeErrorCode) { 'unavailable' } else { [string]$policyBlock.NativeErrorCode }
-            throw ('LAUNCHER WINDOW TEST BLOCKED: local Application Control blocked the synthetic launcher process (native error code ' + $nativeErrorText + '). Static checks passed; runtime smoke was not attempted.')
-        }
-        throw
-    }
-    Assert-LauncherWindow ($null -ne $launcherProcess) 'synthetic direct launcher process must start'
-    try {
-        Assert-LauncherWindow ($launcherProcess.WaitForExit(5000)) 'launcher must return promptly after detaching its synthetic PowerShell child'
-    } finally {
-        $launcherProcess.Dispose()
-    }
-    Assert-SyntheticHiddenStaReport (Join-Path $fixtureFullPath 'launcher-smoke-result.txt') 'direct launcher'
-
     $reportPath = Join-Path $fixtureFullPath 'launcher-smoke-result.txt'
-    Remove-Item -LiteralPath $reportPath -Force
     $cmdStart = New-Object System.Diagnostics.ProcessStartInfo
-    $cmdStart.FileName = Join-Path $env:WINDIR 'System32\cmd.exe'
+    $cmdStart.FileName = $cmdHostPath
     $cmdStart.Arguments = '/d /c ""' + (Join-Path $fixtureFullPath 'Start-TokenRader.cmd') + '""'
     $cmdStart.WorkingDirectory = $fixtureFullPath
     $cmdStart.UseShellExecute = $false
-    $cmdStart.CreateNoWindow = $true
-    $cmdStart.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    # Keep cmd.exe's own console behavior normal so its CreateNoWindow setting
+    # cannot mask whether the child PowerShell host hides its console itself.
+    $cmdStart.CreateNoWindow = $false
+    $cmdStart.WindowStyle = [Diagnostics.ProcessWindowStyle]::Normal
+    $cmdStart.RedirectStandardOutput = $true
+    $cmdStart.RedirectStandardError = $true
     try {
         $cmdProcess = [Diagnostics.Process]::Start($cmdStart)
     } catch {
         $policyBlock = Get-LauncherWindowPolicyBlockInfo $_
         if ($null -ne $policyBlock) {
             $nativeErrorText = if ($null -eq $policyBlock.NativeErrorCode) { 'unavailable' } else { [string]$policyBlock.NativeErrorCode }
-            throw ('LAUNCHER WINDOW TEST BLOCKED: local Application Control blocked the synthetic .cmd smoke process (native error code ' + $nativeErrorText + ').')
+            throw ('LAUNCHER WINDOW TEST BLOCKED: local Application Control blocked the synthetic CMD process (native error code ' + $nativeErrorText + ').')
         }
         throw
     }
-    Assert-LauncherWindow ($null -ne $cmdProcess) '.cmd smoke process must start'
+    Assert-LauncherWindow ($null -ne $cmdProcess) 'synthetic .cmd process must start'
+    $stdoutTask = $cmdProcess.StandardOutput.ReadToEndAsync()
+    $stderrTask = $cmdProcess.StandardError.ReadToEndAsync()
     try {
         Assert-LauncherWindow ($cmdProcess.WaitForExit(5000)) '.cmd must exit promptly without waiting for its dashboard child'
+        $cmdProcess.WaitForExit()
+        $cmdOutput = $stdoutTask.GetAwaiter().GetResult() + "`n" + $stderrTask.GetAwaiter().GetResult()
+        if ($cmdOutput -match '(?i)Application Control policy has blocked this file|blocked by your system administrator' -or $cmdProcess.ExitCode -eq 1260) {
+            throw 'LAUNCHER WINDOW TEST BLOCKED: local Application Control blocked the synthetic PowerShell host or script; security policy was not changed.'
+        }
+        Assert-LauncherWindow ($cmdProcess.ExitCode -eq 0) ('.cmd must report a successful asynchronous launch; exit code=' + $cmdProcess.ExitCode)
     } finally {
         $cmdProcess.Dispose()
     }
-    Assert-SyntheticHiddenStaReport $reportPath '.cmd-to-launcher path'
+    Assert-SyntheticHiddenStaReport $reportPath '.cmd-to-PowerShell path'
+
+    if ($IncludeExe) {
+        # This branch is the only place where the real launcher executable is
+        # started. It still runs only against the synthetic fixture script.
+        Copy-Item -LiteralPath $launcherPath -Destination (Join-Path $fixtureFullPath 'TokenRader.exe')
+        Remove-Item -LiteralPath $reportPath -Force
+        $launcherStart = New-Object System.Diagnostics.ProcessStartInfo
+        $launcherStart.FileName = Join-Path $fixtureFullPath 'TokenRader.exe'
+        $launcherStart.WorkingDirectory = $fixtureFullPath
+        $launcherStart.UseShellExecute = $false
+        $launcherStart.CreateNoWindow = $true
+        $launcherStart.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+        try {
+            $launcherProcess = [Diagnostics.Process]::Start($launcherStart)
+        } catch {
+            $policyBlock = Get-LauncherWindowPolicyBlockInfo $_
+            if ($null -ne $policyBlock) {
+                $nativeErrorText = if ($null -eq $policyBlock.NativeErrorCode) { 'unavailable' } else { [string]$policyBlock.NativeErrorCode }
+                throw ('LAUNCHER WINDOW TEST BLOCKED: local Application Control blocked the synthetic launcher process (native error code ' + $nativeErrorText + '). Static checks passed; the opt-in runtime smoke did not complete.')
+            }
+            throw
+        }
+        Assert-LauncherWindow ($null -ne $launcherProcess) 'synthetic direct launcher process must start'
+        try {
+            Assert-LauncherWindow ($launcherProcess.WaitForExit(5000)) 'launcher must return promptly after detaching its synthetic PowerShell child'
+        } finally {
+            $launcherProcess.Dispose()
+        }
+        Assert-SyntheticHiddenStaReport $reportPath 'opt-in direct launcher path'
+    }
 } finally {
     # Verify the resolved deletion target is still exactly our dedicated temp
     # fixture before cleaning it up.
@@ -171,4 +192,8 @@ try {
     }
 }
 
-Write-Host 'PASS Launcher window: detached .cmd dispatch, GUI PE subsystem, and hidden STA synthetic child smoke.'
+if ($IncludeExe) {
+    Write-Host 'PASS Launcher window: direct PowerShell CMD path, GUI PE metadata, hidden STA synthetic child, and opt-in EXE runtime smoke.'
+} else {
+    Write-Host 'PASS Launcher window: direct PowerShell CMD path, GUI PE metadata, and hidden STA synthetic child. EXE runtime NOT TESTED (opt in with -IncludeExe).'
+}

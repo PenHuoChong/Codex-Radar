@@ -75,7 +75,7 @@ Token Rader 在本机解析这些日志，不要求 API Key，也不会上传提
 git clone https://github.com/lmy1390734971-netizen/Codex-Limit-USD-Radar.git
 Set-Location .\Codex-Limit-USD-Radar
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Run-Tests.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\TokenRader.ps1
+powershell.exe -NoProfile -STA -File .\TokenRader.ps1
 ```
 
 本项目没有 `requirements.txt`，不需要执行 `pip install`。
@@ -84,17 +84,27 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\TokenRader.ps1
 
 也可以下载完整项目目录，然后使用任一方式启动：
 
-1. 双击 `TokenRader.exe`；
-2. 双击 `Start-TokenRader.cmd`；
+1. 双击 `Start-TokenRader.cmd`（推荐的标准脚本入口，不依赖自制 EXE）；
+2. 在系统允许该程序运行的环境下，双击 `TokenRader.exe`；
 3. 在项目目录运行：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\TokenRader.ps1
+powershell.exe -NoProfile -STA -File .\TokenRader.ps1
 ```
 
-日常使用建议双击 `TokenRader.exe`，只显示仪表盘，不保留命令行窗口。`Start-TokenRader.cmd` 会转交给同目录的 EXE 后立即退出；Windows 启动批处理时仍可能短暂闪现控制台。直接运行上面的 PowerShell 命令保留终端，适用于查看调试错误，不会隐藏你已有的终端窗口。
+日常使用建议双击 `Start-TokenRader.cmd`。它通过 Windows 自带 PowerShell 的 `-File -STA -WindowStyle Hidden` 参数启动同目录脚本后立即退出，不经过 `TokenRader.exe`，不保留 CMD/PowerShell 控制台窗口；启动批处理时仍可能短暂闪现控制台。入口不设置执行策略、不请求提权、不自动切换宿主或解除文件阻止。直接运行上面的 PowerShell 命令保留终端，适用于查看调试错误，不会隐藏你已有的终端窗口。
 
-仓库中的启动器没有商业代码签名。若 Windows 显示 SmartScreen 提示，可以运行 PowerShell 脚本，或审查启动器源码后自行构建：
+仓库中的启动器没有受信任的代码签名。SmartScreen 提示与 Smart App Control / 应用控制策略拦截不是同一机制：重新编译不能保证解除拦截。标准脚本入口也必须通过本机对脚本、模块和 DLL 的策略检查，不能保证在所有受控机器上运行。若被阻止或处于受限语言模式，请停止，不关闭安全防护、不添加绕过参数；使用符合本机策略的可信签名发行版，或由设备管理员按组织流程处理。隐藏窗口本身不改变信任判断。
+
+可用以下命令验证标准宿主、合成 WPF 窗口、索引器加载及内存数据库；不启动真实仪表盘，不读取账号、日志或真实索引，不改安全策略：
+
+```powershell
+powershell.exe -NoProfile -STA -File .\tests\Test-StandardPowerShellStartup.ps1
+```
+
+需要验证真实主窗口的打开与正常关闭时，可运行 `tests/Run-StandardStartupIntegrationTests.ps1`。它只复制白名单代码文件和依赖到临时目录，为子进程单独设置空的合成 `CODEX_HOME`；不复制或读取真实日志、账号及项目索引。`tests/Run-LauncherWindowTests.ps1` 默认验证 CMD 标准入口的隐藏控制台和 STA；EXE 仅检查文件结构，实际 EXE 启动测试须显式指定 `-IncludeExe`，仅用于系统允许该 EXE 的环境，不把未测 EXE 宣称为通过。
+
+仅需重新构建时（构建不代表系统会信任产物）：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
@@ -671,7 +681,7 @@ Codex-Limit-USD-Radar/
 ├─ LICENSE                           # MIT 许可证
 ├─ MainWindow.xaml                   # WPF 布局与样式
 ├─ pricing.json                      # 模型价格、阈值和官方来源
-├─ Start-TokenRader.cmd              # PowerShell 宿主回退启动脚本
+├─ Start-TokenRader.cmd              # 遵循本机策略的隐藏控制台标准脚本入口
 ├─ THIRD_PARTY_NOTICES.md            # 第三方参考与声明
 ├─ TokenRader.Core.psm1              # 日志解析、去重、计价和额度算法
 ├─ TokenRader.exe                    # 预构建启动器
