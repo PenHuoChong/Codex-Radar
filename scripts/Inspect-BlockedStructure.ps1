@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$ProjectRoot = '', [switch]$ReadOnlyStructureAuthorized)
+param([string]$ProjectRoot = '', [switch]$ReadOnlyStructureAuthorized, [switch]$OnlyOversized, [string]$IndexerDll = '')
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $db = $null
@@ -8,7 +8,8 @@ try {
     if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
     $ProjectRoot = [IO.Path]::GetFullPath($ProjectRoot)
     Add-Type -Path (Join-Path $ProjectRoot 'indexer/System.Data.SQLite.dll')
-    Add-Type -Path (Join-Path $ProjectRoot 'indexer/TokenRader.Indexer.dll')
+    if ([string]::IsNullOrWhiteSpace($IndexerDll)) { $IndexerDll = Join-Path $ProjectRoot 'indexer/TokenRader.Indexer.dll' }
+    Add-Type -Path $IndexerDll
     $scanType = [TokenRaderIndexer].GetNestedType('SafeOversizedBodyScan', [Reflection.BindingFlags]::NonPublic)
     if ($null -eq $scanType) { throw [InvalidOperationException]::new('Production scanner unavailable.') }
     if ($null -eq ('TokenRaderBlockedInspection.Scanner' -as [type])) {
@@ -30,6 +31,8 @@ namespace TokenRaderBlockedInspection {
   public string UnknownRootFieldsDetail, UnknownPayloadFieldsDetail, UnknownItemFieldsDetail;
   public string ParsedCommandFields, ParsedCommandTypes, ParsedCommandFieldValueTypes, CommandFirstFailure, ToolOutputFirstFailure;
   public string OutputItemTypes, OutputItemFieldValueTypes;
+  public string ChangeEntryFields, ChangeEntryTypes, MessagePartTypes, MessagePartFields;
+  public string OversizedValidation;
  }
  internal sealed class Frame { public int Scope; public bool Object, ExpectKey, ValuePending; public string Key=""; }
  internal sealed class Projection {
@@ -51,9 +54,12 @@ namespace TokenRaderBlockedInspection {
    "shell_call","shell_call_output","mcp_call","web_search_call","image_generation_call","computer_call","code_interpreter_call"
   },StringComparer.Ordinal);
   readonly List<Frame> frames=new List<Frame>();
-  readonly SortedSet<string>[] names={new SortedSet<string>(),new SortedSet<string>(),new SortedSet<string>(),new SortedSet<string>(),new SortedSet<string>(),new SortedSet<string>(),new SortedSet<string>(),new SortedSet<string>(),new SortedSet<string>(),new SortedSet<string>(),new SortedSet<string>()};
-  readonly SortedDictionary<string,string>[] extra={new SortedDictionary<string,string>(),new SortedDictionary<string,string>(),new SortedDictionary<string,string>(),new SortedDictionary<string,string>(),new SortedDictionary<string,string>(),new SortedDictionary<string,string>(),new SortedDictionary<string,string>(),new SortedDictionary<string,string>(),new SortedDictionary<string,string>(),new SortedDictionary<string,string>(),new SortedDictionary<string,string>()};
-  readonly int[] unknown=new int[11]; readonly string[] types={"<absent>","<absent>","<absent>"};
+  readonly SortedSet<string>[] names=CreateNames();
+  static SortedSet<string>[] CreateNames(){var a=new SortedSet<string>[15];for(int i=0;i<a.Length;i++)a[i]=new SortedSet<string>();return a;}
+  readonly SortedDictionary<string,string>[] extra=CreateExtra();
+  static SortedDictionary<string,string>[] CreateExtra(){var a=new SortedDictionary<string,string>[15];for(int i=0;i<a.Length;i++)a[i]=new SortedDictionary<string,string>();return a;}
+  readonly int[] unknown=new int[15]; readonly string[] types={"<absent>","<absent>","<absent>"};
+  readonly SortedSet<string> changeTypes=new SortedSet<string>(),messageTypes=new SortedSet<string>();
   readonly SortedSet<string> parsedTypes=new SortedSet<string>();
   readonly SortedSet<string> outputTypes=new SortedSet<string>();
   readonly StringBuilder token=new StringBuilder(128);
@@ -70,7 +76,9 @@ namespace TokenRaderBlockedInspection {
       if(keyString) { f.Key=Identifier(value)?value:""; if(Fields.Contains(value))names[stringScope-1].Add(value);else {unknown[stringScope-1]++;if(f.Key.Length>0&&(extra[stringScope-1].Count<64||extra[stringScope-1].ContainsKey(f.Key)))extra[stringScope-1][f.Key]="<unobserved>";} f.ExpectKey=false; }
       else if(stringScope==9)parsedTypes.Add(value=="read"||value=="list_files"||value=="search"?value:"unknown");
       else if(stringScope==11)outputTypes.Add(Types.Contains(value)?value:"<unknown-or-escaped>");
-      else types[stringScope-1]=Types.Contains(value)?value:"<unknown-or-escaped>";
+      else if(stringScope==13)changeTypes.Add(Identifier(value)?value:"<unknown-or-escaped>");
+      else if(stringScope==15)messageTypes.Add(Identifier(value)?value:"<unknown-or-escaped>");
+      else types[stringScope-1]=Identifier(value)?value:"<unknown-or-escaped>";
      } else if(keyString && frames.Count>0) { frames[frames.Count-1].Key=""; frames[frames.Count-1].ExpectKey=false; }
      token.Clear(); return;
     }
@@ -88,7 +96,7 @@ namespace TokenRaderBlockedInspection {
    if(b=='"') {
     quoted=true;escape=overflow=escaped=false;token.Clear(); Frame f=frames.Count>0?frames[frames.Count-1]:null;
     keyString=f!=null&&f.Object&&f.ExpectKey;stringScope=f==null?0:f.Scope;
-    capture=stringScope>0&&(keyString||(stringScope<=3||stringScope==9||stringScope==11)&&f.Key=="type");return;
+    capture=stringScope>0&&stringScope!=12&&(keyString||(stringScope<=3||stringScope==9||stringScope==11||stringScope==13||stringScope==15)&&f.Key=="type");return;
    }
    if(b=='{'||b=='[') {
     if(frames.Count>=256){Failed=true;return;}
@@ -98,6 +106,10 @@ namespace TokenRaderBlockedInspection {
     else if(parent!=null&&parent.Scope==8&&b=='{')scope=9;
     else if(parent!=null&&parent.Scope==2&&parent.Key=="output"&&b=='[')scope=10;
     else if(parent!=null&&parent.Scope==10&&b=='{')scope=11;
+    else if(parent!=null&&parent.Scope==3&&parent.Key=="changes"&&b=='{')scope=12;
+    else if(parent!=null&&parent.Scope==12&&b=='{')scope=13;
+    else if(parent!=null&&parent.Scope==2&&parent.Key=="content"&&b=='[')scope=14;
+    else if(parent!=null&&parent.Scope==14&&b=='{')scope=15;
     frames.Add(new Frame{Scope=scope,Object=b=='{',ExpectKey=b=='{'});return;
    }
    if(b=='}'||b==']'){if(frames.Count>0)frames.RemoveAt(frames.Count-1);else Failed=true;return;}
@@ -115,6 +127,8 @@ namespace TokenRaderBlockedInspection {
    f.UnknownRootFieldsDetail=Details(extra[0]);f.UnknownPayloadFieldsDetail=Details(extra[1]);f.UnknownItemFieldsDetail=Details(extra[2]);
    f.ParsedCommandFields=string.Join(",",names[8]);f.ParsedCommandTypes=string.Join(",",parsedTypes);f.ParsedCommandFieldValueTypes=Details(extra[8]);
    f.OutputItemTypes=string.Join(",",outputTypes);f.OutputItemFieldValueTypes=Details(extra[10]);
+   f.ChangeEntryFields=Details(extra[12]);f.ChangeEntryTypes=string.Join(",",changeTypes);
+   f.MessagePartFields=Details(extra[14]);f.MessagePartTypes=string.Join(",",messageTypes);
    // This is only a lexical field/type projection. Production Complete is
    // the strict validator; false here is NOT proof of valid JSON/schema.
    f.LexicalProjectionIncomplete=Failed||quoted||frames.Count!=0;
@@ -156,12 +170,15 @@ namespace TokenRaderBlockedInspection {
    object state=ctor.Invoke(null); Action<int> feed=(Action<int>)Delegate.CreateDelegate(typeof(Action<int>),state,feedMethod);
    Projection projection=new Projection();CommandTrace trace=new CommandTrace(state),outputTrace=new CommandTrace(state,"toolOutput",14);long length=0,lineStart=0,position=0;bool previousCR=false;
    byte[] buffer=new byte[65536];
+   List<string> validation=new List<string>();
    using(FileStream stream=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete)) {
     int count;while(position<gapEnd&&(count=stream.Read(buffer,0,(int)Math.Min(buffer.Length,gapEnd-position)))>0) for(int i=0;i<count;i++) {
      int b=buffer[i];position++;if(previousCR&&b==10){previousCR=false;lineStart=position;continue;}previousCR=false;
      if(b==10||b==13) {
       Finding finding=new Finding{Length=length,Terminated=true,InBlockedGap=lineStart<gapEnd&&position>gapStart,CommandFirstFailure=trace.Failure,ToolOutputFirstFailure=outputTrace.Failure};projection.Copy(finding);
       bool accepted=(bool)complete.GetValue(state,null);
+      if(finding.InBlockedGap&&length>1048576)validation.Add("Length="+length+",Accepted="+accepted);
+      finding.OversizedValidation=string.Join(";",validation.ToArray());
       if(finding.InBlockedGap&&(length>1048576&&!accepted || finding.RootType=="compacted"&&!accepted)) {finding.Found=true;return finding;}
       state=ctor.Invoke(null);feed=(Action<int>)Delegate.CreateDelegate(typeof(Action<int>),state,feedMethod);
       projection=new Projection();trace=new CommandTrace(state);outputTrace=new CommandTrace(state,"toolOutput",14);length=0;lineStart=position;previousCR=b==13;continue;
@@ -170,6 +187,7 @@ namespace TokenRaderBlockedInspection {
     }
    }
    Finding tail=new Finding{Length=length,Terminated=false,InBlockedGap=lineStart<gapEnd&&position>gapStart,CommandFirstFailure=trace.Failure,ToolOutputFirstFailure=outputTrace.Failure};projection.Copy(tail);
+   tail.OversizedValidation=string.Join(";",validation.ToArray());
    if(tail.InBlockedGap&&(length>1048576||tail.RootType=="compacted"))tail.Found=true;
    return tail;
   }
@@ -200,11 +218,14 @@ namespace TokenRaderBlockedInspection {
                 Write-Host ('Sample={0}; RootFieldValueTypes=[{1}]; PayloadFieldValueTypes=[{2}]; ItemFieldValueTypes=[{3}]; ParsedCommandFields=[{4}]; ParsedCommandTypes=[{5}]; ParsedCommandFieldValueTypes=[{6}]; CommandFirstFailure=[{7}]' -f $number,$finding.UnknownRootFieldsDetail,$finding.UnknownPayloadFieldsDetail,$finding.UnknownItemFieldsDetail,$finding.ParsedCommandFields,$finding.ParsedCommandTypes,$finding.ParsedCommandFieldValueTypes,$finding.CommandFirstFailure)
                 Write-Host ('Sample={0}; ToolOutputFirstFailure=[{1}]' -f $number,$finding.ToolOutputFirstFailure)
                 Write-Host ('Sample={0}; OutputItemTypes=[{1}]; OutputItemFieldValueTypes=[{2}]' -f $number,$finding.OutputItemTypes,$finding.OutputItemFieldValueTypes)
+                Write-Host ('Sample={0}; ChangeEntryTypes=[{1}]; ChangeEntryFields=[{2}]; MessagePartTypes=[{3}]; MessagePartFields=[{4}]' -f $number,$finding.ChangeEntryTypes,$finding.ChangeEntryFields,$finding.MessagePartTypes,$finding.MessagePartFields)
+                Write-Host ('Sample={0}; OversizedValidation=[{1}]' -f $number,$finding.OversizedValidation)
                 if ($finding.RootType -eq 'compacted') {
                     Write-Host ('Sample={0}; LatestUsageRecordFieldPresent={1}; LatestUsageRecordFields=[{2}]; UsageFields=[{3}]; ThreadUsageFields=[{4}]; TurnUsageFields=[{5}]; UsageFieldPresenceMasks={6}/{7}/{8}; MaskBits=input,cached,output,reasoning,total,cache_write; PresenceIsValidation=False' -f $number,$finding.LatestUsageRecordFieldPresent,$finding.LatestUsageRecordFields,$finding.UsageFields,$finding.ThreadUsageFields,$finding.TurnUsageFields,$finding.UsageFieldMask,$finding.ThreadUsageFieldMask,$finding.TurnUsageFieldMask)
                 }
             } catch { Write-Host ('Sample={0}; Status=inspection_failed; ExceptionType={1}' -f $number,$_.Exception.GetType().FullName) }
         }
+        if (-not $OnlyOversized) {
         $cmd.CommandText = "SELECT g.path,COALESCE(f.length,-1) FROM (SELECT path FROM recent_history_work WHERE blocked_reason='source_replaced' UNION SELECT path FROM history_gaps WHERE blocked_reason='source_replaced') g LEFT JOIN file_metadata f ON f.path=g.path ORDER BY CASE WHEN f.length IS NULL THEN 1 ELSE 0 END,f.length,g.path LIMIT 1"
         $reader = $cmd.ExecuteReader()
         $replacedPath = $null
@@ -234,6 +255,7 @@ namespace TokenRaderBlockedInspection {
                     Write-Host ('Sample={0}; Ledger={1}; BodyStateEmpty={2}; BodyStateLength={3}; KnownProtocol={4}; StateWithinProductionLimit={5}; StoredCreationValid={6}; StoredCreationMatchesCurrent={7}; ProductionSourceMatchConditions={8}' -f $number,[string]$reader.GetValue(0),[string]::IsNullOrEmpty($state),$state.Length,$knownProtocol,($state.Length -le 600),$storedTicksValid,$ticksEqual,($knownProtocol -and $state.Length -gt 0 -and $state.Length -le 600 -and $ticksEqual))
                 }
             } finally { $reader.Dispose() }
+        }
         }
     } finally { $cmd.Dispose() }
 } catch { Write-Host ('Status=inspection_setup_failed; ExceptionType={0}' -f $_.Exception.GetType().FullName) }

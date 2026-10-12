@@ -2134,7 +2134,7 @@ public static partial class TokenRaderIndexer
 
     // Advance intentionally whenever accepted streaming record schemas change.
     // This is independent of each DFA's continuation serialization protocol.
-    public const int RecentHistoryParserVersion = 7;
+    public const int RecentHistoryParserVersion = 8;
 
     /// <summary>Freeze pending gaps once; following batches never chase append EOF.</summary>
     public static TokenRaderHistoryBackfillResult PrepareRecentHistory(SQLiteConnection db,
@@ -3534,6 +3534,7 @@ public static partial class TokenRaderIndexer
         if (string.IsNullOrWhiteSpace(line)) return false;
         return line.IndexOf("function_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
             line.IndexOf("CommandExecution", StringComparison.Ordinal) >= 0 ||
+            line.IndexOf("FileChange", StringComparison.Ordinal) >= 0 ||
             line.IndexOf("custom_tool_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
             line.IndexOf("tool_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
             line.IndexOf("shell_call", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -3565,7 +3566,8 @@ public static partial class TokenRaderIndexer
         if (string.Equals(record.Type, "compacted", StringComparison.Ordinal)) return 0;
         if (string.Equals(record.Type, "response_item", StringComparison.Ordinal) && record.Payload != null &&
             (string.Equals(record.Payload.Type, "custom_tool_call_output", StringComparison.Ordinal) ||
-             string.Equals(record.Payload.Type, "function_call_output", StringComparison.Ordinal))) {
+             string.Equals(record.Payload.Type, "function_call_output", StringComparison.Ordinal) ||
+             string.Equals(record.Payload.Type, "message", StringComparison.Ordinal))) {
             var scan = new ToolOutputBodyScan();
             foreach (byte value in Encoding.UTF8.GetBytes(line)) scan.Feed(value);
             if (scan.Complete)
@@ -3577,7 +3579,8 @@ public static partial class TokenRaderIndexer
         }
         if (string.Equals(record.Type, "event_msg", StringComparison.Ordinal) &&
             record.Payload != null && string.Equals(record.Payload.Type, "item_completed", StringComparison.Ordinal) &&
-            line.IndexOf("CommandExecution", StringComparison.Ordinal) >= 0)
+            (line.IndexOf("CommandExecution", StringComparison.Ordinal) >= 0 ||
+             line.IndexOf("FileChange", StringComparison.Ordinal) >= 0))
         {
             var scan = new CommandExecutionBodyScan();
             foreach (byte value in Encoding.UTF8.GetBytes(line)) scan.Feed(value);
@@ -3651,9 +3654,9 @@ public static partial class TokenRaderIndexer
         long ticks = observedAt.UtcDateTime.Ticks;
         if (cutoffEventTicks > 0L && ticks < cutoffEventTicks) return 0;
         UpsertToolRecord(db, transaction,
-            BuildToolSourceEventKey(sourcePath, sourceOffsetEnd, "tool_call", "shell"),
+            BuildToolSourceEventKey(sourcePath, sourceOffsetEnd, "tool_call", projection.ToolName),
             projection.CallId, sessionId, ticks, observedAt.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture),
-            model, "tool_call", "shell", NormalizeToolStatus(projection.Status), 0,
+            model, "tool_call", projection.ToolName, NormalizeToolStatus(projection.Status), 0,
             sourcePath, sourceOffsetEnd, rootSessionId, indexRevision);
         return 1;
     }
@@ -7505,6 +7508,7 @@ public static partial class TokenRaderIndexer
         public string Timestamp;
         public string CallId;
         public string Status;
+        public string ToolName = "shell";
     }
 
     // A closed schema, not a permissive JSON skipper. Output/command/cwd strings
@@ -7516,17 +7520,20 @@ public static partial class TokenRaderIndexer
             new string[0],
             new[] { "timestamp", "type", "ordinal", "payload" },
             new[] { "type", "thread_id", "turn_id", "started_at_ms", "completed_at_ms", "item" },
-            new[] { "type", "id", "command", "cwd", "process_id", "source", "status", "exit_code", "duration", "stdout", "stderr", "aggregated_output", "formatted_output", "parsed_cmd" },
+            new[] { "type", "id", "command", "cwd", "process_id", "source", "status", "exit_code", "duration", "stdout", "stderr", "aggregated_output", "formatted_output", "parsed_cmd", "changes" },
             new[] { "secs", "nanos" },
             new string[0],
             new[] { "type", "cmd", "name", "path", "query" },
-            new string[0] // item.command: array of opaque, validated strings
+            new string[0], // item.command: array of opaque, validated strings
+            new string[0], // FileChange.changes: dynamic path keys, never retained
+            new[] { "type", "content" } // only the verified add variant
         };
         private static readonly string[] ParsedTypes = { "unknown", "read", "list_files", "search" };
+        private static readonly string[] CompletionTypes = { "CommandExecution", "FileChange" };
         // invalid/depth/done/mode/match/position/escape/unicode/UTF8 bounds,
         // numeric stage, five kind/stage/seen/key frames, then the current
         // parsed-command variant and null-field mask. No command/path text.
-        private readonly int[] s = new int[34];
+        private readonly int[] s = new int[36];
         private string timestamp = "", callId = "", status = "";
         public bool CanContinue { get { return s[0] == 0; } }
         public bool Complete { get { return CanContinue && s[1] == 0 && s[2] == 1 && s[3] == 0; } }
@@ -7538,23 +7545,25 @@ public static partial class TokenRaderIndexer
             if (p.Length != 4) { Fail(); return; }
             string[] values = p[0].Split(',');
             bool legacy = values.Length == 33 && values[0] == "1";
-            if (!legacy && (values.Length != s.Length + 1 || values[0] != "2")) { Fail(); return; }
-            for (int i = 0; i < (legacy ? 32 : s.Length); i++)
-                if (!int.TryParse(values[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || s[i] > 16383) { Fail(); return; }
+            bool previous = values.Length == 35 && values[0] == "2";
+            if (!legacy && !previous && (values.Length != s.Length + 1 || values[0] != "3")) { Fail(); return; }
+            for (int i = 0; i < (legacy ? 32 : previous ? 34 : s.Length); i++)
+                if (!int.TryParse(values[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || s[i] > 32767) { Fail(); return; }
+            if (legacy || previous) s[34] = 1;
             try {
                 timestamp = RestoreMetadata(p[1]);
                 callId = RestoreMetadata(p[2]);
                 status = RestoreMetadata(p[3]);
             } catch { Fail(); return; }
-            if (s[0] > 1 || s[1] > 5 || s[2] > 1 || s[3] > (legacy ? 6 : 7) || s[5] > 256 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[9] > 255 || s[10] > 255 || s[11] > 3 || s[32] > 4 || s[33] > 31 || timestamp.Length > 48 || callId.Length > 128 || status.Length > 24) { Fail(); return; }
+            if (s[0] > 1 || s[1] > 5 || s[2] > 1 || s[3] > (legacy ? 6 : previous ? 7 : 9) || s[5] > 256 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[9] > 255 || s[10] > 255 || s[11] > 3 || s[32] > 4 || s[33] > 31 || s[34] > 2 || s[35] > 1536 || timestamp.Length > 48 || callId.Length > 128 || status.Length > 24) { Fail(); return; }
             if ((s[3] != 0 && s[1] == 0) || (s[2] == 1 && s[1] != 0)) { Fail(); return; }
             for (int i = 0; i < s[1]; i++) {
                 int f = 12+i*4, kind = s[f];
-                int keyCount = legacy && kind == 6 ? 2 : kind >= 1 && kind <= 7 ? Keys[kind].Length : 0;
-                if (kind < 1 || kind > 7 || s[f+1] > 4 || s[f+3] > keyCount || (s[f+2] >> keyCount) != 0) { Fail(); return; }
+                int keyCount = legacy && kind == 6 ? 2 : kind >= 1 && kind <= 9 ? Keys[kind].Length : 0;
+                if (kind < 1 || kind > (legacy || previous ? 7 : 9) || s[f+1] > 4 || s[f+3] > keyCount || (s[f+2] >> keyCount) != 0) { Fail(); return; }
                 if (i < 3 && kind != i+1) { Fail(); return; }
-                if (i == 3 && kind != 4 && kind != 5 && kind != 7) { Fail(); return; }
-                if (i == 4 && (kind != 6 || s[f-4] != 5)) { Fail(); return; }
+                if (i == 3 && kind != 4 && kind != 5 && kind != 7 && kind != 8) { Fail(); return; }
+                if (i == 4 && !(kind == 6 && s[f-4] == 5 || kind == 9 && s[f-4] == 8)) { Fail(); return; }
             }
             if (legacy && s[1] == 5) {
                 // V1 can only have accepted the unknown variant. Its existing
@@ -7568,7 +7577,7 @@ public static partial class TokenRaderIndexer
         }
         public string Save()
         {
-            string[] values = new string[s.Length+1]; values[0] = "2";
+            string[] values = new string[s.Length+1]; values[0] = "3";
             for (int i = 0; i < s.Length; i++) values[i+1] = s[i].ToString(CultureInfo.InvariantCulture);
             return string.Join(",", values) + "~" + Convert.ToBase64String(Encoding.ASCII.GetBytes(timestamp)) + "~" + Convert.ToBase64String(Encoding.ASCII.GetBytes(callId)) + "~" + Convert.ToBase64String(Encoding.ASCII.GetBytes(status));
         }
@@ -7583,7 +7592,7 @@ public static partial class TokenRaderIndexer
             get {
                 DateTimeOffset at;
                 return Complete && !string.IsNullOrWhiteSpace(callId) && TryParseTimestamp(timestamp, out at) && IsCompletionStatus(status)
-                    ? new CommandExecutionProjection { Timestamp = timestamp, CallId = callId, Status = status } : null;
+                    ? new CommandExecutionProjection { Timestamp = timestamp, CallId = callId, Status = status, ToolName = s[34] == 2 ? "apply_patch" : "shell" } : null;
             }
         }
         private static bool IsCompletionStatus(string value)
@@ -7593,10 +7602,10 @@ public static partial class TokenRaderIndexer
         }
         private void Fail() { s[0] = 1; }
         private static bool Space(int b) { return b == 32 || b == 9 || b == 13 || b == 10; }
-        private string ExpectedType { get { int k = s[Frame]; return k == 1 ? "event_msg" : k == 2 ? "item_completed" : k == 3 ? "CommandExecution" : "unknown"; } }
+        private string ExpectedType { get { int k = s[Frame]; return k == 1 ? "event_msg" : k == 2 ? "item_completed" : k == 3 ? "CommandExecution" : k == 9 ? "add" : "unknown"; } }
         private void BeginString(int mode)
         {
-            s[3] = mode; s[4] = mode == 2 ? (1 << Keys[s[Frame]].Length)-1 : mode == 7 ? 15 : 0;
+            s[3] = mode; s[4] = mode == 2 ? (1 << Keys[s[Frame]].Length)-1 : mode == 7 ? 15 : mode == 8 ? 3 : 0;
             s[5] = s[6] = s[7] = s[8] = 0;
         }
         private void Push(int kind)
@@ -7609,7 +7618,8 @@ public static partial class TokenRaderIndexer
         private void Close(int b)
         {
             int f = Frame, kind = s[f];
-            int required = kind == 1 ? 11 : kind == 2 ? 33 : kind == 3 ? 67 : kind == 4 ? 3 : kind == 6 ? 3 : 0;
+            int required = kind == 1 ? 11 : kind == 2 ? 33 : kind == 3 ? (s[34] == 2 ? 17987 : 67) : kind == 4 || kind == 6 || kind == 9 ? 3 : 0;
+            if (kind == 3 && (s[34] == 0 || (s[f+2] & ~(s[34] == 2 ? 17987 : 16383)) != 0 || s[34] == 2 && s[35] != 0)) { Fail(); return; }
             if (kind == 6) {
                 // The discriminator may appear last, so enforce each closed
                 // variant shape at object end. Hint strings are discarded.
@@ -7627,7 +7637,8 @@ public static partial class TokenRaderIndexer
         private void EndString()
         {
             int f = Frame, kind = s[f], mode = s[3]; s[3] = 0;
-            if (mode == 2) {
+            if (mode == 9) s[f+1] = 1;
+            else if (mode == 2) {
                 int key = -1;
                 for (int i = 0; i < Keys[kind].Length; i++) if ((s[4] & (1 << i)) != 0 && Keys[kind][i].Length == s[5]) { key = i; break; }
                 if (key < 0 || (s[f+2] & (1 << key)) != 0) { Fail(); return; }
@@ -7639,6 +7650,12 @@ public static partial class TokenRaderIndexer
                     for (int i = 0; i < ParsedTypes.Length; i++) if ((s[4] & (1 << i)) != 0 && ParsedTypes[i].Length == s[5]) { variant = i+1; break; }
                     if (variant == 0) { Fail(); return; }
                     s[32] = variant;
+                }
+                if (mode == 8) {
+                    int variant = 0;
+                    for (int i = 0; i < CompletionTypes.Length; i++) if ((s[4] & (1 << i)) != 0 && CompletionTypes[i].Length == s[5]) { variant = i+1; break; }
+                    if (variant == 0) { Fail(); return; }
+                    s[34] = variant;
                 }
                 s[f+1] = 3;
             }
@@ -7683,6 +7700,10 @@ public static partial class TokenRaderIndexer
                     for (int i = 0; i < ParsedTypes.Length; i++) if ((s[4] & (1 << i)) != 0 && (s[5] >= ParsedTypes[i].Length || ParsedTypes[i][s[5]] != b)) s[4] &= ~(1 << i);
                     s[5]++; if (s[4] == 0) Fail(); return;
                 }
+                if (s[3] == 8) {
+                    for (int i = 0; i < CompletionTypes.Length; i++) if ((s[4] & (1 << i)) != 0 && (s[5] >= CompletionTypes[i].Length || CompletionTypes[i][s[5]] != b)) s[4] &= ~(1 << i);
+                    s[5]++; if (s[4] == 0) Fail(); return;
+                }
                 if (s[3] == 4) {
                     // Identity fields are bounded printable ASCII, with no escape
                     // ambiguity. Nonstandard metadata stays conservatively blocked.
@@ -7708,19 +7729,19 @@ public static partial class TokenRaderIndexer
                 if (stage == 0 && b == (kind0 == 5 || kind0 == 7 ? ']' : '}')) { Close(b); return; }
                 if (kind0 == 5) { if (b == '{') Push(6); else Fail(); }
                 else if (kind0 == 7) { if (b == '"') BeginString(1); else Fail(); }
-                else if (b == '"') BeginString(2); else Fail();
+                else if (b == '"') BeginString(kind0 == 8 ? 9 : 2); else Fail();
             } else if (stage == 1) { if (b == ':') s[f0+1] = 2; else Fail(); }
             else if (stage == 2) {
                 if (kind0 == 3 && key0 == 3 && b == '[') { Push(7); return; }
-                int child = kind0 == 1 && key0 == 4 ? 2 : kind0 == 2 && key0 == 6 ? 3 : kind0 == 3 && key0 == 9 ? 4 : kind0 == 3 && key0 == 14 ? 5 : 0;
-                bool nullable = kind0 == 3 && (key0 == 5 || key0 == 8 || key0 >= 9) || kind0 == 6 && (key0 == 4 || key0 == 5);
+                int child = kind0 == 1 && key0 == 4 ? 2 : kind0 == 2 && key0 == 6 ? 3 : kind0 == 3 && key0 == 9 ? 4 : kind0 == 3 && key0 == 14 ? 5 : kind0 == 3 && key0 == 15 ? 8 : kind0 == 8 ? 9 : 0;
+                bool nullable = kind0 == 3 && (key0 == 5 || key0 == 8 || key0 >= 9 && key0 <= 14) || kind0 == 6 && (key0 == 4 || key0 == 5);
                 if (child > 0 && b == (child == 5 ? '[' : '{')) Push(child);
-                else if (nullable && b == 'n') { if (kind0 == 6) s[33] |= 1 << (key0-1); s[3] = 6; s[5] = 0; Feed(b); }
+                else if (nullable && b == 'n') { if (kind0 == 6) s[33] |= 1 << (key0-1); if (kind0 == 3 && (key0 == 10 || key0 == 11)) s[35] |= 1 << (key0-1); s[3] = 6; s[5] = 0; Feed(b); }
                 else if (child > 0) Fail();
                 else {
                     bool numeric = kind0 == 1 && key0 == 3 || kind0 == 2 && (key0 == 4 || key0 == 5) || kind0 == 4 || kind0 == 3 && (key0 == 5 || key0 == 8);
                     bool text = !numeric || kind0 == 3 && key0 == 5;
-                    if (text && b == '"') BeginString(kind0 == 6 && key0 == 1 ? 7 : (kind0 == 1 && key0 == 2 || kind0 != 1 && key0 == 1) ? 3 : (kind0 == 1 && key0 == 1 || kind0 == 3 && (key0 == 2 || key0 == 7)) ? 4 : 1);
+                    if (text && b == '"') BeginString(kind0 == 3 && key0 == 1 ? 8 : kind0 == 6 && key0 == 1 ? 7 : (kind0 == 1 && key0 == 2 || kind0 != 1 && key0 == 1) ? 3 : (kind0 == 1 && key0 == 1 || kind0 == 3 && (key0 == 2 || key0 == 7)) ? 4 : 1);
                     else if (numeric && (b == '-' || b >= '0' && b <= '9')) { s[3] = 5; s[5] = 0; s[11] = b == '-' ? 1 : 0; if (b != '-') Feed(b); }
                     else Fail();
                 }
@@ -7922,11 +7943,12 @@ public static partial class TokenRaderIndexer
         private static readonly string[][] Keys = {
             new string[0],
             new[] { "timestamp", "type", "ordinal", "payload", "metadata" },
-            new[] { "type", "id", "call_id", "output", "internal_chat_message_metadata_passthrough" },
+            new[] { "type", "id", "call_id", "output", "internal_chat_message_metadata_passthrough", "role", "content", "phase", "end_turn", "recipient" },
             new string[0], new string[0], new string[0],
             new[] { "type", "text", "image_url", "detail" }
         };
-        private static readonly string[] Types = { "response_item", "custom_tool_call_output", "function_call_output", "input_text", "input_image" };
+        private static readonly string[] Types = { "response_item", "custom_tool_call_output", "function_call_output", "input_text", "input_image", "message", "output_text", "text" };
+        private static readonly string[] Roles = { "user", "assistant", "system", "developer" };
         private static readonly string[] Literals = { "true", "false", "null" };
         private const int MaxDepth = 24;
         // Numeric enums/counters plus bounded date metadata, never text/URLs.
@@ -7934,6 +7956,8 @@ public static partial class TokenRaderIndexer
         private readonly int[] s = new int[14+MaxDepth*4];
         private string timestamp = "";
         private bool timestampValid = true, timestampClosed;
+        private int payloadVariant; // 1: tool output, 2: message; never body text
+        private bool messageRoleValidated, messageHasMetadata;
         public bool CanContinue { get { return s[0] == 0; } }
         public bool Complete { get { DateTimeOffset observedAt; return CanContinue && s[1] == 0 && s[2] == 1 && s[3] == 0 && (s[12] == 0 || Timestamp(out observedAt)); } }
         public ToolOutputProjection Projection
@@ -7959,7 +7983,8 @@ public static partial class TokenRaderIndexer
         {
             string[] parts = (saved ?? "").Split('~');
             string[] p = parts[0].Split(',');
-            if (p.Length < 15 || (p[0] != "1" && p[0] != "2") || (saved ?? "").Length > 575) { Fail(); return; }
+            if (p.Length < 15 || (p[0] != "1" && p[0] != "2" && p[0] != "3") || (saved ?? "").Length > 575) { Fail(); return; }
+            payloadVariant = p[0] == "3" ? 0 : 1;
             if (p[0] == "1") {
                 if (parts.Length != 1) { Fail(); return; }
                 // Older string-only continuations never retained a timestamp.
@@ -7968,34 +7993,39 @@ public static partial class TokenRaderIndexer
             } else {
                 if (parts.Length != 2) { Fail(); return; }
                 string[] metadata = parts[1].Split(',');
-                if (metadata.Length != 3 || (metadata[0] != "0" && metadata[0] != "1") || (metadata[1] != "0" && metadata[1] != "1")) { Fail(); return; }
+                if (metadata.Length != (p[0] == "3" ? 6 : 3) || (metadata[0] != "0" && metadata[0] != "1") || (metadata[1] != "0" && metadata[1] != "1")) { Fail(); return; }
+                if (p[0] == "3" && (!int.TryParse(metadata[3], NumberStyles.None, CultureInfo.InvariantCulture, out payloadVariant) || payloadVariant < 0 || payloadVariant > 2)) { Fail(); return; }
+                if (p[0] == "3") {
+                    if ((metadata[4] != "0" && metadata[4] != "1") || (metadata[5] != "0" && metadata[5] != "1")) { Fail(); return; }
+                    messageRoleValidated = metadata[4] == "1"; messageHasMetadata = metadata[5] == "1";
+                }
                 timestampValid = metadata[0] == "1"; timestampClosed = metadata[1] == "1";
                 try { timestamp = Encoding.ASCII.GetString(Convert.FromBase64String(metadata[2])); } catch { Fail(); return; }
                 if (timestamp.Length > 48 || !timestampValid && timestamp.Length != 0) { Fail(); return; }
                 foreach (char value in timestamp) if (!TimestampCharacter(value)) { Fail(); return; }
             }
             for (int i = 0; i < 14; i++)
-                if (!int.TryParse(p[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || (i != 12 && s[i] > 255)) { Fail(); return; }
-            if (s[0] > 1 || s[1] > MaxDepth || s[2] > 1 || s[3] > 7 || s[5] > 64 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[11] > 8 || s[13] > 2 || p.Length != 15+s[1]*4) { Fail(); return; }
+                if (!int.TryParse(p[i+1], NumberStyles.None, CultureInfo.InvariantCulture, out s[i]) || s[i] < 0 || (i != 12 && s[i] > (i == 4 ? 1023 : 255))) { Fail(); return; }
+            if (s[0] > 1 || s[1] > MaxDepth || s[2] > 1 || s[3] > 8 || s[5] > 64 || s[6] > 2 || s[7] > 4 || s[8] > 3 || s[11] > 8 || s[13] > 2 || p.Length != 15+s[1]*4) { Fail(); return; }
             if ((s[3] != 0 && s[1] == 0) || (s[2] == 1 && s[1] != 0)) { Fail(); return; }
             for (int i = 0; i < s[1]*4; i++)
-                if (!int.TryParse(p[i+15], NumberStyles.None, CultureInfo.InvariantCulture, out s[i+14]) || s[i+14] < 0 || s[i+14] > 31) { Fail(); return; }
+                if (!int.TryParse(p[i+15], NumberStyles.None, CultureInfo.InvariantCulture, out s[i+14]) || s[i+14] < 0 || s[i+14] > 1023) { Fail(); return; }
             for (int i = 0; i < s[1]; i++) {
                 int f = 14+i*4, k = s[f];
                 if (k < 1 || k > 6 || s[f+1] > 4 || s[f+3] > Keys[k].Length || (s[f+2] >> Keys[k].Length) != 0) { Fail(); return; }
                 if (i == 0 && k != 1) { Fail(); return; }
                 if (i > 0) {
                     int parent = s[f-4], key = s[f-1];
-                    bool permitted = parent == 1 && key == 4 && k == 2 || (parent == 1 || parent == 2) && key == 5 && k == 3 || (parent == 3 || parent == 4) && (k == 3 || k == 4) || parent == 2 && key == 4 && k == 5 || parent == 5 && k == 6;
+                    bool permitted = parent == 1 && key == 4 && k == 2 || (parent == 1 || parent == 2) && key == 5 && k == 3 || (parent == 3 || parent == 4) && (k == 3 || k == 4) || parent == 2 && (key == 4 || key == 7) && k == 5 || parent == 5 && k == 6;
                     if (!permitted) { Fail(); return; }
                 }
             }
         }
         public string Save()
         {
-            string[] p = new string[15+s[1]*4]; p[0] = "2";
+            string[] p = new string[15+s[1]*4]; p[0] = "3";
             for (int i = 0; i < 14+s[1]*4; i++) p[i+1] = s[i].ToString(CultureInfo.InvariantCulture);
-            return string.Join(",",p) + "~" + (timestampValid ? "1" : "0") + "," + (timestampClosed ? "1" : "0") + "," + Convert.ToBase64String(Encoding.ASCII.GetBytes(timestamp));
+            return string.Join(",",p) + "~" + (timestampValid ? "1" : "0") + "," + (timestampClosed ? "1" : "0") + "," + Convert.ToBase64String(Encoding.ASCII.GetBytes(timestamp)) + "," + payloadVariant.ToString(CultureInfo.InvariantCulture) + "," + (messageRoleValidated ? "1" : "0") + "," + (messageHasMetadata ? "1" : "0");
         }
         private void Fail() { s[0] = 1; }
         private static bool Space(int b) { return b == 32 || b == 9 || b == 13 || b == 10; }
@@ -8008,8 +8038,12 @@ public static partial class TokenRaderIndexer
         }
         private void Close(int b)
         {
-            int f = Frame, k = s[f], required = k == 1 ? 10 : k == 2 ? 9 : 0;
+            int f = Frame, k = s[f], required = k == 1 ? 10 : k == 2 ? (payloadVariant == 2 ? 65 : 9) : 0;
             if (b != (k == 4 || k == 5 ? ']' : '}') || (s[f+2] & required) != required) { Fail(); return; }
+            if (k == 2 && (payloadVariant == 0 || (s[f+2] & ~(payloadVariant == 2 ? 1011 : 31)) != 0)) { Fail(); return; }
+            // Legacy image messages omitted role. Keep that exact closed shape
+            // only without opaque metadata, never relax the pure-text proof.
+            if (k == 1 && payloadVariant == 2 && !messageRoleValidated && (s[12] == 0 || messageHasMetadata)) { Fail(); return; }
             if (k == 6) {
                 if (s[13] == 1 ? s[f+2] != 3 : s[13] == 2 ? s[f+2] != 5 && s[f+2] != 13 : true) { Fail(); return; }
                 if (s[13] == 2) { if (s[12] == int.MaxValue) { Fail(); return; } s[12]++; }
@@ -8020,7 +8054,7 @@ public static partial class TokenRaderIndexer
         private void BeginString(int mode)
         {
             s[3] = mode;
-            s[4] = mode == 2 ? (1 << Keys[s[Frame]].Length)-1 : mode == 3 ? (s[Frame] == 1 ? 1 : s[Frame] == 2 ? 6 : 24) : 0;
+            s[4] = mode == 2 ? (1 << Keys[s[Frame]].Length)-1 : mode == 3 ? (s[Frame] == 1 ? 1 : s[Frame] == 2 ? 38 : 216) : mode == 8 ? 15 : 0;
             s[5] = s[6] = s[7] = s[8] = 0;
         }
         private void EndString()
@@ -8030,6 +8064,7 @@ public static partial class TokenRaderIndexer
                 int key = -1;
                 for (int i = 0; i < Keys[k].Length; i++) if ((s[4] & (1 << i)) != 0 && Keys[k][i].Length == s[5]) { key = i; break; }
                 if (key < 0 || (s[f+2] & (1 << key)) != 0) { Fail(); return; }
+                if ((k == 1 || k == 2) && key == 4) messageHasMetadata = true;
                 s[f+2] |= 1 << key; s[f+3] = key+1; s[f+1] = 1;
             } else if (mode == 6) s[f+1] = 1;
             else {
@@ -8037,7 +8072,14 @@ public static partial class TokenRaderIndexer
                     bool exact = false;
                     for (int i = 0; i < Types.Length; i++) if ((s[4] & (1 << i)) != 0 && Types[i].Length == s[5]) exact = true;
                     if (!exact) { Fail(); return; }
-                    if (k == 6) s[13] = (s[4] & 8) != 0 ? 1 : 2;
+                    if (k == 6) s[13] = (s[4] & 16) != 0 ? 2 : 1;
+                    if (k == 2) payloadVariant = (s[4] & 32) != 0 ? 2 : 1;
+                }
+                if (mode == 8) {
+                    bool exact = false;
+                    for (int i = 0; i < Roles.Length; i++) if ((s[4] & (1 << i)) != 0 && Roles[i].Length == s[5]) exact = true;
+                    if (!exact) { Fail(); return; }
+                    messageRoleValidated = true;
                 }
                 if (mode == 7) timestampClosed = true;
                 s[f+1] = 3;
@@ -8046,15 +8088,15 @@ public static partial class TokenRaderIndexer
         private void BeginValue(int b, bool opaque)
         {
             int k = s[Frame], key = s[Frame+3];
-            if (k == 2 && key == 4 && b == '[') { Push(5); return; }
+            if (k == 2 && (key == 4 || key == 7) && b == '[') { Push(5); return; }
             int child = opaque ? (b == '{' ? 3 : b == '[' ? 4 : 0) : k == 1 && key == 4 ? 2 : (k == 1 || k == 2) && key == 5 ? 3 : k == 5 ? 6 : 0;
             if (child > 0 && b == (child == 4 ? '[' : '{')) { Push(child); return; }
-            bool nullable = k == 2 && (key == 2 || key == 3);
-            if ((opaque || nullable) && b == 'n' || opaque && (b == 't' || b == 'f')) { s[3] = 5; s[4] = opaque ? 7 : 4; s[5] = 0; Feed(b); return; }
+            bool nullable = k == 2 && (key == 2 || key == 3 || key == 8 || key == 9 || key == 10);
+            if ((opaque || nullable) && b == 'n' || (opaque || k == 2 && key == 9) && (b == 't' || b == 'f')) { s[3] = 5; s[4] = opaque || k == 2 && key == 9 ? 7 : 4; s[5] = 0; Feed(b); return; }
             if (child > 0) { Fail(); return; }
             bool numeric = opaque || k == 1 && key == 3;
-            bool text = opaque || k == 1 && key <= 2 || k == 2 && key <= 4 || k == 6;
-            if (text && b == '"') { BeginString(k == 1 && key == 2 || (k == 2 || k == 6) && key == 1 ? 3 : k == 1 && key == 1 ? 7 : 1); return; }
+            bool text = opaque || k == 1 && key <= 2 || k == 2 && (key <= 4 || key == 6 || key == 8) || k == 6;
+            if (text && b == '"') { BeginString(k == 1 && key == 2 || (k == 2 || k == 6) && key == 1 ? 3 : k == 1 && key == 1 ? 7 : k == 2 && key == 6 ? 8 : 1); return; }
             if (numeric && (b == '-' || b >= '0' && b <= '9')) {
                 s[3] = 4; s[11] = b == '-' ? 1 : 0;
                 if (b != '-') Feed(b); return;
@@ -8099,8 +8141,8 @@ public static partial class TokenRaderIndexer
                 }
                 if (b == '"') { EndString(); return; }
                 if (b < 32) { Fail(); return; }
-                if (s[3] == 2 || s[3] == 3) {
-                    string[] expected = s[3] == 2 ? Keys[s[Frame]] : Types;
+                if (s[3] == 2 || s[3] == 3 || s[3] == 8) {
+                    string[] expected = s[3] == 2 ? Keys[s[Frame]] : s[3] == 8 ? Roles : Types;
                     for (int i = 0; i < expected.Length; i++) if ((s[4] & (1 << i)) != 0 && (s[5] >= expected[i].Length || expected[i][s[5]] != b)) s[4] &= ~(1 << i);
                     s[5]++; if (s[4] == 0) Fail(); return;
                 }

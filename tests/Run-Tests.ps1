@@ -2011,6 +2011,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-CommandVariantStreamingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ToolOutputStreamingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-ToolOutputProjectionTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-MessageFileChangeStreamingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-CompactedStreamingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-CompactedVariantsTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-FailureInfoUiTests.ps1')

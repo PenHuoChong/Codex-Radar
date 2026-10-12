@@ -128,6 +128,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
 
 压缩归档允许显式为空的 `compaction_response_id` 和 `latest_token_usage_record`，以及已知的 `guardian_history` 数组。空快照不产生用量，归档数组只做完整结构校验，不从其中提取调用或正文；未知字段、错误类型和未完整写入的记录仍会阻断补齐。
 
+带图片的消息也需完整流式验证：只计真实 `content` 中的输入图片，不把 `metadata` 或 `internal_chat_message_metadata_passthrough` 中的示例当作图片、工具或 Token；不保存文本或图片数据。已知 `FileChange` 完成记录的新增文件结构（`changes` 中的 `type: add` 和 `content`）只提取工具完成元数据，路径、文件内容及输出均流式丢弃。未支持的变更类型、未知字段、损坏结构及未完成行仍保留阻断。解析器版本更新后会重新核验之前受阻的原缺口，不手工清除阻断或跳过失败内容。
+
+仅授权超大记录检查时，诊断脚本须加 `-OnlyOversized`，不查询来源替换项；可用 `-IndexerDll` 指定待验证的解析器。匿名输出中的 `OversizedValidation` 仅表示相应长度记录的完整结构是否被该解析器接受，不代表已更新真实索引或实际启动成功。诊断读取范围为选中阻断文件的冻结前缀，执行前仍须明确取得该范围的只读授权。
+
 `scripts/` 中的维护诊断不由程序或测试自动运行，默认不访问私人数据。`Inspect-BlockedStructure.ps1` 需显式传入 `-ReadOnlyStructureAuthorized`，最多检查两个解析阻断文件及一个来源变化文件的元数据，仅输出匿名结构信息；`Measure-StartupDiagnostics.ps1` 需显式传入 `-RunStartWorkerAuthorized`，会执行真实开始后台流程并正常更新元数据索引，运行前必须关闭仪表盘，检测到仍在运行的仪表盘窗口会拒绝。诊断 worker 的索引固定为 `ProjectRoot/data/private/index/index.db`，工作期间暂时覆盖并在退出时恢复原 `TOKEN_RADER_INDEX_DB`；会话根仍遵循 `CODEX_HOME`，未设置时使用 `~/.codex/sessions`。后者不是只读检查，也不是界面点击测试；两者均不读取认证文件、不保存诊断输出。
 
 `Repair-SingleBlockedSource.ps1` 是单独授权的维护工具，不由启动、刷新或补齐按钮自动调用。需先关闭仪表盘，并显式传入 `-RepairSingleSourceAuthorized`；仅在索引恰有一个 `source_replaced` 文件时继续。默认 `-TimeoutSeconds 120`，到时请求取消；可按需指定 1–3600 秒，也可按 Ctrl+C 请求取消，脚本等待同步工作退出后释放资源，超时并不承诺立即退出。它验证该文件冻结前缀的完整结构，在内存暂存数值/工具元数据，将目标源旧索引元数据备份到 `data/private/repairs/` 并重新打开逐字段核对，再按文件路径事务替换。失败保留原索引，不按会话批量删除，不自动处理跨源归属不明或旧格式缺少来源的关联。原 JSONL 不复制、不修改、不加写入锁；内部摘要只用于校验实际消费字节与提交前的前缀一致，不输出或保存摘要。这是冻结快照的一致性复核，不是源文件与数据库之间的跨资源原子锁定，不能阻止其他程序随后改写日志。修复后须重新建立测量起点；原文件已被截断的内容只能保留其旧元数据备份，不能凭空恢复原日志。

@@ -84,7 +84,7 @@ try {
     $reject=@{
         tool='{"type":"response_item","payload":{"type":"function_call","name":"synthetic_tool","arguments":"'+$huge+'"}}'
         image=$safe.Replace('"type":"output_text"','"type":"input_image"')
-        lateImage=$safe.Replace('"}]}}','"},{"type":"input_image","image_url":"synthetic"}]}}')
+        lateImage=$safe.Replace('"}]}}','"},{"type":"input_image","image_url":"synthetic","unknown_image_field":true}]}}')
         usage=$safe.Replace('"}]}}','"}]},"usage":{"input_tokens":7}}')
         context='{"type":"turn_context","payload":{"model":"gpt-5.4","padding":"'+$huge+'"}}'
         unknown=$safe.Replace('"}]}}','"}],"unknown":true}}')

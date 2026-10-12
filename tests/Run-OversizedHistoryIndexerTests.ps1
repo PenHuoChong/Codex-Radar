@@ -39,7 +39,8 @@ function Complete([bool]$recent,[long]$budget) {
         Assert ($batch.ProcessedBytes-ge0 -and $batch.ProcessedBytes-le$budget) 'each call respects byte budget'
         $state=[string](Scalar ('SELECT body_scan_state FROM '+$table+' LIMIT 1'))
         Assert ($state.Length-lt600) 'continuation metadata stays constant size'
-        Assert ($state-eq'' -or $state-match'^[0-9,|]+$') 'continuation stores no body, key or type text'
+        Assert ($state-eq'' -or $state-match'^[2-5]\|[0-9]+\|[A-Za-z0-9,~:+/=|]*$') 'continuation contains only versioned parser enums and bounded metadata'
+        Assert ($state-notmatch'BODY_SENTINEL|response_item|input_image|output_text|event_msg|token_count') 'continuation stores no body, key or type text'
         if($batch.Completed -or $batch.EligibleFiles-eq0){return}
         Assert ($batch.ProcessedBytes-gt0) 'bounded continuation makes progress'
     }
@@ -48,7 +49,7 @@ function Complete([bool]$recent,[long]$budget) {
 try {
     $context='{"timestamp":"2026-10-05T01:00:00Z","type":"turn_context","payload":{"model":"gpt-5.4","service_tier":"priority"}}'
     $token='{"timestamp":"2026-10-05T02:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0},"total_token_usage":{"input_tokens":7,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}}}'
-    $text=('x'*(2*1024*1024))+'\"type\":\"event_msg\" 雪😀 \\ \n \u1234'
+    $text='TEXT_BODY_SENTINEL'+('x'*(2*1024*1024))+'\"type\":\"event_msg\" 雪😀 \\ \n \u1234'
     $safe='{"timestamp":"2026-10-05T01:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","id":null,"phase":"final_answer","end_turn":true,"recipient":null,"content":[{"type":"output_text","text":"'+$text+'"},{"text":"hello","type":"input_text"},{"type":"text","text":"done"}]}}'
     $lateType='{"payload":{"content":[{"text":"'+$text+'","type":"output_text"}],"role":"user","type":"message"},"type":"response_item","timestamp":"2026-10-05T01:00:00Z"}'
     foreach($recent in @($true,$false)) {
@@ -94,7 +95,18 @@ try {
     New-Fixture 'old-dfa' $safe
     Prepare $true
     [void][TokenRaderIndexer]::BackfillRecentHistoryBatch($db,256*1024,5000,$progress,$none)
-    $oldState=([string](Scalar 'SELECT body_scan_state FROM recent_history_work')) -replace '^(2\|[0-9]+\|)2,','${1}1,'
+    $savedState=([string](Scalar 'SELECT body_scan_state FROM recent_history_work')).Split('|')
+    Assert ($savedState.Length-eq3) 'fixture has source-bound parser continuation'
+    # The current message classifier can retain both pure-text and image-safe
+    # candidates. Retire only the genuine pure-text candidate, explicitly
+    # excluding the independent modern message proof from this legacy test.
+    if ($savedState[0]-eq'2') { $pureTextState=$savedState[2] }
+    else {
+        Assert ($savedState[0]-eq'5' -and $savedState[2].StartsWith('B')) 'fixture contains a combined message classifier'
+        $pureTextState=$savedState[2].Substring(1).Split(':')[0]
+    }
+    Assert ($pureTextState-match'^2,') 'fixture contains the authentic current pure-text candidate'
+    $oldState='2|'+$savedState[1]+'|'+($pureTextState -replace '^2,','1,')
     Assert ($oldState-match'^2\|[0-9]+\|1,') 'fixture contains retired grammar version'
     $cmd=$db.CreateCommand()
     try { $cmd.CommandText='UPDATE recent_history_work SET body_scan_state=@state'; [void]$cmd.Parameters.AddWithValue('@state',$oldState); [void]$cmd.ExecuteNonQuery() }
