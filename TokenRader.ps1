@@ -4415,20 +4415,26 @@ function Set-ResultPricing {
 }
 
 function Set-PricingTable {
+    $subscriptionReference = $null -ne $script:Prices.PSObject.Properties['PricingBasis'] -and
+        [string]$script:Prices.PricingBasis -eq 'subscription_reference_v1'
+    # Use the same projected prices as calculation; never reapply mode/API multipliers here.
+    $contexts = if ($subscriptionReference) { @('≤272,000 输入', '>272,000 输入（长上下文）') } else { @('标准 API（兼容）') }
     $rows = foreach ($entry in $script:Prices.models) {
-        [pscustomobject]@{
-            Model = ([string]$entry.displayName) + ' · 普通'
-            Input = ('$' + ([double]$entry.input).ToString('0.###'))
-            Cached = ('$' + ([double]$entry.cachedInput).ToString('0.###'))
-            Output = ('$' + ([double]$entry.output).ToString('0.###'))
-        }
+        $modes = @([pscustomobject]@{ Label = '普通'; Price = $entry })
         if ($null -ne $entry.PSObject.Properties['serviceTiers']) {
             foreach ($tier in $entry.serviceTiers.PSObject.Properties) {
+                $modes += [pscustomobject]@{ Label = Get-ServiceTierLabel $tier.Name; Price = $tier.Value }
+            }
+        }
+        foreach ($mode in $modes) {
+            foreach ($context in $contexts) {
                 [pscustomobject]@{
-                    Model = ([string]$entry.displayName) + ' · ' + (Get-ServiceTierLabel $tier.Name)
-                    Input = '$' + ([double]$tier.Value.input).ToString('0.###')
-                    Cached = '$' + ([double]$tier.Value.cachedInput).ToString('0.###')
-                    Output = '$' + ([double]$tier.Value.output).ToString('0.###')
+                    Model = ([string]$entry.displayName) + ' · ' + $mode.Label
+                    Context = $context
+                    Input = '$' + ([double]$mode.Price.input).ToString('0.###')
+                    Cached = '$' + ([double]$mode.Price.cachedInput).ToString('0.###')
+                    Output = '$' + ([double]$mode.Price.output).ToString('0.###')
+                    CacheWrite = if ($subscriptionReference) { '$' + ([double]$mode.Price.input).ToString('0.###') } else { '见 API 规则' }
                 }
             }
         }

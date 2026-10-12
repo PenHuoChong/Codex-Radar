@@ -1969,6 +1969,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-PlanPricingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-Gpt61SolPricingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-SubscriptionReferenceTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-PricingStandardsTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-PlanQuotaEvidenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-WeeklyReferenceBoundaryTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-QuotaEndpointRefreshTests.ps1')

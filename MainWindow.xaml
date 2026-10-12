@@ -561,12 +561,13 @@
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
                                 <StackPanel>
-                                    <TextBlock Text="当前模型套餐折算参考单价" FontSize="16" FontWeight="SemiBold"/>
+                                    <TextBlock Text="计费标准（订阅折算参考）" FontSize="16" FontWeight="SemiBold"/>
                                     <TextBlock x:Name="PricingVerifiedText" Text="美元参考 / 1M tokens · 非官方订阅单价" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,3,0,0" TextWrapping="Wrap"/>
                                 </StackPanel>
                                 <Button x:Name="OpenPricingButton" Grid.Column="1" Content="查看订阅规则来源" Padding="10,6" FontSize="11"/>
                             </Grid>
-                            <UniformGrid Columns="3" Margin="0,14,0,0">
+                            <TextBlock Text="当前结果的模型 / 模式参考单价" Foreground="{StaticResource MutedBrush}" FontSize="11" Margin="0,12,0,0"/>
+                            <UniformGrid Columns="3" Margin="0,6,0,0">
                                 <Border Background="#101B22" CornerRadius="10" Padding="14" Margin="0,0,6,0">
                                     <StackPanel>
                                         <TextBlock Text="未缓存输入" Foreground="{StaticResource MutedBrush}" FontSize="10"/>
@@ -588,22 +589,22 @@
                             </UniformGrid>
                             <TextBlock x:Name="FormulaText" Text="美元参考 = 未缓存输入 × 参考输入价 + 缓存输入 × 参考缓存价 + 输出 × 参考输出价"
                                        Foreground="#8399A2" FontSize="10" Margin="0,13,0,0" TextWrapping="Wrap"/>
-                        </StackPanel>
-                    </Border>
-
-                    <Border Style="{StaticResource CardStyle}" Margin="4,6,4,8" Padding="16">
-                        <StackPanel>
-                            <TextBlock Text="套餐折算美元参考价格表" FontSize="15" FontWeight="SemiBold"/>
-                            <TextBlock Text="单位为美元参考 / 1M tokens。模式倍率已包含：支持的 Fast 为 2.5×（GPT-5.4 为 2×），Ultrafast 为 8×；不叠加 API 快速倍率，不含缓存写入溢价，统一采用本应用平坦参考费率。非官方美元单价或账单；参考规则保存在 pricing.json 的 subscriptionPricing 中。"
-                                       Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,3,0,10" TextWrapping="Wrap"/>
-                            <DataGrid x:Name="PricingDataGrid" AutoGenerateColumns="False" Height="218" AlternationCount="2">
+                            <TextBlock Text="全部模型 · 速度模式 · 上下文标准" FontSize="14" FontWeight="SemiBold" Margin="0,16,0,0"/>
+                            <TextBlock Text="表中均为美元参考 / 1M tokens，已包含相应速度模式倍率，不再重复相乘。普通与长上下文使用本应用同一参考价；GPT-6.1 Sol 超过 272K 不加价。272K 仅为计价对照边界，不表示模型支持该长度，也不代表订阅加价门槛或官方统一倍率。"
+                                       Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,5,0,6" TextWrapping="Wrap"/>
+                            <TextBlock Text="缓存读取按缓存输入价；缓存写入归入未缓存输入，仅计一次，无额外溢价。推理 Token 已包含在输出中，不重复收费。Fast / Ultrafast 是速度模式，推理 ultra 不自动视为快速模式。规则统一读取 pricing.json 的 subscriptionPricing；美元为应用参考单位，非官方美元单价或账单。"
+                                       Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,0,0,10" TextWrapping="Wrap"/>
+                            <DataGrid x:Name="PricingDataGrid" AutoGenerateColumns="False" Height="280" AlternationCount="2" FontSize="11">
                                 <DataGrid.Columns>
-                                    <DataGridTextColumn Header="模型" Binding="{Binding Model}" Width="*"/>
-                                    <DataGridTextColumn Header="输入" Binding="{Binding Input}" Width="90"/>
-                                    <DataGridTextColumn Header="缓存输入" Binding="{Binding Cached}" Width="90"/>
-                                    <DataGridTextColumn Header="输出" Binding="{Binding Output}" Width="90"/>
+                                    <DataGridTextColumn Header="模型 / 速度模式" Binding="{Binding Model}" Width="*" MinWidth="220"/>
+                                    <DataGridTextColumn Header="单次输入上下文" Binding="{Binding Context}" Width="190"/>
+                                    <DataGridTextColumn Header="未缓存输入" Binding="{Binding Input}" Width="88"/>
+                                    <DataGridTextColumn Header="缓存读取" Binding="{Binding Cached}" Width="82"/>
+                                    <DataGridTextColumn Header="缓存写入¹" Binding="{Binding CacheWrite}" Width="82"/>
+                                    <DataGridTextColumn Header="输出" Binding="{Binding Output}" Width="72"/>
                                 </DataGrid.Columns>
                             </DataGrid>
+                            <TextBlock Text="¹ 缓存写入栏仅说明归入未缓存输入时采用的参考单价，不是另收一笔费用；日志未提供写入数量时不推测。" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,7,0,0" TextWrapping="Wrap"/>
                         </StackPanel>
                     </Border>
 
