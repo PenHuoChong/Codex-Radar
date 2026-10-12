@@ -2004,6 +2004,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-StartupHandoffTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-MeasurementFailureCallbackTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-MeasurementStartEntryTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-LauncherWindowTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IntervalPositiveRenderAuditTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-OversizedHistoryIndexerTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-IncrementalOversizedTests.ps1')

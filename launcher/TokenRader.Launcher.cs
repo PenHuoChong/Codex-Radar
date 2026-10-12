@@ -59,6 +59,17 @@ internal static class TokenRaderLauncher
             CreateNoWindow = true,
             WindowStyle = ProcessWindowStyle.Hidden
         };
-        Process.Start(startInfo);
+        try
+        {
+            Process.Start(startInfo);
+        }
+        catch (Exception error)
+        {
+            System.Windows.Forms.MessageBox.Show(
+                "Unable to start Token Rader.\n" + error.Message,
+                "Token Rader",
+                System.Windows.Forms.MessageBoxButtons.OK,
+                System.Windows.Forms.MessageBoxIcon.Error);
+        }
     }
 }

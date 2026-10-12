@@ -92,6 +92,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\TokenRader.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\TokenRader.ps1
 ```
 
+日常使用建议双击 `TokenRader.exe`，只显示仪表盘，不保留命令行窗口。`Start-TokenRader.cmd` 会转交给同目录的 EXE 后立即退出；Windows 启动批处理时仍可能短暂闪现控制台。直接运行上面的 PowerShell 命令保留终端，适用于查看调试错误，不会隐藏你已有的终端窗口。
+
 仓库中的启动器没有商业代码签名。若 Windows 显示 SmartScreen 提示，可以运行 PowerShell 脚本，或审查启动器源码后自行构建：
 
 ```powershell

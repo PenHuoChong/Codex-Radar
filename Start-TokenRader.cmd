@@ -1,16 +1,10 @@
 @echo off
 setlocal
-where powershell.exe >nul 2>&1
-if errorlevel 1 goto try_pwsh
-powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0TokenRader.ps1"
+if not exist "%~dp0TokenRader.exe" goto no_launcher
+rem Detach the GUI launcher; do not keep CMD alive for the dashboard lifetime.
+start "" "%~dp0TokenRader.exe"
 exit /b %errorlevel%
 
-:try_pwsh
-where pwsh.exe >nul 2>&1
-if errorlevel 1 goto no_powershell
-pwsh.exe -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0TokenRader.ps1"
-exit /b %errorlevel%
-
-:no_powershell
-echo Token Rader requires Windows PowerShell or PowerShell 7 in PATH.
+:no_launcher
+echo TokenRader.exe was not found. Run Build.ps1 to build the GUI launcher.
 exit /b 1

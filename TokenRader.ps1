@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ('"' + $PSCommandPath + '"'))
     $hostExecutable = if ($PSVersionTable.PSEdition -eq 'Core') { Join-Path $PSHOME 'pwsh.exe' } else { Join-Path $PSHOME 'powershell.exe' }
-    Start-Process -FilePath $hostExecutable -ArgumentList $arguments | Out-Null
+    Start-Process -FilePath $hostExecutable -ArgumentList $arguments -WindowStyle Hidden | Out-Null
     exit
 }
 
