@@ -2230,6 +2230,38 @@ function Get-TokenRaderPrices {
     return $document
 }
 
+function Get-TokenRaderCurrentPricingModels {
+    param(
+        [Parameter(Mandatory = $true)]$PricingDocument,
+        [datetime]$ReferenceDate = [datetime]::Today
+    )
+    # Presentation only: never remove historical rates from the calculation document.
+    $subscription = $null -ne $PricingDocument.PSObject.Properties['PricingBasis'] -and
+        [string]$PricingDocument.PricingBasis -eq 'subscription_reference_v1'
+    $availability = $null
+    if ($subscription -and $null -ne $PricingDocument.PSObject.Properties['subscriptionPricing'] -and
+        $null -ne $PricingDocument.subscriptionPricing -and
+        $null -ne $PricingDocument.subscriptionPricing.PSObject.Properties['modelAvailability']) {
+        $availability = $PricingDocument.subscriptionPricing.modelAvailability
+    }
+    foreach ($model in @($PricingDocument.models)) {
+        if ($subscription) {
+            if ($null -ne $model.PSObject.Properties['referenceRateBasis'] -and
+                [string]$model.referenceRateBasis -eq 'historical_application_reference_unit') { continue }
+            $entry = if ($null -ne $availability) { $availability.PSObject.Properties[[string]$model.id] } else { $null }
+            if ($null -ne $entry -and $null -ne $entry.Value -and $null -ne $entry.Value.PSObject.Properties['retiredOn']) {
+                $retiredOn = [datetime]::MinValue
+                if ([datetime]::TryParseExact([string]$entry.Value.retiredOn, 'yyyy-MM-dd',
+                    [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$retiredOn) -and
+                    $ReferenceDate.Date -ge $retiredOn.Date) { continue }
+            }
+        }
+        $model
+    }
+}
+
+Export-ModuleMember -Function Get-TokenRaderCurrentPricingModels
+
 function Resolve-TokenRaderPrice {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Model,

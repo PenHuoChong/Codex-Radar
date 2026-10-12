@@ -589,19 +589,25 @@
                             </UniformGrid>
                             <TextBlock x:Name="FormulaText" Text="美元参考 = 未缓存输入 × 参考输入价 + 缓存输入 × 参考缓存价 + 输出 × 参考输出价"
                                        Foreground="#8399A2" FontSize="10" Margin="0,13,0,0" TextWrapping="Wrap"/>
-                            <TextBlock Text="全部模型 · 速度模式 · 上下文标准" FontSize="14" FontWeight="SemiBold" Margin="0,16,0,0"/>
-                            <TextBlock Text="表中均为美元参考 / 1M tokens，已包含相应速度模式倍率，不再重复相乘。普通与长上下文使用本应用同一参考价；GPT-6.1 Sol 超过 272K 不加价。272K 仅为计价对照边界，不表示模型支持该长度，也不代表订阅加价门槛或官方统一倍率。"
+                            <TextBlock Text="当前模型 · 速度模式 · 上下文参考规则" FontSize="14" FontWeight="SemiBold" Margin="0,16,0,0"/>
+                            <TextBlock Text="长上下文官方订阅倍率未确认：下表两档同价只是本应用的美元参考策略，不代表官方承诺长上下文不额外消耗额度。GPT-6.1 Sol 按已选参考策略不加价；272K 仅为对照边界，不表示模型支持该长度。表中模式倍率已包含，不再重复相乘。已退役及仅供历史兼容的模型不列入当前表，历史调用仍可计价。"
                                        Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,5,0,6" TextWrapping="Wrap"/>
                             <TextBlock Text="缓存读取按缓存输入价；缓存写入归入未缓存输入，仅计一次，无额外溢价。推理 Token 已包含在输出中，不重复收费。Fast / Ultrafast 是速度模式，推理 ultra 不自动视为快速模式。规则统一读取 pricing.json 的 subscriptionPricing；美元为应用参考单位，非官方美元单价或账单。"
                                        Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,0,0,10" TextWrapping="Wrap"/>
                             <DataGrid x:Name="PricingDataGrid" AutoGenerateColumns="False" Height="280" AlternationCount="2" FontSize="11">
                                 <DataGrid.Columns>
                                     <DataGridTextColumn Header="模型 / 速度模式" Binding="{Binding Model}" Width="*" MinWidth="220"/>
-                                    <DataGridTextColumn Header="单次输入上下文" Binding="{Binding Context}" Width="190"/>
-                                    <DataGridTextColumn Header="未缓存输入" Binding="{Binding Input}" Width="88"/>
-                                    <DataGridTextColumn Header="缓存读取" Binding="{Binding Cached}" Width="82"/>
-                                    <DataGridTextColumn Header="缓存写入¹" Binding="{Binding CacheWrite}" Width="82"/>
-                                    <DataGridTextColumn Header="输出" Binding="{Binding Output}" Width="72"/>
+                                    <DataGridTextColumn Header="单次输入上下文（参考）" Binding="{Binding Context}" Width="190">
+                                        <DataGridTextColumn.ElementStyle>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="ToolTip" Value="{Binding ContextEvidence}"/>
+                                            </Style>
+                                        </DataGridTextColumn.ElementStyle>
+                                    </DataGridTextColumn>
+                                    <DataGridTextColumn Header="输入参考价" Binding="{Binding Input}" Width="88"/>
+                                    <DataGridTextColumn Header="读缓存参考" Binding="{Binding Cached}" Width="82"/>
+                                    <DataGridTextColumn Header="写缓存参考¹" Binding="{Binding CacheWrite}" Width="82"/>
+                                    <DataGridTextColumn Header="输出参考价" Binding="{Binding Output}" Width="82"/>
                                 </DataGrid.Columns>
                             </DataGrid>
                             <TextBlock Text="¹ 缓存写入栏仅说明归入未缓存输入时采用的参考单价，不是另收一笔费用；日志未提供写入数量时不推测。" Foreground="{StaticResource MutedBrush}" FontSize="10" Margin="0,7,0,0" TextWrapping="Wrap"/>

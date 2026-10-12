@@ -4322,7 +4322,7 @@ function Show-MeasurementPricingDialog {
     $list = New-Object Windows.Controls.StackPanel
     $scroll.Content = $list
     $selectors = @{}
-    foreach ($price in @($script:Prices.models)) {
+    foreach ($price in @(Get-TokenRaderCurrentPricingModels -PricingDocument $script:Prices)) {
         $row = New-Object Windows.Controls.StackPanel
         $row.Orientation = 'Horizontal'
         $row.Margin = '0,0,0,10'
@@ -4348,10 +4348,11 @@ function Show-MeasurementPricingDialog {
         [void]$list.Children.Add($row)
     }
     if ($dialog.ShowDialog() -eq $true) {
-        $selections = @{}
+        # Hidden historical models retain their existing assumptions for old calls.
+        $selections = @{} + $script:State.ManualServiceTiers
         foreach ($model in $selectors.Keys) {
             $value = [string]$selectors[$model].SelectedItem.Tag
-            if ($value -ne '') { $selections[$model] = $value }
+            if ($value -ne '') { $selections[$model] = $value } else { $selections.Remove($model) }
         }
         if (-not (Set-MeasurementPricingConfirmation -Selections $selections)) {
             $script:StatusText.Text = '后台状态已变化，本次模式确认尚未应用；请在结果更新完成后重试。'
@@ -4419,7 +4420,7 @@ function Set-PricingTable {
         [string]$script:Prices.PricingBasis -eq 'subscription_reference_v1'
     # Use the same projected prices as calculation; never reapply mode/API multipliers here.
     $contexts = if ($subscriptionReference) { @('≤272,000 输入', '>272,000 输入（长上下文）') } else { @('标准 API（兼容）') }
-    $rows = foreach ($entry in $script:Prices.models) {
+    $rows = foreach ($entry in @(Get-TokenRaderCurrentPricingModels -PricingDocument $script:Prices)) {
         $modes = @([pscustomobject]@{ Label = '普通'; Price = $entry })
         if ($null -ne $entry.PSObject.Properties['serviceTiers']) {
             foreach ($tier in $entry.serviceTiers.PSObject.Properties) {
@@ -4431,6 +4432,7 @@ function Set-PricingTable {
                 [pscustomobject]@{
                     Model = ([string]$entry.displayName) + ' · ' + $mode.Label
                     Context = $context
+                    ContextEvidence = if ($subscriptionReference) { '应用参考同价；官方倍率未确认' } else { 'API 兼容规则' }
                     Input = '$' + ([double]$mode.Price.input).ToString('0.###')
                     Cached = '$' + ([double]$mode.Price.cachedInput).ToString('0.###')
                     Output = '$' + ([double]$mode.Price.output).ToString('0.###')

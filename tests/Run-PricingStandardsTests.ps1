@@ -134,7 +134,8 @@ function Assert-PricingStandardsRowMatchesCore {
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $coreModulePath = Join-Path $projectRoot 'TokenRader.Core.psm1'
 Import-Module $coreModulePath -Force
-$script:Prices = Get-TokenRaderPrices -PricingPath (Join-Path $projectRoot 'pricing.json') -SubscriptionReference
+$script:PricingPath = Join-Path $projectRoot 'pricing.json'
+$script:Prices = Get-TokenRaderPrices -PricingPath $script:PricingPath -SubscriptionReference
 $script:PricingDocument = $script:Prices
 
 # Import only the two production functions under test. Parsing the file avoids
@@ -144,7 +145,7 @@ $tokens = $null
 $parseErrors = $null
 $mainAst = [System.Management.Automation.Language.Parser]::ParseFile($mainWindowPath, [ref]$tokens, [ref]$parseErrors)
 Assert-PricingStandards (@($parseErrors).Count -eq 0) 'TokenRader.ps1 parses successfully'
-foreach ($functionName in @('Get-ServiceTierLabel', 'Set-PricingTable')) {
+foreach ($functionName in @('Get-ServiceTierLabel', 'Set-PricingTable', 'Show-MeasurementPricingDialog')) {
     $functionAst = $mainAst.Find({
         param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
@@ -158,6 +159,58 @@ $script:PricingVerifiedText = [pscustomobject]@{ Text = '' }
 Set-PricingTable
 $rows = @($script:PricingDataGrid.ItemsSource)
 Assert-PricingStandards ($rows.Count -gt 0) 'subscription price table has display rows'
+$currentModels = @(Get-TokenRaderCurrentPricingModels -PricingDocument $script:PricingDocument -ReferenceDate ([datetime]::Today))
+$currentModelIds = @($currentModels | ForEach-Object { [string]$_.id })
+$historicalModels = @($script:PricingDocument.models | Where-Object {
+    $null -ne $_.PSObject.Properties['referenceRateBasis'] -and
+    [string]$_.referenceRateBasis -eq 'historical_application_reference_unit'
+})
+foreach ($historicalModel in $historicalModels) {
+    Assert-PricingStandards ($currentModelIds -notcontains [string]$historicalModel.id) `
+        ('historical subscription reference is not a current display option: ' + [string]$historicalModel.id)
+    Assert-PricingStandards (@($rows | Where-Object { ([string]$_.Model).StartsWith(([string]$historicalModel.displayName + ' ' + [string][char]0x00B7 + ' '), [StringComparison]::Ordinal) }).Count -eq 0) `
+        ('historical subscription reference is omitted from the displayed standards: ' + [string]$historicalModel.id)
+}
+
+# Availability is a presentation filter, not a destructive edit to historical
+# reference prices or the raw API pricing document.
+$rawPricing = Get-TokenRaderPrices -PricingPath $script:PricingPath
+$rawCurrentModels = @(Get-TokenRaderCurrentPricingModels -PricingDocument $rawPricing -ReferenceDate ([datetime]'2026-10-14'))
+Assert-PricingStandards (@($rawPricing.models).Count -eq $rawCurrentModels.Count) 'raw API pricing keeps all model options regardless of subscription availability'
+$subscriptionOct13 = @(Get-TokenRaderCurrentPricingModels -PricingDocument $script:PricingDocument -ReferenceDate ([datetime]'2026-10-13'))
+$subscriptionOct14 = @(Get-TokenRaderCurrentPricingModels -PricingDocument $script:PricingDocument -ReferenceDate ([datetime]'2026-10-14'))
+Assert-PricingStandards (@($subscriptionOct13 | Where-Object { [string]$_.id -eq 'gpt-5.5' }).Count -eq 1) 'GPT-5.5 remains a current option through 2026-10-13'
+Assert-PricingStandards (@($subscriptionOct14 | Where-Object { [string]$_.id -eq 'gpt-5.5' }).Count -eq 0) 'GPT-5.5 is removed from current options on its 2026-10-14 retirement date'
+$withoutAvailability = ConvertFrom-Json (ConvertTo-Json -InputObject $script:PricingDocument -Depth 12 -Compress)
+$withoutAvailability.subscriptionPricing.PSObject.Properties.Remove('modelAvailability')
+$gracefulModels = @(Get-TokenRaderCurrentPricingModels -PricingDocument $withoutAvailability -ReferenceDate ([datetime]'2026-10-14'))
+Assert-PricingStandards (@($gracefulModels | Where-Object { [string]$_.id -eq 'gpt-6.1-sol' }).Count -eq 1) `
+    'a missing availability map leaves known current models usable without throwing'
+Assert-PricingStandards (@($gracefulModels | Where-Object { [string]$_.id -eq 'gpt-5.4' }).Count -eq 0) `
+    'historical reference basis remains excluded when availability metadata is absent'
+foreach ($historicalId in @('gpt-5.4', 'gpt-5.3-codex')) {
+    $historicalPrice = Resolve-TokenRaderPrice -Model $historicalId -PricingDocument $script:PricingDocument
+    $historicalCost = Get-TokenRaderCost -Usage ([pscustomobject]@{Input=100000L;Cached=25000L;Output=10000L;Total=110000L;Uncached=75000L;ReasoningOutput=0L}) `
+        -Model $historicalId -PricingDocument $script:PricingDocument -Scope call -ServiceTier default -LongContextApplied $false
+    Assert-PricingStandards ($null -ne $historicalPrice -and [string]$historicalPrice.referenceRateBasis -eq 'historical_application_reference_unit') `
+        ('historical price remains available for resolution: ' + $historicalId)
+    Assert-PricingStandards ([bool]$historicalCost.Known -and [double]$historicalCost.TotalCost -gt 0) `
+        ('historical call still computes using retained pricing: ' + $historicalId)
+}
+
+$manualPickerAst = $mainAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Show-MeasurementPricingDialog'
+}, $true)
+$manualPickerText = [string]$manualPickerAst.Extent.Text
+Assert-PricingStandards ($manualPickerText.Contains('Get-TokenRaderCurrentPricingModels')) `
+    'manual pricing picker uses the same current-model presentation filter'
+$manualModelLoop = $manualPickerAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+        [string]$node.Condition.Extent.Text -match 'Get-TokenRaderCurrentPricingModels'
+}, $true)
+Assert-PricingStandards ($null -ne $manualModelLoop) 'manual pricing selector iterates only the helper-filtered model set'
 
 $contextNormal = ([string][char]0x2264) + '272,000 ' + ([string][char]0x8F93) + ([string][char]0x5165)
 $contextLong = '>272,000 ' + ([string][char]0x8F93) + ([string][char]0x5165) +
@@ -166,7 +219,7 @@ $contextLong = '>272,000 ' + ([string][char]0x8F93) + ([string][char]0x5165) +
 $separator = ' ' + [string][char]0x00B7 + ' '
 $expectedModesById = @{}
 
-foreach ($priceModel in @($script:PricingDocument.models)) {
+foreach ($priceModel in $currentModels) {
     $tiers = @()
     if ($null -ne $priceModel.PSObject.Properties['serviceTiers'] -and $null -ne $priceModel.serviceTiers) {
         $tiers = @($priceModel.serviceTiers.PSObject.Properties | ForEach-Object { [string]$_.Name })
@@ -263,5 +316,11 @@ Assert-PricingStandards ($cardXml.Contains('x:Name="PricingDataGrid"')) 'pricing
 Assert-PricingStandards ($cardXml.Contains('x:Name="PricingVerifiedText"')) 'pricing card contains the named verification label'
 Assert-PricingStandards ($cardXml.Contains('Binding="{Binding Context}"')) 'pricing card binds the context column'
 Assert-PricingStandards ($cardXml.Contains('Binding="{Binding CacheWrite}"')) 'pricing card binds the cache-write column'
+$longContextMultiplierCaveat = ([string][char]0x957F) + ([string][char]0x4E0A) + ([string][char]0x4E0B) +
+    ([string][char]0x6587) + ([string][char]0x5B98) + ([string][char]0x65B9) + ([string][char]0x8BA2) +
+    ([string][char]0x9605) + ([string][char]0x500D) + ([string][char]0x7387) + ([string][char]0x672A) +
+    ([string][char]0x786E) + ([string][char]0x8BA4)
+Assert-PricingStandards ($cardXml.Contains($longContextMultiplierCaveat)) `
+    'pricing caveat distinguishes the application long-context reference from an unconfirmed official subscription multiplier'
 
 Write-Output 'PRICING_STANDARDS_TESTS_PASSED'
