@@ -289,7 +289,9 @@ foreach ($category in @('Input', 'Cached', 'Output', 'CacheWrite')) {
 
 # Check the declared model policy separately from table/core equality: a shared
 # bug in both display and calculation must not make all models appear flat.
-foreach ($modelId in @('gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.6-cyber','gpt-5.5')) {
+foreach ($modelId in @('gpt-6.1-terra','gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna','gpt-5.6-cyber','gpt-5.5')) {
+    # Retired entries remain resolvable for history, but have no current UI rows.
+    if ($currentModelIds -notcontains $modelId) { continue }
     $priceModel = Resolve-TokenRaderPrice -Model $modelId -PricingDocument $script:PricingDocument
     $isFlat = $modelId -eq 'gpt-5.6-sol'
     foreach ($tier in @('default') + @($priceModel.serviceTiers.PSObject.Properties | ForEach-Object { [string]$_.Name })) {

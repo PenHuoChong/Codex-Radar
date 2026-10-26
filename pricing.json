@@ -3,14 +3,22 @@
   "unitTokens": 1000000,
   "verifiedAt": "2026-09-24",
   "priceType": "OpenAI API Standard processing",
+  "latestPriceAudit": {
+    "verifiedAt": "2026-10-27",
+    "scope": "Standard input, cached-input and output rates for the listed models; not an exhaustive historical service-tier audit",
+    "models": ["gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-cyber", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2", "gpt-5.2-codex", "gpt-5-mini", "gpt-5-codex", "gpt-5"],
+    "source": "https://developers.openai.com/api/docs/pricing",
+    "modelSources": "https://developers.openai.com/api/docs/models/",
+    "caveats": ["GPT-5.5 historical API priority rates were not reverified; retained for compatibility only.", "GPT-5.6 Cyber long-context rule is confirmed by its model page, while the general pricing table shows dashes."]
+  },
   "subscriptionPricing": {
-    "verifiedAt": "2026-10-13",
+    "verifiedAt": "2026-10-27",
     "source": "https://learn.chatgpt.com/docs/agent-configuration/speed",
     "pricingSource": "https://learn.chatgpt.com/docs/pricing",
     "basis": "standard_api_normalized_reference",
     "referenceBasis": "subscription_reference_v1",
     "referenceRatePolicy": "Explicit application USD reference units, not official subscription USD prices or a credit-to-USD conversion. User-confirmed API-style context multipliers apply only to explicitly configured models; GPT-6.1 Sol and GPT-5.6 Sol subscription no-surcharge exceptions remain flat. No cache-write premium. Historical entries do not establish present availability.",
-    "contextRuleVersion": "2026-10-13-api-style-reference-with-sol-exceptions",
+    "contextRuleVersion": "2026-10-27-terra-api-style-reference-with-sol-exceptions",
     "contextSources": {
       "gpt-6.1-sol": "https://x.com/thsottiaux/status/2109430894604026039",
       "gpt-5.6-sol": "https://x.com/thsottiaux/status/2076543065045795309",
@@ -28,6 +36,7 @@
       "gpt-5": { "retiredOn": "2026-04-14", "scope": "chatgpt_sign_in", "source": "https://learn.chatgpt.com/docs/changelog" }
     },
     "referenceModels": {
+      "gpt-6.1-terra": { "input": 1.0, "cachedInput": 0.05, "output": 5.0, "verifiedAt": "2026-10-27", "basis": "application_reference_unit", "longContextPolicy": "user_confirmed_api_style_reference", "longContextThreshold": 272000, "longContextInputMultiplier": 2.0, "longContextOutputMultiplier": 1.5 },
       "gpt-6-astra": { "input": 10.0, "cachedInput": 1.0, "output": 50.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit", "longContextPolicy": "user_confirmed_api_style_reference", "longContextThreshold": 272000, "longContextInputMultiplier": 2.0, "longContextOutputMultiplier": 1.5 },
       "gpt-6.1-sol": { "input": 2.0, "cachedInput": 0.1, "output": 10.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit", "longContextPolicy": "subscription_no_surcharge" },
       "gpt-6-sol": { "input": 2.0, "cachedInput": 0.2, "output": 10.0, "verifiedAt": "2026-10-13", "basis": "application_reference_unit", "longContextPolicy": "user_confirmed_api_style_reference", "longContextThreshold": 272000, "longContextInputMultiplier": 2.0, "longContextOutputMultiplier": 1.5 },
@@ -47,6 +56,7 @@
       "gpt-5": { "input": 1.25, "cachedInput": 0.125, "output": 10.0, "basis": "historical_application_reference_unit" }
     },
     "fastMultipliers": {
+      "gpt-6.1-terra": 2.5,
       "gpt-6-astra": 2.5,
       "gpt-6.1-sol": 2.5,
       "gpt-6-sol": 2.5,
@@ -63,6 +73,15 @@
     },
     "historicalFastMultipliers": ["gpt-5.4"],
     "modelVerification": {
+      "gpt-6.1-terra": {
+        "verifiedAt": "2026-10-27",
+        "source": "https://learn.chatgpt.com/docs/pricing",
+        "modelSource": "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+        "availabilitySource": "https://learn.chatgpt.com/docs/whats-new/october-26-30-2026",
+        "fastMultiplierBasis": "included_subscription_usage",
+        "longContextBasis": "user_confirmed_api_style_reference_not_official_subscription_multiplier",
+        "ultrafastSupported": false
+      },
       "gpt-6.1-sol": {
         "verifiedAt": "2026-10-13",
         "source": "https://learn.chatgpt.com/docs/pricing",
@@ -74,6 +93,36 @@
     "note": "Application-normalized dollar reference only; not official USD subscription rates and not a dollar-to-credit conversion."
   },
   "models": [
+    {
+      "id": "gpt-6.1-terra",
+      "displayName": "GPT-6.1 Terra",
+      "aliases": [],
+      "verifiedAt": "2026-10-27",
+      "input": 1.00,
+      "cachedInput": 0.05,
+      "cacheWrite": 1.25,
+      "cacheWriteMultiplier": 1.25,
+      "output": 5.00,
+      "contextWindow": 1050000,
+      "longContextThreshold": 272000,
+      "longContextInputMultiplier": 2.0,
+      "longContextOutputMultiplier": 1.5,
+      "serviceTiers": {
+        "priority": {
+          "input": 2.00,
+          "cachedInput": 0.10,
+          "cacheWrite": 2.50,
+          "cacheWriteMultiplier": 1.25,
+          "output": 10.00,
+          "longContextThreshold": 272000,
+          "longContextInputMultiplier": 2.0,
+          "longContextOutputMultiplier": 1.5,
+          "verifiedAt": "2026-10-27",
+          "source": "https://developers.openai.com/api/docs/models/gpt-6.1-terra"
+        }
+      },
+      "source": "https://developers.openai.com/api/docs/models/gpt-6.1-terra"
+    },
     {
       "id": "gpt-6-astra",
       "displayName": "GPT-6 Astra",

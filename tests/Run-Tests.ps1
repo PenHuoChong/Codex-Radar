@@ -201,6 +201,7 @@ Assert-Equal 'USD' ([string]$prices.currency) 'pricing currency metadata'
 Assert-Equal 1000000 ([Int64]$prices.unitTokens) 'pricing unit metadata'
 Assert-Equal 'OpenAI API Standard processing' ([string]$prices.priceType) 'pricing type metadata'
 $expectedPrices = [ordered]@{
+    'gpt-6.1-terra'   = @(1.00, 0.05, 5.00)
     'gpt-6-astra'     = @(10.00, 1.00, 50.00)
     'gpt-6.1-sol'     = @(2.00, 0.10, 10.00)
     'gpt-6-sol'       = @(2.00, 0.20, 10.00)
@@ -220,13 +221,14 @@ $expectedPrices = [ordered]@{
     'gpt-5'           = @(1.25, 0.125, 10.00)
 }
 $expectedPriorityPrices = [ordered]@{
+    'gpt-6.1-terra'   = @(2.00, 0.10, 10.00)
     'gpt-6.1-sol'     = @(4.00, 0.20, 20.00)
     'gpt-6-sol'       = @(4.00, 0.40, 20.00)
     'gpt-6-luna'      = @(0.20, 0.02, 1.00)
 }
 $canonicalIds = @($prices.models | ForEach-Object { ([string]$_.id).ToLowerInvariant() })
-$largeContextModelIds = @('gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4')
-$longContextModelIds = @('gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-cyber', 'gpt-5.5', 'gpt-5.4')
+$largeContextModelIds = @('gpt-6.1-terra', 'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4')
+$longContextModelIds = @('gpt-6.1-terra', 'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6-cyber', 'gpt-5.5', 'gpt-5.4')
 Assert-Equal $canonicalIds.Count @($canonicalIds | Sort-Object -Unique).Count 'pricing canonical model IDs are unique'
 Assert-Equal $expectedPrices.Count $canonicalIds.Count 'every pricing entry has an exact official-price regression'
 foreach ($pricingModelId in @($expectedPrices.Keys)) {
@@ -1968,6 +1970,7 @@ try {
     & (Join-Path $PSScriptRoot 'Run-ServiceTierTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-PlanPricingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-Gpt61SolPricingTests.ps1')
+    & (Join-Path $PSScriptRoot 'Run-Gpt61TerraPricingTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-SubscriptionReferenceTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-PricingStandardsTests.ps1')
     & (Join-Path $PSScriptRoot 'Run-PlanQuotaEvidenceTests.ps1')
